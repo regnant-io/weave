@@ -66,7 +66,8 @@ echo "📥 Cloning repository..."
 cd $APP_DIR
 if [ -d ".git" ]; then
     echo "Repository exists, pulling latest..."
-    git pull origin master
+    git fetch origin
+    git reset --hard origin/master
 else
     git clone https://gitlab.com/daudi.abinallah/weave.git .
 fi
