@@ -10,13 +10,6 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit"
   },
-  "browserslist": [
-    "iOS >= 12",
-    "Safari >= 12",
-    "Chrome >= 80",
-    "Firefox >= 78",
-    "Edge >= 88"
-  ],
   "dependencies": {
     "core-js": "^3.39.0",
     "lucide-react": "^0.469.0",
