@@ -2,6 +2,19 @@
 
 This guide will help you deploy Weave on a Kamatera cloud server with all services including Ollama, Docker, and ngrok tunneling.
 
+## Before You Start
+
+### Create GitLab Repository
+
+1. Go to https://gitlab.com and sign in as `daudi.abinallah`
+2. Click "New project" → "Create blank project"
+3. Set project name: `weave`
+4. Set visibility: Private (or Public if you prefer)
+5. Click "Create project"
+6. The repository URL will be: `https://gitlab.com/daudi.abinallah/weave.git`
+
+This repository is already configured to push to this URL.
+
 ## Prerequisites
 
 - A Kamatera cloud instance (Ubuntu 20.04/22.04 recommended)
