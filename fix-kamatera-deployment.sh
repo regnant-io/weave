@@ -107,10 +107,19 @@ ollama pull nomic-embed-text
 # Build and start services
 echo "🏗️  Building Docker images..."
 cd /opt/weave
-docker-compose build
+
+# Verify we have docker-compose.yml
+if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Error: docker-compose.yml not found in /opt/weave"
+    echo "Current directory contents:"
+    ls -la
+    exit 1
+fi
+
+sudo docker-compose build
 
 echo "🚀 Starting all services..."
-docker-compose --profile deep up -d
+sudo docker-compose --profile deep up -d
 
 # Wait for services
 sleep 30
@@ -118,7 +127,7 @@ sleep 30
 # Check status
 echo ""
 echo "📊 Service Status:"
-docker-compose ps
+sudo docker-compose ps
 
 # Start ngrok
 echo ""
