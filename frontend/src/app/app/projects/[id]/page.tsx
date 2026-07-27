@@ -30,7 +30,7 @@ export default async function ProjectMemoryPage({ params }: { params: Promise<{ 
         <ProjectMemoryClient
           projectId={id}
           language={language}
-          hypotheses={project.hypotheses as never}
+          hypotheses={(project.hypotheses || {}) as never}
           notes={project.notes ?? []}
           summary={project.summary}
         />

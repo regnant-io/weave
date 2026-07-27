@@ -14,11 +14,18 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Compression is handled at the CDN (Brotli) per architecture 4.1; Next also
-  // gzips by default in production.
   compress: true,
+  
+  // Browser compatibility for older devices (iOS 15, etc.)
+  compiler: {
+    // Remove console.log in production
+    removeConsole: process.env.NODE_ENV === 'production',
+  },
+  
+  // Transpile for older browsers
+  transpilePackages: ['lucide-react', 'react-markdown', 'remark-gfm'],
+  
   async rewrites() {
-    // Evaluated at server start (runtime), so it picks up the live env value.
     const backend = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
     return [{ source: "/api/backend-health", destination: `${backend}/health` }];
   },
