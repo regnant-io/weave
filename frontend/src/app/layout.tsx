@@ -82,7 +82,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             __html:
               "document.documentElement.classList.remove('no-js');" +
               "try{var m=document.cookie.match(/weave_theme=(light|dark)/);if(m){document.documentElement.setAttribute('data-theme',m[1]);}else{document.documentElement.removeAttribute('data-theme');}}catch(e){}" +
-              "if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});}",
+              "if('serviceWorker' in navigator){" +
+              "navigator.serviceWorker.getRegistrations().then(function(regs){" +
+              "regs.forEach(function(reg){if(reg.active&&reg.active.scriptURL.includes('/sw.js')){reg.update();}});" +
+              "});" +
+              "window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});" +
+              "}",
           }}
         />
       </head>
