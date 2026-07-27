@@ -1,0 +1,736 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   WEAVE — Editorial Hybrid design system
+   ----------------------------------------------------------------------------
+   Derived from design.md (Minimalist Monochrome) with two deliberate overrides
+   agreed with the product owner:
+
+     1. ACCENT — design.md forbids accent colour. We use a single burnt-orange
+        ink instead. It is the ONLY hue in the system; everything else is a warm
+        monochrome ramp. Warm neutrals (not cold greys) are what let the orange
+        read as *ink on paper* rather than as a UI highlight.
+
+     2. MOTION — design.md wants instant/binary transitions. We want organic.
+        Motion here is slow-out, never bouncy, and always interruptible. The
+        easing curves below are the whole personality: --ease-out-expo for
+        anything that reveals, --ease-out-soft for anything that responds.
+
+   Everything else is faithful: line-based structure, dramatic negative space,
+   typography as the hero, layered textures instead of flat fills, inversion for
+   emphasis. Corners are sharp on CONTENT (blocks, cards, rules) and softened
+   only on CHROME (controls the thumb touches) — that is the "hybrid".
+
+   Light + dark are full peers. Every token is redefined, none inherited.
+   ========================================================================== */
+
+:root,
+:root[data-theme="light"] {
+  /* -- warm monochrome ramp (paper) -- */
+  --bg: #ffffff;
+  --bg-subtle: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f4f3f0;
+  --surface-3: #edece8;
+  --surface-hover: #e9e7e2;
+  --border: #e4e2dd;          /* hairline — structure without mass */
+  --border-mid: #cfccc5;
+  --border-strong: #12110f;   /* editorial rule — full ink */
+  --fg: #12110f;
+  --fg-muted: #57544e;
+  --fg-faint: #8c887f;
+
+  /* -- the single hue -- */
+  --accent: #d4451d;
+  --accent-strong: #a8320f;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(212, 69, 29, 0.08);
+  --accent-line: rgba(212, 69, 29, 0.3);
+  --accent-glow: rgba(212, 69, 29, 0.22);
+
+  /* -- status (desaturated to sit beside the orange, never compete) -- */
+  --danger: #b3261e;
+  --danger-soft: rgba(179, 38, 30, 0.1);
+  --warn: #8a6100;
+  --warn-soft: rgba(138, 97, 0, 0.1);
+  --ok: #2f6b46;
+  --ok-soft: rgba(47, 107, 70, 0.1);
+
+  /* -- depth: chrome only, and barely -- */
+  --shadow-sm: 0 1px 2px rgba(18, 17, 15, 0.04);
+  --shadow: 0 1px 2px rgba(18, 17, 15, 0.04), 0 8px 24px rgba(18, 17, 15, 0.06);
+  --shadow-lg: 0 2px 8px rgba(18, 17, 15, 0.06), 0 24px 64px rgba(18, 17, 15, 0.12);
+
+  /* -- texture inks -- */
+  --texture-ink: 18, 17, 15;
+  --texture-strength: 0.028;
+  --noise-strength: 0.02;
+
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0c0b0a;
+  --bg-subtle: #121110;
+  --surface: #151412;
+  --surface-2: #1d1b19;
+  --surface-3: #26241f;
+  --surface-hover: #2c2925;
+  --border: #2a2724;
+  --border-mid: #3d3934;
+  --border-strong: #f2f0eb;
+  --fg: #f2f0eb;
+  --fg-muted: #a8a399;
+  --fg-faint: #6e6a62;
+
+  --accent: #ff7043;
+  --accent-strong: #ff8a65;
+  --accent-fg: #1a0a04;
+  --accent-soft: rgba(255, 112, 67, 0.12);
+  --accent-line: rgba(255, 112, 67, 0.34);
+  --accent-glow: rgba(255, 112, 67, 0.3);
+
+  --danger: #ff6b6b;
+  --danger-soft: rgba(255, 107, 107, 0.13);
+  --warn: #e0a740;
+  --warn-soft: rgba(224, 167, 64, 0.13);
+  --ok: #5fbe8a;
+  --ok-soft: rgba(95, 190, 138, 0.13);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 2px 8px rgba(0, 0, 0, 0.5), 0 24px 64px rgba(0, 0, 0, 0.66);
+
+  --texture-ink: 242, 240, 235;
+  --texture-strength: 0.032;
+  --noise-strength: 0.024;
+
+  color-scheme: dark;
+}
+
+/* Follow the OS when the user has expressed no preference. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #0c0b0a;
+    --bg-subtle: #121110;
+    --surface: #151412;
+    --surface-2: #1d1b19;
+    --surface-3: #26241f;
+    --surface-hover: #2c2925;
+    --border: #2a2724;
+    --border-mid: #3d3934;
+    --border-strong: #f2f0eb;
+    --fg: #f2f0eb;
+    --fg-muted: #a8a399;
+    --fg-faint: #6e6a62;
+    --accent: #ff7043;
+    --accent-strong: #ff8a65;
+    --accent-fg: #1a0a04;
+    --accent-soft: rgba(255, 112, 67, 0.12);
+    --accent-line: rgba(255, 112, 67, 0.34);
+    --accent-glow: rgba(255, 112, 67, 0.3);
+    --danger: #ff6b6b;
+    --danger-soft: rgba(255, 107, 107, 0.13);
+    --warn: #e0a740;
+    --warn-soft: rgba(224, 167, 64, 0.13);
+    --ok: #5fbe8a;
+    --ok-soft: rgba(95, 190, 138, 0.13);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 2px 8px rgba(0, 0, 0, 0.5), 0 24px 64px rgba(0, 0, 0, 0.66);
+    --texture-ink: 242, 240, 235;
+    --texture-strength: 0.032;
+    --noise-strength: 0.024;
+    color-scheme: dark;
+  }
+}
+
+/* -- shape: sharp content, soft chrome ------------------------------------ */
+:root {
+  --r-none: 0px;
+  --r-xs: 2px;
+  --r-sm: 4px;
+  --r-md: 7px;
+  --r-lg: 11px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* -- motion: the personality lives here --------------------------------- */
+  --ease-out-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-soft: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-organic: cubic-bezier(0.4, 0.14, 0.3, 1);
+  --dur-instant: 90ms;
+  --dur-fast: 150ms;
+  --dur: 260ms;
+  --dur-slow: 420ms;
+  --dur-panel: 520ms;
+
+  /* type */
+  --font-display: var(--font-playfair), Georgia, "Times New Roman", serif;
+  --font-read: var(--font-source-serif), Georgia, serif;
+  --font-ui: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+/* Colour-only theme transition. Never transition layout. */
+body,
+.themed {
+  transition: background-color var(--dur) var(--ease-out-soft),
+    color var(--dur) var(--ease-out-soft), border-color var(--dur) var(--ease-out-soft);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+/* -- focus: editorial, never a glow blob ---------------------------------- */
+:where(a, button, [role="button"], input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* -- scrollbars: hairline, unobtrusive ------------------------------------ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-mid) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-mid);
+  border-radius: var(--r-full);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-faint);
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.no-js-banner {
+  display: none;
+}
+.no-js .no-js-banner {
+  display: block;
+}
+
+/* ==========================================================================
+   TEXTURES — design.md is emphatic that flat = failure. These are applied via
+   ::before overlays so they never interfere with the element's own background.
+   ========================================================================== */
+
+.tx-lines::before,
+.tx-grid::before,
+.tx-diagonal::before,
+.tx-noise::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.tx-lines::before {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 1px,
+    rgb(var(--texture-ink)) 1px,
+    rgb(var(--texture-ink)) 2px
+  );
+  background-size: 100% 4px;
+  opacity: var(--texture-strength);
+}
+
+.tx-grid::before {
+  background-image: linear-gradient(rgb(var(--texture-ink)) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--texture-ink)) 1px, transparent 1px);
+  background-size: 40px 40px;
+  opacity: calc(var(--texture-strength) * 0.7);
+}
+
+.tx-diagonal::before {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 40px,
+    rgb(var(--texture-ink)) 40px,
+    rgb(var(--texture-ink)) 41px
+  );
+  opacity: calc(var(--texture-strength) * 0.5);
+}
+
+.tx-noise::before {
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: var(--noise-strength);
+  mix-blend-mode: var(--noise-blend, multiply);
+}
+:root[data-theme="dark"] .tx-noise::before {
+  --noise-blend: screen;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .tx-noise::before {
+    --noise-blend: screen;
+  }
+}
+
+/* Editorial rules — structure by line, not by box. */
+.rule-hair {
+  border-top: 1px solid var(--border);
+}
+.rule-thin {
+  border-top: 1px solid var(--border-strong);
+}
+.rule-thick {
+  border-top: 3px solid var(--border-strong);
+}
+.rule-accent {
+  border-top: 2px solid var(--accent);
+}
+
+/* Small-caps editorial label — used for every section eyebrow in the app. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  font-weight: 500;
+}
+
+.display {
+  font-family: var(--font-display);
+  letter-spacing: -0.025em;
+  line-height: 1.02;
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   READING COLUMN — assistant answers are set as editorial prose, not UI text.
+   ========================================================================== */
+
+.md {
+  color: var(--fg);
+  font-family: var(--font-read);
+  font-size: 16.5px;
+  line-height: 1.72;
+  letter-spacing: -0.003em;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  /* `pretty` avoids orphan/widow reflow, which is a real source of visible
+     line-rewrap jitter while text streams in. */
+  text-wrap: pretty;
+}
+.md > *:first-child {
+  margin-top: 0;
+}
+.md > *:last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 0.95em;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-family: var(--font-display);
+  margin: 1.5em 0 0.5em;
+  line-height: 1.22;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.md h1 {
+  font-size: 1.72em;
+}
+.md h2 {
+  font-size: 1.4em;
+}
+.md h3 {
+  font-size: 1.18em;
+}
+.md h4 {
+  font-size: 1.04em;
+}
+/* An editorial hairline under h2 gives the long answers real rhythm. */
+.md h2 {
+  padding-bottom: 0.28em;
+  border-bottom: 1px solid var(--border);
+}
+.md ul,
+.md ol {
+  margin: 0 0 0.95em;
+  padding-left: 1.35em;
+}
+.md li {
+  margin: 0.3em 0;
+}
+.md li::marker {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.md a {
+  color: var(--fg);
+  text-decoration: none;
+  background-image: linear-gradient(var(--accent), var(--accent));
+  background-size: 100% 1px;
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  transition: background-size var(--dur-fast) var(--ease-out-soft);
+  padding-bottom: 1px;
+}
+.md a:hover {
+  background-size: 100% 2px;
+  color: var(--accent);
+}
+.md strong {
+  font-weight: 650;
+  color: var(--fg);
+}
+.md em {
+  font-style: italic;
+}
+.md blockquote {
+  margin: 1.1em 0;
+  padding: 0.1em 0 0.1em 1.15em;
+  border-left: 2px solid var(--accent);
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 0.1em 0.36em;
+  border-radius: var(--r-xs);
+}
+.md pre {
+  margin: 1.15em 0;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent-line);
+  border-radius: var(--r-xs);
+  overflow-x: auto;
+}
+.md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.md table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.15em 0;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  display: block;
+  overflow-x: auto;
+}
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  text-align: left;
+}
+.md th {
+  background: var(--surface-2);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.md hr {
+  border: none;
+  border-top: 1px solid var(--border-strong);
+  margin: 1.8em 0;
+  opacity: 0.35;
+}
+.md img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+}
+
+/* ==========================================================================
+   MOTION LIBRARY
+   ========================================================================== */
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes shimmerSweep {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -180% 0;
+  }
+}
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes drawStroke {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes tracePulse {
+  0% {
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.animate-rise {
+  animation: riseIn var(--dur-slow) var(--ease-out-expo) both;
+}
+.animate-fade {
+  animation: fadeIn var(--dur) var(--ease-out-soft) both;
+}
+
+/* Live "working" text — a slow ink sweep, not a blinking cursor. */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--fg-faint) 20%,
+    var(--fg) 42%,
+    var(--accent) 50%,
+    var(--fg) 58%,
+    var(--fg-faint) 80%
+  );
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmerSweep 2.6s var(--ease-in-out-soft) infinite;
+}
+
+/* The pulsing dot that marks an in-flight step. */
+.pulse-dot {
+  animation: breathe 1.7s var(--ease-in-out-soft) infinite;
+}
+
+/* ==========================================================================
+   COLLAPSIBLE — grid-template-rows 0fr -> 1fr animates real auto height with
+   no JS measurement, no scrollHeight thrash, and stays smooth when the content
+   inside is still growing (which is exactly our streaming case).
+
+   NAMING: the `wv-` prefix is load-bearing. This was originally `.collapse`,
+   which silently collided with Tailwind's own `.collapse` utility
+   (`visibility: collapse`). Both rules applied; ours set display and
+   grid-template-rows but never `visibility`, so Tailwind's won for that one
+   property and every panel rendered open-but-invisible — content present in
+   the DOM, nothing on screen. Never name a custom class after a Tailwind
+   utility.
+   ========================================================================== */
+
+.wv-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  /* Explicit, so no utility of the same name can ever hide us again. */
+  visibility: visible;
+  transition: grid-template-rows var(--dur-slow) var(--ease-out-expo),
+    opacity var(--dur) var(--ease-out-soft);
+  opacity: 0;
+}
+.wv-collapse[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.wv-collapse > .wv-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Chevron that rotates with the same curve as the panel it controls. */
+.chev {
+  transition: transform var(--dur-slow) var(--ease-out-expo);
+}
+.chev[data-open="true"] {
+  transform: rotate(90deg);
+}
+
+/* ==========================================================================
+   STREAMING — deliberately NO caret. Newly committed text fades up over one
+   beat so growth reads as ink settling rather than as a jump.
+   ========================================================================== */
+
+.stream-in {
+  animation: fadeIn 240ms var(--ease-out-soft) both;
+}
+
+/* Kill browser scroll-anchoring inside the transcript. The browser tries to
+   "helpfully" preserve visual position when content grows above the viewport,
+   which fights our own bottom-pinning and produces the stutter. We own scroll. */
+.transcript,
+.transcript * {
+  overflow-anchor: none;
+}
+.transcript {
+  scroll-behavior: auto; /* smooth-scroll + per-frame growth = jitter */
+  /* Reserve the scrollbar gutter so the column never shifts sideways the
+     moment content becomes tall enough to overflow. */
+  scrollbar-gutter: stable;
+  /* Contain layout/paint so a growing last block cannot invalidate the whole
+     transcript's layout on every frame. */
+  contain: layout paint style;
+}
+
+/* Committed blocks are inert: isolate them so the growing tail can't trigger
+   their repaint. This is what keeps cost flat over a multi-hour run. */
+.block-settled {
+  contain: content;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 1px;
+}
+
+/* ==========================================================================
+   PANEL / RESIZE
+   ========================================================================== */
+
+.panel-enter {
+  animation: panelIn var(--dur-panel) var(--ease-out-expo) both;
+}
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.resize-handle {
+  position: absolute;
+  left: -7px;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  cursor: col-resize;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+.resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease-out-soft);
+}
+.resize-handle:hover::before,
+.resize-handle[data-dragging="true"]::before {
+  opacity: 1;
+}
+
+/* ==========================================================================
+   UTILITIES
+   ========================================================================== */
+
+.hide-scrollbar {
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Inversion for emphasis — design.md's substitute for a second colour. */
+.invert-surface {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .wv-collapse {
+    transition: none;
+  }
+  .shimmer {
+    -webkit-text-fill-color: var(--fg-muted);
+    background: none;
+  }
+}

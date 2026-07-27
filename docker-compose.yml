@@ -1,0 +1,183 @@
+# Weave — full stack.
+#
+# Default (no profile): backend (SQLite + offline/anthropic LLM + subprocess
+# sandbox) + frontend. Boots with zero external services.
+#
+#   docker compose up --build
+#     frontend -> http://localhost:3000
+#     backend  -> http://localhost:8000  (docs at /docs)
+#
+# Production-shaped services (Postgres + Redis) are behind the "full" profile:
+#   docker compose --profile full up --build
+# and point WEAVE_DATABASE_URL at the postgres service.
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      # Host 8001 -> container 8000 (8000 on the host may be taken by another app).
+      - "8001:8000"
+    environment:
+      WEAVE_ENVIRONMENT: dev
+      WEAVE_CORS_ORIGINS: '["http://localhost:3000"]'
+      # LLM backend: auto | ollama | anthropic | offline
+      WEAVE_LLM_BACKEND: ${WEAVE_LLM_BACKEND:-auto}
+      # Reach an Ollama server running on the host from inside the container.
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-https://anyplace-portal-wagon.ngrok-free.dev/}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-gemma4:cloud}
+      # Optional: use Ollama for retrieval embeddings too (needs the embed model pulled).
+      WEAVE_OLLAMA_USE_EMBEDDINGS: ${WEAVE_OLLAMA_USE_EMBEDDINGS:-false}
+      WEAVE_OLLAMA_EMBED_MODEL: ${WEAVE_OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      # Provide a real key to use Claude instead; omit to run the offline engine.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Deep-capability services (populated when the "deep" profile is up; empty
+      # otherwise, so the tools simply report themselves unavailable).
+      WEAVE_SEARXNG_URL: ${WEAVE_SEARXNG_URL:-}
+      WEAVE_BROWSERLESS_URL: ${WEAVE_BROWSERLESS_URL:-}
+      WEAVE_RENDER_URL: ${WEAVE_RENDER_URL:-}
+      WEAVE_GOTENBERG_URL: ${WEAVE_GOTENBERG_URL:-}
+      WEAVE_CLICKHOUSE_URL: ${WEAVE_CLICKHOUSE_URL:-}
+      # Background jobs / cache / observability / channels (all optional).
+      WEAVE_REDIS_URL: ${WEAVE_REDIS_URL:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      WEAVE_SMS_PROVIDER: ${WEAVE_SMS_PROVIDER:-log}
+      WEAVE_AT_USERNAME: ${WEAVE_AT_USERNAME:-}
+      WEAVE_AT_API_KEY: ${WEAVE_AT_API_KEY:-}
+      WEAVE_WA_VERIFY_TOKEN: ${WEAVE_WA_VERIFY_TOKEN:-weave-verify}
+      WEAVE_WA_TOKEN: ${WEAVE_WA_TOKEN:-}
+      WEAVE_WA_PHONE_ID: ${WEAVE_WA_PHONE_ID:-}
+      # Use Postgres+pgvector instead of SQLite (bring up with --profile full):
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-}
+    extra_hosts:
+      # Lets host.docker.internal resolve to the host on Linux too (already works
+      # on Docker Desktop for Mac/Windows).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - backend_var:/app/var
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      WEAVE_API_BASE: http://backend:8000
+      NODE_ENV: production
+    depends_on:
+      - backend
+
+  postgres:
+    # pgvector image so the vector extension is available (architecture §2).
+    image: pgvector/pgvector:pg16
+    profiles: ["full"]
+    environment:
+      POSTGRES_USER: weave
+      POSTGRES_PASSWORD: weave
+      POSTGRES_DB: weave
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["full"]
+    ports:
+      - "6379:6379"
+
+  worker:
+    # Celery worker for background jobs (ingestion, heavy analysis, re-summarize).
+    build: ./backend
+    profiles: ["full"]
+    command: ["celery", "-A", "app.tasks", "worker", "--loglevel=info"]
+    environment:
+      WEAVE_REDIS_URL: redis://redis:6379/0
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-postgresql+psycopg://weave:weave@postgres:5432/weave}
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-https://anyplace-portal-wagon.ngrok-free.dev/}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-gemma4:cloud}
+    depends_on:
+      - redis
+    volumes:
+      - backend_var:/app/var
+
+  # ---- Deep-capability services (profile: deep) --------------------------
+  # Start with:  docker compose --profile deep up -d
+  # then point the backend at them (see .env: WEAVE_SEARXNG_URL=http://searxng:8080 etc.)
+
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["deep"]
+    ports:
+      - "8888:8080"
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8888/
+    volumes:
+      # Bind-mount our settings.yml (enables the JSON API + disables the limiter).
+      - ./searxng:/etc/searxng:ro
+
+  browserless:
+    # Headless-Chrome pool for JS-rendered fetches + screenshots + PDF.
+    image: ghcr.io/browserless/chromium:latest
+    profiles: ["deep"]
+    ports:
+      - "3001:3000"
+    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
+    environment:
+      CONCURRENT: "4"
+      TOKEN: ""
+
+  gotenberg:
+    # Deterministic HTML/Markdown -> PDF for decks and reports.
+    image: gotenberg/gotenberg:8
+    profiles: ["deep"]
+    command:
+      - "gotenberg"
+      - "--chromium-start-timeout=60s"       # Chromium is slow to boot under load
+      - "--api-timeout=120s"
+    ports:
+      - "3002:3000"
+    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
+
+  render:
+    # Node render-sandbox: AI specs -> charts / Three.js / decks (see render-service/).
+    build: ./render-service
+    profiles: ["deep"]
+    ports:
+      - "3100:3100"
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["deep"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: weave
+      MINIO_ROOT_PASSWORD: weave-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    profiles: ["deep"]
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    profiles: ["deep"]
+    ports:
+      - "8123:8123"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+volumes:
+  backend_var:
+  pg_data:
+  minio_data:
+  qdrant_data:
+  clickhouse_data:

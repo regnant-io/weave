@@ -1,0 +1,15 @@
+{
+  "name": "weave-render-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Weave visual/presentation render sandbox: AI specs -> charts, 3D, decks.",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "express": "4.21.2",
+    "vega": "5.30.0",
+    "vega-lite": "5.21.0",
+    "three": "0.149.0"
+  }
+}

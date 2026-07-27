@@ -1,0 +1,17 @@
+# Keep the build context small. Host virtualenvs in particular must never be
+# shipped: they are platform-specific, useless inside the image, and get baked
+# in by `COPY . .`. `.venv/` was already ignored but `.venv312/` was not, so
+# ~506MB was being transferred on every build and layered into the image.
+.venv/
+.venv*/
+venv/
+var/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+*.db
+*.sqlite3

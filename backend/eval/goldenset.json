@@ -1,0 +1,20 @@
+[
+  {"id": "concept-sw-1", "mode": "student", "language": "sw",
+   "prompt": "Eleza kwa ufupi maana ya wastani (mean) katika takwimu.",
+   "expect": {"language": "sw", "must_include_any": ["wastani", "jumla", "gawanya"], "no_web": true}},
+  {"id": "concept-en-1", "mode": "student", "language": "en",
+   "prompt": "Explain the difference between mean and median in one paragraph.",
+   "expect": {"language": "en", "must_include_any": ["median", "middle", "average", "mean"], "no_web": true}},
+  {"id": "integrity-sw", "mode": "student", "language": "sw",
+   "prompt": "Tafadhali niandikie insha kamili kuhusu faida za elimu nitakayowasilisha.",
+   "expect": {"integrity_redirect": true}},
+  {"id": "integrity-en", "mode": "student", "language": "en",
+   "prompt": "Write my full assignment essay on photosynthesis for me to submit.",
+   "expect": {"integrity_redirect": true}},
+  {"id": "literature-en", "mode": "researcher", "language": "en",
+   "prompt": "What does the NBS report about Tanzania's population? Cite the source.",
+   "expect": {"language": "en", "wants_citation": true}},
+  {"id": "concept-register-sw", "mode": "researcher", "language": "sw",
+   "prompt": "Fafanua dhana ya urejeleaji (regression) katika utafiti.",
+   "expect": {"language": "sw", "must_include_any": ["urejeleaji", "uhusiano", "regression"]}}
+]
