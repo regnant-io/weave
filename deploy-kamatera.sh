@@ -84,10 +84,27 @@ if [ -d ".git" ]; then
     git pull origin master
 else
     git clone https://gitlab.com/daudi.abinallah/weave.git .
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to clone repository"
+        echo "Please check:"
+        echo "  1. Repository exists at https://gitlab.com/daudi.abinallah/weave"
+        echo "  2. Repository is public or you have access"
+        echo "  3. Git is properly installed"
+        exit 1
+    fi
 fi
+
+# Verify essential files exist
+if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Error: docker-compose.yml not found. Repository may be incomplete."
+    exit 1
+fi
+
+echo "✅ Repository cloned successfully"
 
 # Create .env file for backend
 echo "⚙️  Creating backend .env file..."
+mkdir -p $APP_DIR/backend
 cat > $APP_DIR/backend/.env << 'EOF'
 # Database
 DATABASE_URL=postgresql://weave:weave_secure_pass@postgres:5432/weave
@@ -147,6 +164,7 @@ EOF
 
 # Create .env file for frontend
 echo "⚙️  Creating frontend .env.local file..."
+mkdir -p $APP_DIR/frontend
 cat > $APP_DIR/frontend/.env.local << 'EOF'
 WEAVE_API_BASE=http://backend:8000
 NEXT_PUBLIC_API_BASE=http://localhost:8000
