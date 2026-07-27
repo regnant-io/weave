@@ -1,7 +1,7 @@
 // Weave service worker — offline-tolerant shell (architecture 4.1 / v2 PWA).
 // Static assets: cache-first. Navigations: network-first with an offline fallback.
 // API + SSE (/api/*) are always network (never cached).
-const CACHE = "weave-v1";
+const CACHE = "weave-v2";
 const SHELL = ["/", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (e) => {
