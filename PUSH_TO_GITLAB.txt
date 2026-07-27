@@ -1,0 +1,194 @@
+═══════════════════════════════════════════════════════════════
+  WEAVE PROJECT - READY TO PUSH TO GITLAB
+═══════════════════════════════════════════════════════════════
+
+✅ All code is committed and ready to push!
+✅ Deployment script created with ngrok integration
+✅ Comprehensive documentation added
+
+═══════════════════════════════════════════════════════════════
+  STEP 1: CREATE GITLAB PROJECT
+═══════════════════════════════════════════════════════════════
+
+1. Open browser: https://gitlab.com
+2. Sign in as: daudi.abinallah
+3. Click "+" → "New project/repository" → "Create blank project"
+4. Project name: weave
+5. Project URL: https://gitlab.com/daudi.abinallah/weave
+6. Visibility: Private (recommended)
+7. ❌ UNCHECK "Initialize repository with a README"
+8. Click "Create project"
+
+═══════════════════════════════════════════════════════════════
+  STEP 2: PUSH CODE TO GITLAB
+═══════════════════════════════════════════════════════════════
+
+After creating the project, run this command:
+
+    git push -u origin master
+
+If you need authentication, use one of these methods:
+
+METHOD A - Personal Access Token (Easiest):
+1. Go to: https://gitlab.com/-/profile/personal_access_tokens
+2. Create token with scopes: api, read_repository, write_repository
+3. Copy the token
+4. Run:
+   git remote set-url origin https://oauth2:YOUR_TOKEN@gitlab.com/daudi.abinallah/weave.git
+   git push -u origin master
+
+METHOD B - SSH Key:
+1. ssh-keygen -t ed25519 -C "daudi.abinallah@gitlab.com"
+2. cat ~/.ssh/id_ed25519.pub (copy output)
+3. Add to: https://gitlab.com/-/profile/keys
+4. Run:
+   git remote set-url origin git@gitlab.com:daudi.abinallah/weave.git
+   git push -u origin master
+
+═══════════════════════════════════════════════════════════════
+  STEP 3: DEPLOY TO KAMATERA
+═══════════════════════════════════════════════════════════════
+
+On your Kamatera server (Ubuntu 20.04/22.04 recommended):
+
+Option 1 - Direct download:
+    curl -o deploy-kamatera.sh https://gitlab.com/daudi.abinallah/weave/-/raw/master/deploy-kamatera.sh
+    chmod +x deploy-kamatera.sh
+    ./deploy-kamatera.sh
+
+Option 2 - Clone repository:
+    git clone https://gitlab.com/daudi.abinallah/weave.git
+    cd weave
+    chmod +x deploy-kamatera.sh
+    ./deploy-kamatera.sh
+
+The script will automatically:
+✅ Install Docker, Docker Compose, Ollama, ngrok
+✅ Pull AI models (llama3.2:3b, nomic-embed-text)
+✅ Configure all services
+✅ Start all containers
+✅ Expose frontend via ngrok
+
+═══════════════════════════════════════════════════════════════
+  WHAT'S INCLUDED
+═══════════════════════════════════════════════════════════════
+
+✅ Backend: FastAPI with PostgreSQL, Qdrant, ClickHouse
+✅ Frontend: Next.js 15 with bilingual UI (Kiswahili/English)
+✅ AI: Ollama with llama3.2:3b and nomic-embed-text
+✅ Storage: MinIO (S3-compatible)
+✅ Search: SearXNG (private search engine)
+✅ Tools: Browserless, Gotenberg, Render service
+✅ Tunnel: ngrok (already configured with your token)
+
+═══════════════════════════════════════════════════════════════
+  REPOSITORY STRUCTURE
+═══════════════════════════════════════════════════════════════
+
+weave/
+├── README.md                    # Project overview
+├── DEPLOY.md                    # Deployment documentation
+├── GITLAB_SETUP.md              # GitLab setup instructions
+├── deploy-kamatera.sh           # Automated deployment script
+├── docker-compose.yml           # Docker orchestration
+├── architecture.md              # System architecture
+├── design.md                    # Design documentation
+├── ROADMAP.md                   # Development roadmap
+├── backend/                     # FastAPI backend
+│   ├── app/                     # Application code
+│   ├── tests/                   # Test suite
+│   ├── Dockerfile               # Backend container
+│   └── requirements.txt         # Python dependencies
+├── frontend/                    # Next.js frontend
+│   ├── src/                     # Source code
+│   ├── public/                  # Static assets
+│   ├── Dockerfile               # Frontend container
+│   └── package.json             # Node dependencies
+└── render-service/              # Visualization service
+    └── server.js                # Render server
+
+═══════════════════════════════════════════════════════════════
+  COMMITS READY TO PUSH
+═══════════════════════════════════════════════════════════════
+
+200c386 - Update deployment script with GitLab repository URL
+74cc2cc - Add comprehensive GitLab setup and push instructions
+8f1aa09 - Add GitLab repository setup instructions
+4ddbdca - Add Kamatera cloud deployment script
+347845b - Add complete Weave project
+15c48f7 - Fix React error #31 and service worker issues
+
+═══════════════════════════════════════════════════════════════
+  NGROK CONFIGURATION
+═══════════════════════════════════════════════════════════════
+
+✅ Auth token already configured in deployment script:
+   3H4wuqzRY3EcfGMJwif0rPscF4I_6h93bQynFGPkb7yRgSpc3
+
+The deployment script will:
+1. Install ngrok
+2. Configure with your auth token
+3. Create tunnel to frontend (port 3000)
+4. Display the public URL
+
+═══════════════════════════════════════════════════════════════
+  SYSTEM REQUIREMENTS (KAMATERA)
+═══════════════════════════════════════════════════════════════
+
+Minimum (Testing):
+- CPU: 4 cores
+- RAM: 8GB
+- Disk: 50GB SSD
+
+Recommended (Production):
+- CPU: 8 cores
+- RAM: 16GB
+- Disk: 100GB SSD
+
+Heavy Load (All services + AI):
+- CPU: 16 cores
+- RAM: 32GB
+- Disk: 200GB SSD
+
+═══════════════════════════════════════════════════════════════
+  AFTER DEPLOYMENT
+═══════════════════════════════════════════════════════════════
+
+You'll get access to:
+
+Frontend:       https://xxxx.ngrok-free.app (public)
+                http://localhost:3000 (local)
+
+Backend API:    http://localhost:8000
+API Docs:       http://localhost:8000/docs
+
+MinIO:          http://localhost:9001
+Qdrant:         http://localhost:6333/dashboard
+ClickHouse:     http://localhost:8123
+Ollama:         http://localhost:11434
+
+═══════════════════════════════════════════════════════════════
+  SUPPORT & DOCUMENTATION
+═══════════════════════════════════════════════════════════════
+
+📖 Full deployment guide:     See DEPLOY.md
+📖 GitLab setup guide:        See GITLAB_SETUP.md
+📖 Project documentation:     See README.md
+📖 Architecture details:      See architecture.md
+📖 Development roadmap:       See ROADMAP.md
+
+═══════════════════════════════════════════════════════════════
+  NEXT STEPS
+═══════════════════════════════════════════════════════════════
+
+1. ✅ Create GitLab project (https://gitlab.com/projects/new)
+2. ✅ Push code: git push -u origin master
+3. ✅ Verify upload: https://gitlab.com/daudi.abinallah/weave
+4. ✅ Deploy to Kamatera: run deploy-kamatera.sh
+5. ✅ Access via ngrok URL
+6. ✅ Create admin account
+7. ✅ Start using Weave!
+
+═══════════════════════════════════════════════════════════════
+
+Ready to deploy! 🚀
