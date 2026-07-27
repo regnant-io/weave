@@ -83,10 +83,7 @@ if [ -d ".git" ]; then
     echo "Repository already exists, pulling latest changes..."
     git pull origin master
 else
-    # Replace with actual GitLab URL once created
-    # git clone https://gitlab.com/daudi.abinallah/weave.git .
-    echo "⚠️  Repository URL will be added after GitLab project creation"
-    echo "For now, you'll need to upload the code manually or use git clone"
+    git clone https://gitlab.com/daudi.abinallah/weave.git .
 fi
 
 # Create .env file for backend
