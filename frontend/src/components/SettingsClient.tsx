@@ -86,40 +86,44 @@ export default function SettingsClient({
       </Section>
 
       {/* System / capabilities */}
-      {health && (
+      {health && health.llm_engine && (
         <Section title={sw ? "Mfumo na uwezo" : "System & capabilities"}>
           <Info label="LLM engine" value={health.llm_engine} />
           <Info label={sw ? "Embeddings" : "Embeddings"} value={health.embedding_backend} />
           <Info label="Sandbox" value={health.sandbox_backend} />
           <Info label="Database" value={health.database} />
-          <div className="pt-2">
-            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-fg-faint">
-              {sw ? "Zana zinazopatikana" : "Available tools"}
+          {health.tools && health.tools.length > 0 && (
+            <div className="pt-2">
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-fg-faint">
+                {sw ? "Zana zinazopatikana" : "Available tools"}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {health.tools.map((tool) => (
+                  <span key={tool} className="rounded-sm bg-surface-2 px-2 py-1 text-xs text-fg-muted">{tool}</span>
+                ))}
+              </div>
             </div>
-            <div className="flex flex-wrap gap-1.5">
-              {health.tools.map((tool) => (
-                <span key={tool} className="rounded-sm bg-surface-2 px-2 py-1 text-xs text-fg-muted">{tool}</span>
-              ))}
+          )}
+          {health.capabilities && Object.keys(health.capabilities).length > 0 && (
+            <div className="pt-3">
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-fg-faint">
+                {sw ? "Huduma" : "Services"}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(health.capabilities).map(([k, on]) => (
+                  <span
+                    key={k}
+                    className={`inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs ${
+                      on ? "bg-accent-soft text-accent" : "bg-surface-2 text-fg-faint"
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${on ? "bg-accent" : "bg-fg-faint"}`} />
+                    {k}
+                  </span>
+                ))}
+              </div>
             </div>
-          </div>
-          <div className="pt-3">
-            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-fg-faint">
-              {sw ? "Huduma" : "Services"}
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {Object.entries(health.capabilities).map(([k, on]) => (
-                <span
-                  key={k}
-                  className={`inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs ${
-                    on ? "bg-accent-soft text-accent" : "bg-surface-2 text-fg-faint"
-                  }`}
-                >
-                  <span className={`h-1.5 w-1.5 rounded-full ${on ? "bg-accent" : "bg-fg-faint"}`} />
-                  {k}
-                </span>
-              ))}
-            </div>
-          </div>
+          )}
         </Section>
       )}
     </div>
