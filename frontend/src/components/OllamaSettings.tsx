@@ -13,25 +13,44 @@ export default function OllamaSettings({ language }: { language: Language }) {
   const [saved, setSaved] = useState(false);
 
   async function refresh() {
-    const [cfg, m] = await Promise.all([
-      fetch("/api/ollama-config").then((r) => r.json()).catch(() => ({})),
-      fetch("/api/models").then((r) => r.json()).catch(() => ({ models: [] })),
-    ]);
-    setHost(cfg.ollama_host ?? "");
-    setModel(cfg.ollama_model ?? "");
-    setModels(m.models ?? []);
+    try {
+      const cfgRes = await fetch("/api/ollama-config");
+      const cfg = cfgRes.ok ? await cfgRes.json() : {};
+      const mRes = await fetch("/api/models");
+      const m = mRes.ok ? await mRes.json() : { models: [] };
+      
+      setHost(cfg.ollama_host || "");
+      setModel(cfg.ollama_model || "");
+      setModels(m.models || []);
+    } catch (err) {
+      console.error("Failed to load Ollama config:", err);
+      setHost("");
+      setModel("");
+      setModels([]);
+    }
   }
   useEffect(() => { refresh(); }, []);
 
   async function save() {
-    setSaving(true); setSaved(false);
-    await fetch("/api/ollama-config", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ host, model }),
-    });
-    await refresh();
-    setSaving(false); setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    try {
+      setSaving(true); 
+      setSaved(false);
+      const response = await fetch("/api/ollama-config", {
+        method: "POST", 
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host: host, model: model }),
+      });
+      if (!response.ok) {
+        console.error("Failed to save Ollama config:", response.status);
+      }
+      await refresh();
+      setSaving(false); 
+      setSaved(true);
+      setTimeout(function() { setSaved(false); }, 2000);
+    } catch (err) {
+      console.error("Error saving Ollama config:", err);
+      setSaving(false);
+    }
   }
 
   return (

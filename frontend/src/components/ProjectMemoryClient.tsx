@@ -19,13 +19,22 @@ export default function ProjectMemoryClient({
   const [busy, setBusy] = useState(false);
 
   async function call(action: string, method: string, body?: object) {
-    setBusy(true);
-    await fetch(`/api/projects/${projectId}/${action}`, {
-      method, headers: { "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    setBusy(false);
-    router.refresh();
+    try {
+      setBusy(true);
+      const response = await fetch(`/api/projects/${projectId}/${action}`, {
+        method, 
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!response.ok) {
+        console.error(`Failed to ${action}:`, response.status);
+      }
+      setBusy(false);
+      router.refresh();
+    } catch (err) {
+      console.error(`Error in ${action}:`, err);
+      setBusy(false);
+    }
   }
 
   const cycle = (s?: string) => (s === "open" ? "supported" : s === "supported" ? "refuted" : "open");
