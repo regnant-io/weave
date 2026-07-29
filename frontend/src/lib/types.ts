@@ -53,6 +53,51 @@ export interface WebImage {
 
 export type Effort = "spool" | "weave" | "tapestry";
 
+/** One conversation inside a project. */
+export interface Thread {
+  id: string;
+  project_id: string;
+  title: string;
+  summary: string;
+  status: "active" | "archived" | "rolled";
+  parent_thread_id: string | null;
+  token_estimate: number;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A fact the assistant carries across every chat in a project. */
+export interface MemoryEntry {
+  id: string;
+  key: string;
+  content: string;
+  kind: "fact" | "decision" | "preference" | "finding" | "question" | "artifact";
+  importance: number;
+  thread_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UsageStats {
+  projects: number;
+  sessions: number;
+  messages: number;
+  prompts: number;
+  total_tokens: number;
+  active_days: number;
+  current_streak: number;
+  longest_streak: number;
+  peak_hour: number | null;
+  busiest_weekday: number | null;
+  favourite_model: string;
+  datasets: number;
+  analyses: number;
+  top_tools: Array<{ name: string; count: number }>;
+  last_active: string | null;
+  activity: Array<{ date: string; active: boolean }>;
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant";

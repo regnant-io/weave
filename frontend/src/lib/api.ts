@@ -2,7 +2,16 @@
 // httpOnly auth cookie is attached here and never exposed to client JS.
 import "server-only";
 import { getToken } from "./session";
-import type { Dataset, Message, Project, SourcePassage, User } from "./types";
+import type {
+  Dataset,
+  MemoryEntry,
+  Message,
+  Project,
+  SourcePassage,
+  Thread,
+  UsageStats,
+  User,
+} from "./types";
 
 const API_BASE = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
 const PREFIX = "/api/v1";
@@ -71,6 +80,51 @@ export const api = {
   createProject: (title: string, mode: string) =>
     request<Project>("/projects", { method: "POST", body: JSON.stringify({ title, mode }) }),
   getMessages: (id: string) => request<Message[]>(`/projects/${id}/messages`),
+
+  listThreads: (projectId: string) => request<Thread[]>(`/projects/${projectId}/threads`),
+  getThreadMessages: (projectId: string, threadId: string) =>
+    request<Message[]>(`/projects/${projectId}/threads/${threadId}/messages`),
+  listMemory: (projectId: string) => request<MemoryEntry[]>(`/projects/${projectId}/memory`),
+
+  usageStats: async (): Promise<UsageStats | null> => {
+    // The welcome screen must render even when analytics fail — a dashboard is
+    // not worth blocking the page the user actually came for.
+    try {
+      return await request<UsageStats>("/stats");
+    } catch {
+      return null;
+    }
+  },
+
+  /** Model catalog + the resolved context windows. Never throws. */
+  models: async () => {
+    try {
+      return await request<{
+        models: Array<{ name: string; context?: number; trained_context?: number }>;
+        current_model: string;
+        engine: string;
+        num_ctx_fallback: number;
+        num_ctx_ceiling: number;
+      }>("/models");
+    } catch {
+      return null;
+    }
+  },
+
+  workspaceStatus: async () => {
+    try {
+      return await request<{
+        enabled: boolean;
+        image: string;
+        network: boolean;
+        memory_mb: number;
+        cpus: number;
+        default_timeout: number;
+      }>("/workspace/status");
+    } catch {
+      return null;
+    }
+  },
 
   getDatasetProfile: (id: string) => request<Dataset>(`/datasets/${id}/profile`),
   listProjectDatasets: (projectId: string) =>

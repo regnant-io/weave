@@ -81,7 +81,41 @@ export interface TextBlock {
   text: string;
 }
 
-export type Block = TextBlock | StepBlock;
+/** One question the assistant is blocking on. */
+export interface AskUserQuestion {
+  question: string;
+  header?: string;
+  options: { label: string; description?: string }[];
+  multi_select?: boolean;
+}
+
+export interface AskUserRequest {
+  id: string;
+  questions: AskUserQuestion[];
+  answered?: boolean;
+}
+
+/**
+ * A blocking question, placed in the timeline where it was asked.
+ *
+ * It is a BLOCK rather than a floating modal on purpose: the question belongs to
+ * the moment in the work that raised it, and a modal would hide the reasoning
+ * that makes the question answerable.
+ */
+export interface AskBlock {
+  kind: "ask";
+  id: string;
+  request: AskUserRequest;
+}
+
+/** Generated output rendered inline, in the order it was produced. */
+export interface ArtifactBlock {
+  kind: "artifact";
+  id: string;
+  artifact: Artifact;
+}
+
+export type Block = TextBlock | StepBlock | AskBlock | ArtifactBlock;
 
 export interface ChatTurn {
   id: string;
@@ -100,6 +134,8 @@ export interface ChatTurn {
 
 export const isStep = (b: Block): b is StepBlock => b.kind === "step";
 export const isText = (b: Block): b is TextBlock => b.kind === "text";
+export const isAsk = (b: Block): b is AskBlock => b.kind === "ask";
+export const isArtifactBlock = (b: Block): b is ArtifactBlock => b.kind === "artifact";
 
 /** Total text of an assistant turn (for copy, and for history round-trips). */
 export function turnText(t: ChatTurn): string {
@@ -114,7 +150,10 @@ export function turnText(t: ChatTurn): string {
 /** Every artifact a turn produced, from its own list and from inside its steps. */
 export function turnArtifacts(t: ChatTurn): Artifact[] {
   const out = [...t.artifacts];
-  for (const b of t.blocks) if (isStep(b)) out.push(...b.artifacts);
+  for (const b of t.blocks) {
+    if (isStep(b)) out.push(...b.artifacts);
+    else if (isArtifactBlock(b)) out.push(b.artifact);
+  }
   const seen = new Set<string>();
   return out.filter((a) => (seen.has(a.url) ? false : (seen.add(a.url), true)));
 }

@@ -5,70 +5,116 @@ import { useCallback, useEffect, useRef } from "react";
 /**
  * Rate-smoothed token drain.
  *
- * Raw SSE arrives in lumps: the network coalesces, and a local Ollama emits a
- * whole word (sometimes a whole sentence) per message. Flushing whatever landed
- * once per frame — the old behaviour — reproduces that lumpiness exactly, so
- * text arrives in visible chunks with dead frames between them.
+ * Raw SSE arrives in lumps: the network coalesces frames, and a local Ollama
+ * emits a whole word — sometimes a whole sentence — per message. Flushing
+ * whatever landed once per frame reproduces that lumpiness exactly, so text
+ * arrives in visible chunks with dead frames between them.
  *
- * Instead we treat arriving text as a reservoir and release it at a controlled
- * rate, so the reader sees continuous flow regardless of how bursty the source
- * is. The rate adapts: we always aim to empty the reservoir within
- * DRAIN_TARGET_MS, so we track a fast model closely and never build a lag the
- * user would notice, while a slow model still reads as a steady hand rather
- * than a stutter.
+ * Arriving text is treated as a reservoir and released at a controlled rate, so
+ * the reader sees continuous flow regardless of how bursty the source is.
+ *
+ * Three properties make it read as smooth rather than merely fast:
+ *
+ *  1. TIME-BASED, not frame-based. The previous version released
+ *     `pending / (140ms / 16.67ms)` characters per frame, which silently
+ *     assumed 60Hz. On a 120Hz iPad that drained twice as fast as intended, and
+ *     on a struggling low-end Android it stalled. Here the release is
+ *     `rate × elapsed`, measured from the real clock, so the perceived speed is
+ *     identical on every device.
+ *
+ *  2. The rate is EASED, not recomputed. A burst arriving mid-sentence would
+ *     otherwise cause an instant speed-up that reads as a stutter; an
+ *     exponential moving average lets the rate accelerate over a few frames
+ *     instead of stepping.
+ *
+ *  3. Releases land on WORD boundaries, so words never visibly assemble letter
+ *     by letter — which reads as glitchy rather than fluid.
  *
  * There is deliberately no caret. Growth is the only motion cue.
  */
 
-const FRAME_MS = 1000 / 60;
-/** Empty whatever is buffered within roughly this long. */
-const DRAIN_TARGET_MS = 140;
-/** Never slower than this, or a trickle of tokens looks frozen. */
-const MIN_CHARS_PER_FRAME = 1;
-/** Backlog past this means the model is way ahead; dump faster to catch up. */
-const FLOOD_THRESHOLD = 900;
+/** Aim to have emptied whatever is buffered within roughly this long. */
+const DRAIN_TARGET_MS = 130;
+/** Land the tail within this long once the transport has closed. */
+const FINISH_TARGET_MS = 220;
+/** Backlog past this means the model is far ahead; shorten the target. */
+const FLOOD_CHARS = 700;
+/** Chars/ms. ~0.02 is a readable trickle; without a floor a slow model freezes. */
+const MIN_RATE = 0.02;
+/** Chars/ms ceiling, so a huge paste still reads as fast typing, not a jump. */
+const MAX_RATE = 3.5;
+/** EMA weight for new rate observations. Lower = smoother, slower to react. */
+const RATE_SMOOTHING = 0.18;
+/** Never spend longer than this hunting for a word boundary. */
+const BOUNDARY_LOOKAHEAD = 16;
 
 export function useSmoothStream(onChars: (chunk: string) => void) {
   const buffer = useRef("");
   const raf = useRef<number | null>(null);
   const running = useRef(false);
   const finishing = useRef(false);
+  const rate = useRef(0); // chars per millisecond
+  const lastTs = useRef(0);
+  const carry = useRef(0); // sub-character remainder, so slow rates still advance
   const onCharsRef = useRef(onChars);
   onCharsRef.current = onChars;
 
-  const tick = useCallback(() => {
+  const stop = useCallback(() => {
+    running.current = false;
+    finishing.current = false;
+    if (raf.current !== null) cancelAnimationFrame(raf.current);
+    raf.current = null;
+    rate.current = 0;
+    carry.current = 0;
+  }, []);
+
+  const tick = useCallback((ts: number) => {
     const pending = buffer.current.length;
 
     if (pending === 0) {
       if (finishing.current) {
-        running.current = false;
-        finishing.current = false;
-        raf.current = null;
+        stop();
         return;
       }
+      // Idle but still connected: keep the loop alive and the clock current, or
+      // the first frame after a gap would release a huge burst.
+      lastTs.current = ts;
+      rate.current = 0;
       raf.current = requestAnimationFrame(tick);
       return;
     }
 
-    const framesInTarget = Math.max(1, DRAIN_TARGET_MS / FRAME_MS);
-    let n = Math.ceil(pending / framesInTarget);
+    const elapsed = lastTs.current ? Math.min(64, ts - lastTs.current) : 16;
+    lastTs.current = ts;
 
-    if (pending > FLOOD_THRESHOLD) {
-      // Far behind: release aggressively so latency stays bounded. Still not
-      // the whole buffer, so it reads as fast typing rather than a paste.
-      n = Math.ceil(pending / 3);
-    } else if (finishing.current) {
-      // Stream closed — land the tail promptly but still smoothly.
-      n = Math.max(n, Math.ceil(pending / 8));
+    // Target rate empties the reservoir within the window we're aiming for.
+    const target = finishing.current
+      ? FINISH_TARGET_MS
+      : pending > FLOOD_CHARS
+        ? DRAIN_TARGET_MS / 3
+        : DRAIN_TARGET_MS;
+    const observed = Math.min(MAX_RATE, Math.max(MIN_RATE, pending / target));
+
+    // Ease toward the observed rate rather than snapping to it.
+    rate.current = rate.current
+      ? rate.current + (observed - rate.current) * RATE_SMOOTHING
+      : observed;
+
+    const exact = rate.current * elapsed + carry.current;
+    let n = Math.floor(exact);
+    carry.current = exact - n;
+    if (n < 1) {
+      raf.current = requestAnimationFrame(tick);
+      return;
     }
-    n = Math.max(MIN_CHARS_PER_FRAME, n);
+    if (n > pending) n = pending;
 
-    // Prefer to break on whitespace so words don't visibly assemble letter by
-    // letter mid-word, which reads as glitchy rather than fluid.
+    // Snap forward to the next whitespace so a word is never half-revealed.
     if (n < pending) {
-      const window = buffer.current.slice(n, Math.min(pending, n + 12));
+      const window = buffer.current.slice(n, Math.min(pending, n + BOUNDARY_LOOKAHEAD));
       const ws = window.search(/\s/);
       if (ws >= 0) n += ws + 1;
+      else if (pending - n <= BOUNDARY_LOOKAHEAD) n = pending; // short tail: take it all
     }
 
     const chunk = buffer.current.slice(0, n);
@@ -76,12 +122,14 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
     onCharsRef.current(chunk);
 
     raf.current = requestAnimationFrame(tick);
-  }, []);
+  }, [stop]);
 
   const start = useCallback(() => {
     if (running.current) return;
     running.current = true;
     finishing.current = false;
+    lastTs.current = 0;
+    carry.current = 0;
     raf.current = requestAnimationFrame(tick);
   }, [tick]);
 
@@ -95,31 +143,27 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
     [start],
   );
 
-  /** Transport closed: drain what's left, then stop the loop. */
+  /** Transport closed: drain what's left promptly, then stop the loop. */
   const finish = useCallback(() => {
     finishing.current = true;
-    if (!running.current && buffer.current.length) start();
-  }, [start]);
+    if (!running.current && buffer.current.length) {
+      running.current = true;
+      lastTs.current = 0;
+      raf.current = requestAnimationFrame(tick);
+    }
+  }, [tick]);
 
   /** Abort: hand back the undrained remainder so the caller can commit it. */
   const flushNow = useCallback(() => {
     const rest = buffer.current;
     buffer.current = "";
-    finishing.current = false;
-    running.current = false;
-    if (raf.current) cancelAnimationFrame(raf.current);
-    raf.current = null;
+    stop();
     return rest;
-  }, []);
+  }, [stop]);
 
   const pending = useCallback(() => buffer.current.length, []);
 
-  useEffect(
-    () => () => {
-      if (raf.current) cancelAnimationFrame(raf.current);
-    },
-    [],
-  );
+  useEffect(() => () => stop(), [stop]);
 
   return { push, finish, flushNow, pending };
 }

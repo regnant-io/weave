@@ -43,13 +43,59 @@ def _artifact_sweeper() -> None:
     threading.Thread(target=loop, daemon=True).start()
 
 
+_DEV_SECRET = "dev-insecure-change-me-in-production-please-0123456789"
+
+
+def _preflight() -> None:
+    """Refuse to run a production deployment with development defaults.
+
+    This exists because the failure is silent and total: the shipped
+    `secret_key` is public in the repository, so anyone who reads it can mint a
+    valid JWT for any user on an exposed instance. A tunnelled dev box is
+    exactly the situation where nobody remembers to set it, so the check is a
+    hard stop rather than a warning.
+    """
+    is_prod = settings.environment.lower() in {"production", "prod", "staging"}
+    problems: list[str] = []
+
+    if settings.secret_key == _DEV_SECRET:
+        msg = ("WEAVE_SECRET_KEY is still the public development default — anyone "
+               "can forge a login token.")
+        if is_prod:
+            problems.append(msg)
+        else:
+            log.warning("SECURITY: %s Set it before exposing this instance.", msg)
+
+    if is_prod and settings.debug:
+        problems.append("WEAVE_DEBUG is on in a production environment.")
+
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with insecure production settings:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    # Loud, but not fatal: these are deliberate choices with real consequences
+    # if the instance is reachable from the internet.
+    if settings.workspace_enabled and settings.workspace_network:
+        log.warning(
+            "SECURITY: the developer workspace can execute code with network access. "
+            "Every VERIFIED user of this instance can run commands in a container on "
+            "this host. Set WEAVE_WORKSPACE_ENABLED=false before exposing Weave to "
+            "people you do not trust."
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _preflight()
     init_db()
     engine = get_engine()
     _artifact_sweeper()
-    log.info("Weave gateway ready [env=%s, llm=%s, sandbox=%s]",
-             settings.environment, getattr(engine, "name", "offline"), settings.sandbox_backend)
+    log.info("Weave gateway ready [env=%s, llm=%s, sandbox=%s, workspace=%s]",
+             settings.environment, getattr(engine, "name", "offline"),
+             settings.sandbox_backend,
+             "on" if settings.workspace_enabled else "off")
     yield
 
 

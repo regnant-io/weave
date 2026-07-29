@@ -90,8 +90,16 @@ npm run dev
 
 1. **Auth** — register / login (stdlib scrypt + HS256 JWT) and SMS-OTP flow (OTP
    logged in dev). Token stored httpOnly by the frontend.
-2. **Projects** — persistent research workspaces with hypotheses + a rolling
-   summary (the "persistent research memory").
+2. **Projects & chats** — a project is a persistent research workspace
+   (hypotheses, datasets, a rolling summary). Inside it you can run **several
+   chats**, and they are not isolated: what one establishes is promoted to
+   project memory (`remember` / `recall`) and read into every other chat's
+   prompt, so a new chat continues rather than restarts. Full CRUD — rename,
+   delete, delete-all — each behind a confirmation.
+2b. **Context that follows the model** — the window is read from the model
+   itself via Ollama's `/api/show`, not hard-coded. When a chat approaches it,
+   the chat is summarised and continued in a successor chat automatically, and
+   the UI says so instead of silently forgetting the beginning.
 3. **Datasets** — upload CSV/XLSX/JSON → object storage → automatic profiling
    (schema, per-column stats). Idempotency keys dedupe mobile retries.
 4. **Bilingual chat** — SSE-streamed, student (Socratic) vs researcher (direct)
@@ -100,10 +108,22 @@ npm run dev
 5. **Retrieval** — hybrid vector + BM25 search with reciprocal-rank fusion over a
    seeded Tanzanian source library, language-aware query expansion, and
    access-status / predatory-journal flags enforced at the data layer.
-6. **Code execution** — the model (or the offline engine) emits Python that runs
-   in a hardened sandbox against a read-only copy of the dataset, producing
-   charts/tables that come back into the chat.
-7. **Guardrails** — academic-integrity redirect (student mode), ungrounded-fact
+6. **Code execution — two sandboxes, deliberately separate.**
+   * *Analysis* (`services/sandbox`): model-written Python against a read-only
+     copy of the user's dataset. No network, import allowlist, no `open()`,
+     workspace destroyed after each run. Those limits are the product.
+   * *Developer workspace* (`services/workspace`): a persistent per-project
+     directory in a Docker container **with network**, where the assistant
+     builds real software — installs npm/pip packages, downloads assets, edits
+     existing files in place, runs the tests it writes, verifies a file actually
+     parses, and packages the result as a `.tar.gz`. Requires Docker; build the
+     image once with `docker compose --profile build-images build workspace-image`.
+     Turn it off with `WEAVE_WORKSPACE_ENABLED=false` before exposing Weave to
+     people you do not trust.
+7. **Asking you back** — `ask_user` blocks the turn on a real question with
+   selectable options when a fork would change the work, instead of guessing or
+   abandoning the run.
+8. **Guardrails** — academic-integrity redirect (student mode), ungrounded-fact
    flagging, predatory-journal checking.
 
 ---
@@ -121,18 +141,41 @@ service; adding a capability = adding one `Tool`.
 | `check_citation` | Predatory-journal check | working |
 | `web_search` | **SearXNG** metasearch | wired; needs `deep` profile |
 | `deep_research` | SearXNG + **Browserless** + extraction, iterative loop, SSRF-guarded, streamed | wired; needs `deep` profile |
-| `generate_visual` | **Render service** (Vega-Lite → SVG) | wired; needs `deep` profile |
-| `generate_deck` | Render service (slides → HTML deck) | wired; needs `deep` profile |
+| `generate_visual` | **Render service** (Vega-Lite → SVG, house style applied server-side) | wired; needs `deep` profile |
+| `generate_deck` | Render service (slides → designed HTML deck, 8 layouts, print-to-PDF) | wired; needs `deep` profile |
+| `create_3d_experience` | Render service (**Babylon.js**) — games, 3D building, physics, walkthroughs | wired; needs `deep` profile |
+| `generate_3d` / `create_diagram` / `create_simulation` / `create_animation` | Render service (spec-driven) | wired; needs `deep` profile |
 | `query_warehouse` | **DuckDB** (embedded) / ClickHouse | working (DuckDB), read-only SQL guard |
+| `ask_user` | Interaction broker (blocks the turn on a real question) | working |
+| `remember` / `recall` / `forget` | Project memory, shared across chats | working |
+| `workspace_write/read/edit/list/move/delete` | Developer workspace (host FS, traversal-guarded) | working |
+| `workspace_exec` | Developer workspace container (network, npm/pip, tests) | needs Docker |
+| `workspace_verify` | Parse check — Python AST, JSON, `node --check`, structural | working |
+| `workspace_package` | `.tar.gz` of the built project | working |
 
 `GET /health` reports the resolved engine, embedding backend, the registered
-tools, and which capabilities are currently enabled.
+tools, and which capabilities are currently enabled. `GET /api/v1/workspace/status`
+re-probes Docker, so starting it does not need a backend restart.
+
+**Charts and decks are styled by the service, not by the prompt.** Vega's
+defaults are overridden with the Weave design tokens before every render
+(`render-service/lib/vegaTheme.js`), and decks pick a layout per slide shape
+(`lib/deck.js`). A model that emits only data still produces output that matches
+everything else the product draws.
+
+**Babylon scenes are fully self-contained** — the engine is inlined, so a scene
+is a single ~7 MB HTML file with no network at runtime. Meshes and textures are
+downloaded into the workspace first and passed by name in `assets`, which inlines
+them as data URLs.
 
 ### Deep-capability services (self-hosted)
 
 ```bash
+# one-off: build the developer-workspace image the assistant executes in
+docker compose --profile build-images build workspace-image
+
 # start the heavy services (pulls SearXNG, Browserless/Chromium, Gotenberg,
-# MinIO, Qdrant, ClickHouse + builds the Node render service):
+# MinIO, Qdrant, ClickHouse + builds the Node render service with Babylon):
 docker compose --profile deep up -d
 
 # then point the backend at them and restart it:

@@ -128,8 +128,8 @@ export default function PanelFrame({
 
 export function PanelEmpty({ text }: { text: string }) {
   return (
-    <div className="tx-lines relative flex h-40 items-center justify-center border border-dashed border-border">
-      <p className="relative z-[1] px-6 text-center text-xs text-fg-faint">{text}</p>
+    <div className="flex h-40 items-center justify-center border border-dashed border-border">
+      <p className="px-6 text-center text-xs leading-relaxed text-fg-faint">{text}</p>
     </div>
   );
 }

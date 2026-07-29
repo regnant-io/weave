@@ -68,6 +68,11 @@ class HypothesisIn(BaseModel):
     status: Literal["open", "supported", "refuted"] = "open"
 
 
+class ProjectUpdate(BaseModel):
+    title: str | None = None
+    mode: Mode | None = None
+
+
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -77,6 +82,58 @@ class ProjectOut(BaseModel):
     summary: str
     notes: list[dict[str, Any]] = []
     created_at: datetime
+
+
+# --- threads (chats within a project) ---
+class ThreadCreate(BaseModel):
+    title: str = ""
+
+
+class ThreadUpdate(BaseModel):
+    title: str | None = None
+    status: Literal["active", "archived"] | None = None
+
+
+class ThreadOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    project_id: str
+    title: str
+    summary: str
+    status: str
+    parent_thread_id: str | None = None
+    token_estimate: int = 0
+    message_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- shared project memory ---
+class MemoryEntryIn(BaseModel):
+    key: str
+    content: str
+    kind: Literal["fact", "decision", "preference", "finding", "question", "artifact"] = "fact"
+    importance: int = 3
+
+
+class MemoryEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    key: str
+    content: str
+    kind: str
+    importance: int
+    thread_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- assistant -> user questions ---
+class InteractionAnswer(BaseModel):
+    #: question text -> chosen label(s). A free-typed answer is just another
+    #: value here, so the model sees one uniform shape.
+    answers: dict[str, str] = {}
+    notes: str = ""
 
 
 # --- datasets ---
@@ -96,6 +153,9 @@ class MessageCreate(BaseModel):
     content: str
     language: Language = "sw"
     dataset_id: str | None = None
+    # Which chat inside the project this turn belongs to. Omitted -> the
+    # project's active thread, so older clients keep working unchanged.
+    thread_id: str | None = None
     stream: bool = True
     effort: Literal["spool", "weave", "tapestry"] = "weave"
     model: str | None = None  # optional Ollama model override for this turn

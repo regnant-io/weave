@@ -33,12 +33,21 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
     models = []
     for n in names:
         ctx = None
+        trained = None
         if ollama is not None:
             try:
                 ctx = ollama.effective_context(n)
+                trained = ollama.model_context(n)
             except Exception:  # noqa: BLE001 - one bad model must not 500 the list
                 ctx = None
-        models.append({"name": n, "context": ctx})
+        models.append({
+            "name": n,
+            # What we will actually request (and draw the meter against).
+            "context": ctx,
+            # What the model itself advertises, so the UI can show when a
+            # configured ceiling is costing the user window.
+            "trained_context": trained,
+        })
 
     cfg = current()
     return {
@@ -46,9 +55,10 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
         "current_model": cfg["ollama_model"],
         "engine": getattr(engine, "name", "offline"),
         # Fallback window (used when a model's own window can't be read) and the
-        # ceiling we will request from a model that advertises more.
+        # OPT-IN ceiling (0 = none: every model gets its full window).
         "num_ctx_fallback": settings.ollama_num_ctx,
         "num_ctx_ceiling": settings.ollama_max_num_ctx,
+        "num_ctx_floor": settings.ollama_min_num_ctx,
     }
 
 

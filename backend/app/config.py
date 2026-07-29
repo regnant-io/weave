@@ -53,7 +53,9 @@ class Settings(BaseSettings):
     #   anthropic -> force Anthropic (falls back to offline if no key/SDK)
     #   offline   -> force the deterministic offline engine
     llm_backend: str = "auto"
-    llm_max_tokens: int = 4096
+    # Output ceiling for the Anthropic path. Deliberately generous: a truncated
+    # answer mid-file is worse than a slow one, and this is a ceiling, not a target.
+    llm_max_tokens: int = 16384
     # Agentic tool loop: allow long autonomous runs (a single prompt can legitimately
     # run for a long time on hard work — don't cap it artificially).
     llm_max_tool_iters: int = 40
@@ -76,10 +78,17 @@ class Settings(BaseSettings):
     # read from /api/show. It is not a cap: clamping every model to this was
     # throwing away 97% of a 262k-token window and reporting "8.2k" in the UI.
     ollama_num_ctx: int = 8192
-    # Upper bound on what we will actually request from a model that advertises
-    # a very large window. Huge contexts are slow and, on a metered cloud
-    # endpoint, expensive — so we take the model's window up to this ceiling.
-    ollama_max_num_ctx: int = 32768
+    # Optional upper bound on what we request from a model that advertises a very
+    # large window. 0 (the default) means NO CEILING — every model gets its own
+    # full window. A previous default of 32768 silently clamped a 262k model to
+    # 32k, which is exactly what truncated long file generation. Set a positive
+    # value only if a metered endpoint makes huge contexts costly.
+    ollama_max_num_ctx: int = 0
+    # Hard floor so a model that mis-reports a tiny window still gets usable room.
+    ollama_min_num_ctx: int = 4096
+    # Fraction of the context window left free for the model's OWN output when
+    # deciding num_predict. The rest is assumed to be prompt + history.
+    ollama_output_reserve: float = 0.4
     # Ollama embeddings for retrieval (opt-in; needs the embed model pulled). When
     # off, the deterministic offline embedding is used (keeps a zero-dependency boot).
     ollama_use_embeddings: bool = False
@@ -115,6 +124,9 @@ class Settings(BaseSettings):
     artifact_sweep_interval_seconds: int = 60 * 60
     max_sandbox_runs_per_turn: int = 6
     max_web_calls_per_turn: int = 12
+    # The workspace container is the most expensive capability per call, and a
+    # looping agent could otherwise start hundreds of them in one turn.
+    max_workspace_execs_per_turn: int = 40
 
     # --- sandbox (architecture section 8) ---
     sandbox_backend: str = "subprocess"  # subprocess | firecracker
@@ -123,6 +135,28 @@ class Settings(BaseSettings):
     sandbox_memory_mb: int = 512
     sandbox_output_max_bytes: int = 10 * 1024 * 1024  # 10 MB (architecture 8.4)
     sandbox_max_output_files: int = 12
+
+    # --- developer workspace (the SECOND sandbox; see services/workspace) ---
+    # A persistent, network-enabled, per-project directory the model builds
+    # software in. Deliberately separate from the analysis sandbox, which must
+    # keep its no-network / no-filesystem guarantees around user data.
+    workspace_enabled: bool = True
+    workspace_root: str = str(DATA_DIR / "workspaces")
+    workspace_image: str = os.getenv("WEAVE_WORKSPACE_IMAGE", "weave-workspace:latest")
+    # Execution is containerised; without a container runtime the workspace
+    # tools are not advertised at all rather than silently no-oping.
+    workspace_memory_mb: int = 2048
+    workspace_cpus: float = 2.0
+    workspace_pids_limit: int = 512
+    workspace_user: str = "1000:1000"           # never root inside the container
+    workspace_exec_timeout: int = 180           # default per command
+    workspace_exec_max_timeout: int = 1800      # ceiling a build may request
+    workspace_output_chars: int = 20_000        # per stream, tail-truncated
+    workspace_package_max_bytes: int = 80 * 1024 * 1024
+    # Network access is what makes dependency installation and asset downloads
+    # possible. It is the reason this sandbox is separate from the analysis one.
+    workspace_network: bool = True
+    workspace_network_mode: str = "bridge"
 
     # --- rate limiting (token bucket; architecture 5.3) ---
     rate_limit_chat_per_min: int = 20

@@ -66,12 +66,13 @@ class RenderClient:
         return r.content
 
     # -- charts ---------------------------------------------------------------
-    def chart(self, spec: dict, fmt: str = "svg") -> dict:
+    def chart(self, spec: dict, fmt: str = "svg", theme: str = "light") -> dict:
         import base64
         want_png = fmt == "png"
         r = self._httpx.post(
             f"{self._base()}/chart",
-            json={"spec": spec, "format": "png" if want_png else "json"}, timeout=30,
+            json={"spec": spec, "format": "png" if want_png else "json", "theme": theme},
+            timeout=30,
         )
         r.raise_for_status()
         body = r.json()
@@ -84,9 +85,10 @@ class RenderClient:
 
     # -- decks ----------------------------------------------------------------
     def deck(self, slides: list[dict], title: str = "Weave deck", theme: str = "light",
-             fmt: str = "html") -> dict:
+             fmt: str = "html", subtitle: str = "") -> dict:
         r = self._httpx.post(f"{self._base()}/deck",
-                             json={"slides": slides, "title": title, "theme": theme}, timeout=30)
+                             json={"slides": slides, "title": title,
+                                   "subtitle": subtitle, "theme": theme}, timeout=30)
         r.raise_for_status()
         html = r.text
         files = [self._save(html.encode("utf-8"), "deck.html", "text/html")]
@@ -182,6 +184,41 @@ class RenderClient:
         return self._visual("/three", {"scene": scene, "title": title, "theme": theme},
                             project_id=project_id, visual_id=vid, title=title,
                             tool="generate_3d", spec={"scene": scene})
+
+    def babylon(self, *, project_id: str, code: str, title: str = "3D scene",
+                subtitle: str = "", theme: str = "dark", assets: dict | None = None,
+                controls: str = "", libs: list | None = None,
+                visual_id: str | None = None) -> dict:
+        """Interactive Babylon.js scene — games, 3D builders, walkthroughs.
+
+        Assets are inlined as data URLs by the render service because the
+        artifact runs with no network at all; a scene that references a URL
+        would render an empty world with no explanation.
+        """
+        from . import visuals
+        vid = visual_id or visuals.new_id()
+        spec = {"code": code, "controls": controls, "libs": libs or [],
+                "assets": sorted((assets or {}).keys())}
+        return self._visual(
+            "/babylon",
+            {"code": code, "title": title, "subtitle": subtitle, "theme": theme,
+             "assets": assets or {}, "controls": controls, "libs": libs or []},
+            project_id=project_id, visual_id=vid, title=title,
+            tool="create_3d_experience", spec=spec,
+        )
+
+    def engines(self) -> dict:
+        """Which optional render engines this service actually has bundled.
+
+        Advertising `create_3d_experience` when the Babylon bundle is missing
+        would have the model happily build a scene that can never render.
+        """
+        try:
+            r = self._httpx.get(f"{self._base()}/health", timeout=8)
+            r.raise_for_status()
+            return r.json().get("engines", {}) or {}
+        except Exception:  # noqa: BLE001 - unreachable service: assume nothing
+            return {}
 
     # -- 3D -------------------------------------------------------------------
     def three(self, scene: dict, title: str = "Weave 3D", capture: bool = False) -> dict:

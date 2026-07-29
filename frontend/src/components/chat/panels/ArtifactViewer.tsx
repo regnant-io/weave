@@ -9,13 +9,15 @@ export function ArtifactView({ a, language }: { a: Artifact; language: Language 
   const [failed, setFailed] = useState(false);
 
   if (a.mime.startsWith("image/")) {
+    // No texture behind artefacts: a noise/grid overlay competes with a chart's
+    // own gridlines and makes a transparent PNG look dirty. Plain surface.
     return (
-      <div className="tx-noise relative border border-border bg-surface-2 p-2">
+      <div className="relative border border-border bg-surface-2 p-2">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={a.url}
           alt={a.name}
-          className="relative z-[1] mx-auto max-h-[70vh] w-auto max-w-full"
+          className="mx-auto max-h-[70vh] w-auto max-w-full"
           onError={() => setFailed(true)}
         />
         {failed && (
@@ -110,8 +112,8 @@ export function ArtifactGrid({
 }) {
   if (!items.length) {
     return (
-      <div className="tx-lines relative flex h-40 items-center justify-center border border-dashed border-border">
-        <p className="relative z-[1] px-6 text-center text-xs text-fg-faint">{emptyText}</p>
+      <div className="flex h-40 items-center justify-center border border-dashed border-border">
+        <p className="px-6 text-center text-xs leading-relaxed text-fg-faint">{emptyText}</p>
       </div>
     );
   }
@@ -133,8 +135,8 @@ export function ArtifactGrid({
               className="max-h-52 w-full bg-surface-2 object-contain p-1.5"
             />
           ) : (
-            <div className="tx-grid relative flex h-24 items-center justify-center bg-surface-2">
-              <IcoFile size={20} className="relative z-[1] text-fg-faint" />
+            <div className="flex h-24 items-center justify-center bg-surface-2">
+              <IcoFile size={20} className="text-fg-faint" />
             </div>
           )}
           <div className="flex items-center gap-2 border-t border-border px-2.5 py-1.5">

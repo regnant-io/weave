@@ -48,12 +48,28 @@ services:
       WEAVE_WA_PHONE_ID: ${WEAVE_WA_PHONE_ID:-}
       # Use Postgres+pgvector instead of SQLite (bring up with --profile full):
       WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-}
+      # --- developer workspace (the SECOND sandbox) ---
+      # Where the assistant builds software: network on, dependencies
+      # installable, results packaged as a tarball. Set to false before exposing
+      # Weave to people you do not trust — every verified user can run commands
+      # in a container on this host.
+      WEAVE_WORKSPACE_ENABLED: ${WEAVE_WORKSPACE_ENABLED:-true}
+      WEAVE_WORKSPACE_IMAGE: ${WEAVE_WORKSPACE_IMAGE:-weave-workspace:latest}
     extra_hosts:
       # Lets host.docker.internal resolve to the host on Linux too (already works
       # on Docker Desktop for Mac/Windows).
       - "host.docker.internal:host-gateway"
     volumes:
       - backend_var:/app/var
+      # The workspace service shells out to `docker run`, so the backend needs
+      # the host's Docker socket. This is a real privilege grant — a process
+      # that can talk to this socket can start privileged containers — which is
+      # why workspace execution is gated to verified users and can be turned off
+      # entirely with WEAVE_WORKSPACE_ENABLED=false.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspaces are bind-mounted INTO the exec container by host path, so the
+      # backend and the host must agree on where they live.
+      - ${WEAVE_WORKSPACE_HOST_DIR:-./var/workspaces}:/app/var/workspaces
 
   frontend:
     build: ./frontend
@@ -138,11 +154,23 @@ services:
     shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
 
   render:
-    # Node render-sandbox: AI specs -> charts / Three.js / decks (see render-service/).
+    # Node render-sandbox: AI specs -> charts / Three.js / Babylon.js scenes /
+    # decks (see render-service/). Babylon bundles are large, so this image
+    # takes a few minutes to build the first time.
     build: ./render-service
     profiles: ["deep"]
     ports:
       - "3100:3100"
+
+  # ---- developer-workspace image (built, never run as a service) ----------
+  # `docker compose --profile build-images build workspace-image` produces the
+  # image the backend starts per command. It is defined here so the build is one
+  # command rather than a README instruction people miss.
+  workspace-image:
+    build: ./workspace-image
+    image: weave-workspace:latest
+    profiles: ["build-images"]
+    command: ["true"]
 
   minio:
     image: minio/minio:latest

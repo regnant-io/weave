@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   Artifact,
   Citation,
@@ -12,11 +12,21 @@ import type {
 } from "@/lib/types";
 import type { ServicePrefs } from "@/lib/services";
 import { DEFAULT_SERVICES } from "@/lib/services";
-import type { Block, ChatTurn, StepBlock } from "@/lib/chatTypes";
-import { isStep, isText, turnArtifacts, turnText } from "@/lib/chatTypes";
+import type { AskUserRequest, Block, ChatTurn, StepBlock } from "@/lib/chatTypes";
+import {
+  isArtifactBlock,
+  isAsk,
+  isStep,
+  isText,
+  turnArtifacts,
+  turnText,
+} from "@/lib/chatTypes";
+import { contextFor, fetchCatalog, type ModelCatalog } from "@/lib/models";
 import PanelDock, { usePanelDock } from "./panels/PanelDock";
 import { categorise, PANEL_META, PANEL_ORDER, panelCounts, type PanelId } from "./panels/panels";
-import Composer, { type ModelInfo } from "./Composer";
+import AskUserCard from "./AskUserCard";
+import Composer from "./Composer";
+import InlineArtifact from "./InlineArtifact";
 import Markdown from "./Markdown";
 import StepChip from "./StepChip";
 import TurnRail from "./TurnRail";
@@ -37,15 +47,30 @@ import {
 function fromHistory(messages: Message[], language: Language): ChatTurn[] {
   return messages.map((m) => {
     const text = language === "sw" ? m.content_sw : m.content_en;
+    const artifacts = m.artifacts ?? [];
+    // Reloading a conversation must look like the conversation did: charts and
+    // scenes render inline, not as a row of pills at the bottom. Prose first,
+    // then the output it produced — the tool-by-tool ordering isn't persisted.
+    const blocks: Block[] =
+      m.role === "assistant"
+        ? [
+            { kind: "text", id: `${m.id}-t`, text },
+            ...artifacts.map((a, i) => ({
+              kind: "artifact" as const,
+              id: `${m.id}-a${i}`,
+              artifact: a,
+            })),
+          ]
+        : [];
     return {
       id: m.id,
       role: m.role,
       text,
-      blocks: m.role === "assistant" ? [{ kind: "text", id: `${m.id}-t`, text }] : [],
+      blocks,
       thinking: "",
       citations: m.citations ?? [],
       images: m.images ?? [],
-      artifacts: m.artifacts ?? [],
+      artifacts,
       pending: false,
       createdAt: Date.parse(m.created_at) || Date.now(),
     } satisfies ChatTurn;
@@ -65,6 +90,8 @@ export default function ChatClient({
   datasets,
   services: initialServices = DEFAULT_SERVICES,
   effort: initialEffort = "weave",
+  threadId,
+  onThreadChange,
 }: {
   projectId: string;
   language: Language;
@@ -74,15 +101,23 @@ export default function ChatClient({
   lite?: boolean;
   services?: ServicePrefs;
   effort?: Effort;
+  /** Which chat inside the project this view is showing. */
+  threadId?: string;
+  /** Called when the server rolls the conversation into a successor thread. */
+  onThreadChange?: (id: string) => void;
 }) {
   const [turns, setTurns] = useState<ChatTurn[]>(() => fromHistory(initialMessages, language));
   const [input, setInput] = useState("");
   const [datasetId, setDatasetId] = useState<string>(datasets[0]?.id ?? "");
   const [streaming, setStreaming] = useState(false);
   const [effort, setEffort] = useState<Effort>(initialEffort);
-  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [model, setModel] = useState<string>("");
   const [services, setServices] = useState<ServicePrefs>(initialServices);
+  /** Set when the server summarised this chat and opened a successor. */
+  const [rolled, setRolled] = useState<{ to: string; title: string } | null>(null);
+  /** Set when history had to be trimmed to fit the model's window. */
+  const [trimmed, setTrimmed] = useState(false);
 
   // right-hand panels (independent surfaces, several may be open)
   const dock = usePanelDock();
@@ -95,24 +130,47 @@ export default function ChatClient({
   /** Id of the step currently receiving substeps. */
   const activeStep = useRef<string | null>(null);
   const turnEls = useRef(new Map<string, HTMLElement>());
+  /**
+   * Artifacts already placed in the timeline.
+   *
+   * The backend emits each artifact twice by design — once LIVE from the tool
+   * that produced it (so a chart appears the moment it exists, not twenty
+   * minutes later when the run ends) and once in the end-of-turn summary that
+   * history replays from. Without this the transcript shows every chart twice.
+   */
+  const seenArtifacts = useRef(new Set<string>());
+  const threadRef = useRef<string | undefined>(threadId);
+  threadRef.current = threadId;
 
   const scroller = useStickToBottom<HTMLDivElement>();
 
   /* ------------------------------------------------------------ model list */
   useEffect(() => {
-    fetch("/api/models")
-      .then((r) => r.json())
-      .then((d) => {
-        // Tolerate both the legacy string[] shape and the richer object shape.
-        const raw = d.models ?? [];
-        const list: ModelInfo[] = raw.map((m: any) =>
-          typeof m === "string" ? { name: m } : { name: m.name, context: m.context },
-        );
-        setModels(list);
-        setModel(d.current_model ?? list[0]?.name ?? "");
-      })
-      .catch(() => {});
+    let alive = true;
+    fetchCatalog().then((c) => {
+      if (!alive) return;
+      setCatalog(c);
+      setModel((cur) => cur || c.currentModel);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
+
+  // The window the meter is drawn against is the model's REAL context, resolved
+  // by the server from the model itself — not a constant. Drawing against a
+  // guess is worse than showing nothing, because the user trusts the gauge.
+  const contextLimit = useMemo(
+    () => (catalog ? contextFor(catalog, model) : 0),
+    [catalog, model],
+  );
+
+  // A new chat starts clean: no carried-over artifacts, no stale rollover notice.
+  useEffect(() => {
+    seenArtifacts.current = new Set();
+    setRolled(null);
+    setTrimmed(false);
+  }, [threadId]);
 
   /* --------------------------------------------------- block mutation utils */
 
@@ -151,11 +209,39 @@ export default function ChatClient({
 
   const stream = useSmoothStream(appendText);
 
-  // Keep the view pinned in the same commit that grew the content — before
-  // paint, so no intermediate unpinned frame is ever shown.
-  useEffect(() => {
+  // Keep the view pinned in the same commit that grew the content — BEFORE
+  // paint. `useEffect` runs after the browser has already painted the taller
+  // content, so at the exact bottom every token produced a one-frame up-jump
+  // followed by a catch-up. `useLayoutEffect` closes that gap entirely.
+  useLayoutEffect(() => {
     scroller.keep();
   }, [turns, scroller]);
+
+  /** Land a block at the end of the timeline, flushing buffered prose first. */
+  const appendBlock = useCallback(
+    (block: Block) => {
+      // Structural boundary: buffered text belongs BEFORE this, not after it.
+      const rest = stream.flushNow();
+      if (rest) appendText(rest);
+      patchBlocks((blocks) => [...blocks, block]);
+    },
+    [appendText, patchBlocks, stream],
+  );
+
+  /**
+   * Place a generated artifact inline, where it was produced.
+   *
+   * Deduped by URL because the backend emits each artifact twice on purpose
+   * (live from the tool, then again in the end-of-turn summary).
+   */
+  const addArtifact = useCallback(
+    (a: Artifact) => {
+      if (!a?.url || seenArtifacts.current.has(a.url)) return;
+      seenArtifacts.current.add(a.url);
+      appendBlock({ kind: "artifact", id: nextId("art"), artifact: a });
+    },
+    [appendBlock],
+  );
 
   const mutateStep = useCallback(
     (id: string | null, fn: (s: StepBlock) => StepBlock) => {
@@ -334,6 +420,7 @@ export default function ChatClient({
           content,
           language,
           dataset_id: datasetId || null,
+          thread_id: threadRef.current ?? null,
           effort,
           model: model || null,
           regenerate,
@@ -440,17 +527,67 @@ export default function ChatClient({
             break;
           case "artifact": {
             const a = data as Artifact;
+            // Rendered inline in the timeline AND recorded on the step, so the
+            // panel's grouped view still lists it.
             if (activeStep.current) {
               mutateStep(activeStep.current, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
-            } else {
-              patchLast((m) => ({ ...m, artifacts: [...m.artifacts, a] }));
             }
+            addArtifact(a);
             break;
           }
           case "citation":
             patchLast((m) => ({ ...m, citations: [...m.citations, data as Citation] }));
             break;
+
+          /* ---- the assistant asking the user something ---- */
+          case "ask_user": {
+            const req: AskUserRequest = {
+              id: String(data.id ?? ""),
+              questions: Array.isArray(data.questions) ? data.questions : [],
+            };
+            if (req.id && req.questions.length) {
+              appendBlock({ kind: "ask", id: nextId("ask"), request: req });
+              // The turn is genuinely blocked on this, so make sure it is on
+              // screen even if the user had scrolled up to read earlier work.
+              scroller.pin("smooth");
+            }
+            break;
+          }
+          case "ask_user_done":
+            // Answered here, in another tab, or timed out — collapse either way.
+            patchBlocks((blocks) =>
+              blocks.map((b) =>
+                isAsk(b) && b.request.id === data.id
+                  ? { ...b, request: { ...b.request, answered: true } }
+                  : b,
+              ),
+            );
+            break;
+
+          /* ---- context lifecycle ---- */
+          case "context_trimmed":
+            // Say it out loud. Silently dropping the start of a conversation is
+            // how an assistant appears to "forget" with no signal to the reader.
+            setTrimmed(true);
+            break;
+          case "summarizing":
+            addSub(
+              language === "sw"
+                ? "Inafupisha mazungumzo…"
+                : "Summarising this chat…",
+            );
+            break;
+          case "thread_rolled":
+            setRolled({ to: String(data.to ?? ""), title: String(data.title ?? "") });
+            break;
+
           case "done":
+            // The server rolls to a successor thread when this one filled the
+            // model's window; follow it, or the next turn would be written into
+            // a chat the model can no longer read in full.
+            if (data.next_thread_id && onThreadChange) {
+              onThreadChange(String(data.next_thread_id));
+            }
             break;
           case "error":
             patchLast((m) => ({ ...m, pending: false, error: true }));
@@ -497,10 +634,25 @@ export default function ChatClient({
   const counts = useMemo(() => panelCounts(payload), [payload]);
   const totalArtifacts = Object.values(counts).reduce((a, b) => a + b, 0);
 
+  // Same chars/token ratio the server budgets with, so the gauge and the actual
+  // trimming decision never disagree.
   const contextUsed = useMemo(() => {
     const chars = turns.reduce((n, t) => n + turnText(t).length, 0);
     return Math.ceil(chars / 3.6);
   }, [turns]);
+
+  const markAnswered = useCallback((id: string) => {
+    setTurns((prev) =>
+      prev.map((t) => ({
+        ...t,
+        blocks: t.blocks.map((b) =>
+          isAsk(b) && b.request.id === id
+            ? { ...b, request: { ...b.request, answered: true } }
+            : b,
+        ),
+      })),
+    );
+  }, []);
 
   const railTurns = useMemo(
     () =>
@@ -541,10 +693,20 @@ export default function ChatClient({
   const empty = turns.length === 0;
 
   return (
-    <div className="relative flex h-full min-w-0">
+    <div className="relative flex h-full min-w-0 overflow-hidden">
       {/* ------------------------------------------------- conversation column */}
-      {/* The transcript keeps a hard floor: panels squeeze, the conversation does not. */}
-      <div className="relative flex min-w-0 flex-1 shrink-0 basis-[380px] flex-col max-lg:basis-auto">
+      {/*
+        DESKTOP: the transcript keeps a hard floor (basis 380 + shrink-0) so the
+        panels squeeze and the conversation does not.
+
+        MOBILE: those same two classes were the "chat overflows on the right"
+        bug — `flex-basis: 380px` with `flex-shrink: 0` cannot shrink below
+        380px, so on a 360px phone the column stuck out past the viewport and
+        took the whole page with it. Below `lg` the column is simply
+        `flex-1 min-w-0`, which is what lets a wide code block or table scroll
+        inside itself instead of widening the page.
+      */}
+      <div className="relative flex min-w-0 flex-1 flex-col lg:shrink-0 lg:basis-[380px]">
         {/* thread menu */}
         <div className="pointer-events-none absolute right-2 top-2 z-30">
           <div className="pointer-events-auto relative">
@@ -599,9 +761,17 @@ export default function ChatClient({
         <div
           ref={scroller.ref}
           onScroll={scroller.onScroll}
-          className="transcript min-h-0 flex-1 overflow-y-auto"
+          className="transcript min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
         >
-          <div className="mx-auto w-full max-w-chat px-4 pb-44 pt-10">
+          {/*
+            Bottom padding clears the composer, which is an overlay: it must
+            account for the composer's own height, the safe area, and the
+            keyboard inset, or the last line of an answer sits under the input.
+          */}
+          <div
+            className="pad-chrome-top mx-auto w-full min-w-0 max-w-chat px-4"
+            style={{ paddingBottom: "calc(11rem + var(--safe-bottom) + var(--kb-inset))" }}
+          >
             {empty && <EmptyState language={language} mode={mode} />}
             {turns.map((turn, i) =>
               turn.role === "user" ? (
@@ -622,11 +792,42 @@ export default function ChatClient({
                   register={registerTurn}
                   streaming={streaming && i === turns.length - 1}
                   onOpenArtifact={openArtifact}
+                  onAnswered={markAnswered}
                   onRegenerate={
                     !streaming && i === turns.length - 1 && !turn.pending ? regenerate : undefined
                   }
                 />
               ),
+            )}
+
+            {trimmed && !rolled && (
+              <Notice
+                tone="warn"
+                text={
+                  language === "sw"
+                    ? "Mazungumzo haya yamekuwa marefu kuliko dirisha la modeli, hivyo sehemu ya mwanzo haikutumwa. Kumbukumbu ya mradi bado inatumika."
+                    : "This chat is longer than the model's context window, so the earliest turns weren't sent. Project memory still applies."
+                }
+              />
+            )}
+
+            {rolled && (
+              <Notice
+                tone="accent"
+                text={
+                  language === "sw"
+                    ? `Mazungumzo yamefikia kikomo cha muktadha. Nimeyafupisha na kufungua "${rolled.title}" ukiendelea nayo.`
+                    : `This chat reached the model's context limit. It has been summarised and continued in "${rolled.title}".`
+                }
+                action={
+                  onThreadChange && rolled.to
+                    ? {
+                        label: language === "sw" ? "Nenda huko" : "Go there",
+                        onClick: () => onThreadChange(rolled.to),
+                      }
+                    : undefined
+                }
+              />
             )}
           </div>
         </div>
@@ -642,7 +843,9 @@ export default function ChatClient({
         <button
           onClick={() => scroller.pin("smooth")}
           aria-label={language === "sw" ? "Nenda chini" : "Scroll to bottom"}
-          className={`absolute bottom-32 left-1/2 z-30 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-border bg-surface text-fg-muted shadow-soft transition-all duration-slow ease-expo hover:border-accent-line hover:text-fg ${
+          /* Rides above the composer, so it tracks the keyboard too. */
+          style={{ bottom: "calc(8rem + var(--safe-bottom) + var(--kb-inset))" }}
+          className={`absolute left-1/2 z-30 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-border bg-surface text-fg-muted shadow-soft transition-all duration-slow ease-expo hover:border-accent-line hover:text-fg ${
             scroller.pinned
               ? "pointer-events-none translate-y-3 scale-90 opacity-0"
               : "translate-y-0 scale-100 opacity-100"
@@ -663,12 +866,13 @@ export default function ChatClient({
           setDatasetId={setDatasetId}
           effort={effort}
           setEffort={setEffort}
-          models={models}
+          models={catalog?.models ?? []}
           model={model}
           setModel={setModel}
           services={services}
           setServices={setServices}
           contextUsed={contextUsed}
+          contextLimit={contextLimit}
         />
       </div>
 
@@ -764,6 +968,7 @@ function AssistantTurn({
   streaming,
   onRegenerate,
   onOpenArtifact,
+  onAnswered,
   register,
 }: {
   turn: ChatTurn;
@@ -771,6 +976,7 @@ function AssistantTurn({
   streaming: boolean;
   onRegenerate?: () => void;
   onOpenArtifact: (a: Artifact) => void;
+  onAnswered: (id: string) => void;
   register: (id: string, el: HTMLElement | null) => void;
 }) {
   const nothingYet = turn.blocks.length === 0 && !turn.thinking;
@@ -779,21 +985,41 @@ function AssistantTurn({
     <div ref={(el) => register(turn.id, el)} data-turn-id={turn.id} className="animate-rise mb-2">
       {turn.thinking && <Reasoning text={turn.thinking} active={turn.pending} language={language} />}
 
-      {/* The block timeline: prose and work interleaved in the order they happened. */}
-      {turn.blocks.map((b, i) =>
-        isText(b) ? (
-          b.text.trim() ? (
+      {/* The block timeline: prose, work, questions and generated output,
+          interleaved in the order they actually happened. */}
+      {turn.blocks.map((b, i) => {
+        if (isText(b)) {
+          return b.text.trim() ? (
             <Markdown
               key={b.id}
               text={b.text}
               streaming={streaming && i === turn.blocks.length - 1}
               onOpenArtifact={onOpenArtifact}
             />
-          ) : null
-        ) : (
-          <StepChip key={b.id} step={b} language={language} onOpenArtifact={onOpenArtifact} />
-        ),
-      )}
+          ) : null;
+        }
+        if (isAsk(b)) {
+          return (
+            <AskUserCard
+              key={b.id}
+              request={b.request}
+              language={language}
+              onAnswered={onAnswered}
+            />
+          );
+        }
+        if (isArtifactBlock(b)) {
+          return (
+            <InlineArtifact
+              key={b.id}
+              artifact={b.artifact}
+              language={language}
+              onOpen={onOpenArtifact}
+            />
+          );
+        }
+        return <StepChip key={b.id} step={b} language={language} onOpenArtifact={onOpenArtifact} />;
+      })}
 
       {/* No prebuilt loader. Just an honest, unbounded presence indicator that
           says "still here" without implying a duration. */}
@@ -804,9 +1030,6 @@ function AssistantTurn({
         </div>
       )}
 
-      {turn.artifacts.length > 0 && (
-        <InlineArtifacts artifacts={turn.artifacts} onOpen={onOpenArtifact} language={language} />
-      )}
       {turn.citations.length > 0 && <Sources citations={turn.citations} language={language} />}
 
       {onRegenerate && (
@@ -855,29 +1078,36 @@ function Reasoning({
   );
 }
 
-function InlineArtifacts({
-  artifacts,
-  onOpen,
-  language,
+/**
+ * A quiet, full-width status line inside the transcript.
+ *
+ * Used for things the SYSTEM did that change what the assistant can see —
+ * history being trimmed, a chat being rolled into a successor. These have to be
+ * visible: an assistant that has silently lost the start of the conversation
+ * looks like it is being careless rather than out of room.
+ */
+function Notice({
+  tone,
+  text,
+  action,
 }: {
-  artifacts: Artifact[];
-  onOpen: (a: Artifact) => void;
-  language: Language;
+  tone: "warn" | "accent";
+  text: string;
+  action?: { label: string; onClick: () => void };
 }) {
+  const border = tone === "warn" ? "border-warn" : "border-accent";
+  const fg = tone === "warn" ? "text-warn" : "text-accent";
   return (
-    <div className="mt-4">
-      <div className="eyebrow mb-1.5">{language === "sw" ? "Matokeo" : "Output"}</div>
-      <div className="flex flex-wrap gap-1.5">
-        {artifacts.map((a, i) => (
-          <button
-            key={i}
-            onClick={() => onOpen(a)}
-            className="group inline-flex max-w-full items-center gap-1.5 border border-border bg-surface px-2.5 py-1.5 text-xs text-fg-muted transition-all duration-fast ease-soft hover:border-accent-line hover:text-fg"
-          >
-            <span className="truncate">{a.name}</span>
-          </button>
-        ))}
-      </div>
+    <div className={`animate-rise my-4 border-l-2 ${border} pl-3`}>
+      <p className="text-[13px] leading-relaxed text-fg-muted">{text}</p>
+      {action && (
+        <button
+          onClick={action.onClick}
+          className={`mt-1.5 text-[12px] uppercase tracking-widest ${fg} transition-opacity duration-fast hover:opacity-70`}
+        >
+          {action.label} →
+        </button>
+      )}
     </div>
   );
 }

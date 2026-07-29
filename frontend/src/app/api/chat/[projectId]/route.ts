@@ -33,10 +33,18 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ projectId:
   return new Response(upstream.body, {
     status: 200,
     headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
+      "Content-Type": "text/event-stream; charset=utf-8",
+      // `no-transform` is the part that matters through a tunnel or a CDN: it
+      // tells every intermediary (and Next's own compression) not to buffer or
+      // re-encode the body. Without it a proxy can hold the stream until it has
+      // enough bytes to compress, and the answer arrives in one lump minutes
+      // later — which reads as a hang, not as slow streaming.
+      "Cache-Control": "no-cache, no-store, no-transform, must-revalidate",
       Connection: "keep-alive",
+      // nginx / ngrok / most reverse proxies honour this explicitly.
       "X-Accel-Buffering": "no",
+      // Belt and braces: an empty encoding stops Next from gzipping the stream.
+      "Content-Encoding": "identity",
     },
   });
 }

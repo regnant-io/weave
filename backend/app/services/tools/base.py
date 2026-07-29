@@ -23,10 +23,20 @@ class ToolContext:
     trust: str = "verified"
     services: dict[str, Any] = field(default_factory=dict)   # analysis, retrieval, ...
     emit: Callable[[str, dict], None] | None = None          # progress sink (SSE stages)
+    #: The conversation this turn belongs to. Tools that write memory record
+    #: where a fact came from; tools that ask the user need somewhere to anchor.
+    thread: Any = None
+    #: threading.Event set when the client disconnects. A tool that waits on
+    #: anything (a user answer, a long build) must check this or it will keep a
+    #: worker thread alive after the user has already walked away.
+    cancel: Any = None
 
     def progress(self, event: str, data: dict) -> None:
         if self.emit:
             self.emit(event, data)
+
+    def cancelled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
 
 
 ToolExecute = Callable[[ToolContext, dict], dict]

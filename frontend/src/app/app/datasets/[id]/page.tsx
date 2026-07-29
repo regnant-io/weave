@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { api, ApiError } from "@/lib/api";
 import { getLanguage, isAuthed } from "@/lib/session";
 import type { DatasetProfileColumn } from "@/lib/types";
+import PageShell from "@/components/PageShell";
 
 // Dataset profile view (architecture 4.2 /app/datasets/[id]): schema, stats.
 export default async function DatasetPage({ params }: { params: Promise<{ id: string }> }) {
@@ -14,10 +15,15 @@ export default async function DatasetPage({ params }: { params: Promise<{ id: st
     const profile = ds.column_profile;
     const columns = profile.columns ?? [];
 
+    // PageShell, not a bare div: `main` is `overflow-hidden`, so a page without
+    // its own scroll container is simply cut off below the fold. It also
+    // supplies the clearance for the fixed menu button.
     return (
-      <div className="mx-auto max-w-content px-4 py-8">
-        <h1 className="text-2xl font-bold">{ds.original_filename}</h1>
-        <p className="mb-4 text-sm text-fg-muted">
+      <PageShell>
+        <h1 className="break-words text-2xl font-semibold tracking-tight">
+          {ds.original_filename}
+        </h1>
+        <p className="mb-4 mt-1 text-sm text-fg-muted">
           {profile.row_count ?? ds.row_count ?? "?"} {language === "sw" ? "safu" : "rows"} ·{" "}
           {profile.column_count ?? columns.length} {language === "sw" ? "nguzo" : "columns"} ·{" "}
           {(ds.size_bytes / 1024).toFixed(1)} KB
@@ -59,7 +65,7 @@ export default async function DatasetPage({ params }: { params: Promise<{ id: st
             </table>
           </div>
         )}
-      </div>
+      </PageShell>
     );
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) redirect("/auth/login");

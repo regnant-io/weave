@@ -166,8 +166,8 @@ export default function OnboardingClient({
   const canAdvance = id !== "field" || true;
 
   return (
-    <div className="tx-noise relative min-h-dvh">
-      <div className="relative z-[1] mx-auto flex min-h-dvh w-full max-w-3xl flex-col px-5 py-10 md:px-8">
+    <div className="tx-noise min-h-app relative">
+      <div className="min-h-app relative z-[1] mx-auto flex w-full max-w-3xl flex-col px-5 py-10 md:px-8">
         {/* brand + progress */}
         <div className="flex items-center justify-between">
           <WeaveMark size="sm" className="text-fg" />

@@ -83,6 +83,12 @@ class Project(Base):
     messages: Mapped[list["Message"]] = relationship(
         back_populates="project", cascade="all, delete-orphan", order_by="Message.created_at"
     )
+    threads: Mapped[list["Thread"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", order_by="Thread.created_at"
+    )
+    memory: Mapped[list["MemoryEntry"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     citations: Mapped[list["Citation"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
@@ -102,11 +108,83 @@ class Dataset(Base):
     project: Mapped[Project] = relationship(back_populates="datasets")
 
 
+class Thread(Base):
+    """One conversation inside a project.
+
+    A project is the durable research workspace; a thread is a single line of
+    enquiry within it. Splitting them is what allows a long investigation to be
+    broken into readable conversations WITHOUT losing what earlier ones
+    established — continuity lives in the project (summary + MemoryEntry), not
+    in one ever-growing message list.
+
+    It is also the unit of context management: when a thread's history no longer
+    fits the selected model's window it is summarised and a successor thread is
+    opened with `parent_thread_id` pointing back, so the chain stays auditable.
+    """
+    __tablename__ = "threads"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    # Compact recap of this thread, written when it is rolled or on demand. This
+    # is what later threads in the same project read.
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active|archived|rolled
+    # Set when this thread was opened automatically because its predecessor
+    # filled the model's context window.
+    parent_thread_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Running estimate of the tokens this thread's history occupies, so the
+    # rollover decision doesn't require re-reading every message.
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    project: Mapped["Project"] = relationship(back_populates="threads")
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="thread", cascade="all, delete-orphan", order_by="Message.created_at"
+    )
+
+
+class MemoryEntry(Base):
+    """A durable fact the assistant chose to carry across threads.
+
+    The rolling project summary is lossy by construction — it is a fixed-length
+    window over a growing conversation, so specifics (a chosen method, a dataset
+    quirk, a rejected approach) fall out of it exactly when they start
+    mattering. These entries are the opposite: small, addressable, and never
+    silently truncated. They are written by the `remember` tool and read back
+    into the system prompt on every turn of every thread in the project.
+    """
+    __tablename__ = "project_memory"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    # Thread it originated in, so the UI can say where a fact came from.
+    thread_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # fact | decision | preference | finding | question | artifact
+    kind: Mapped[str] = mapped_column(String(24), default="fact")
+    # Short stable slug. Writing the same key again UPDATES rather than
+    # duplicating, so a corrected fact replaces the wrong one.
+    key: Mapped[str] = mapped_column(String(96), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    # 1-5. Higher entries survive when the budget forces a trim.
+    importance: Mapped[int] = mapped_column(Integer, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    project: Mapped["Project"] = relationship(back_populates="memory")
+
+
 class Message(Base):
     __tablename__ = "messages"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"))
+    # Nullable so pre-thread rows keep loading; init_db backfills them into a
+    # default thread on first boot after the upgrade.
+    thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("threads.id"), nullable=True, index=True
+    )
     role: Mapped[str] = mapped_column(String(16))  # user | assistant
     content_sw: Mapped[str] = mapped_column(Text, default="")
     content_en: Mapped[str] = mapped_column(Text, default="")
@@ -118,6 +196,7 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped[Project] = relationship(back_populates="messages")
+    thread: Mapped["Thread | None"] = relationship(back_populates="messages")
     analysis_runs: Mapped[list["AnalysisRun"]] = relationship(
         back_populates="message", cascade="all, delete-orphan"
     )

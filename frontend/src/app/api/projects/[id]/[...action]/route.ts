@@ -12,10 +12,20 @@ async function proxy(req: NextRequest, id: string, action: string[], method: str
     cache: "no-store",
   };
   if (method === "POST" || method === "PATCH") init.body = await req.text().catch(() => "{}") || "{}";
-  const res = await fetch(`${API_BASE}/api/v1/projects/${id}/${action.join("/")}`, init);
+  // Forward the query string: destructive endpoints require an explicit
+  // ?confirm=… guard, and dropping it here would turn every delete into a 400.
+  const qs = req.nextUrl.search || "";
+  const res = await fetch(
+    `${API_BASE}/api/v1/projects/${id}/${action.map(encodeURIComponent).join("/")}${qs}`,
+    init,
+  );
   return NextResponse.json(await res.json().catch(() => ({})), { status: res.status });
 }
 
+export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string; action: string[] }> }) {
+  const { id, action } = await ctx.params;
+  return proxy(req, id, action, "GET");
+}
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string; action: string[] }> }) {
   const { id, action } = await ctx.params;
   return proxy(req, id, action, "POST");

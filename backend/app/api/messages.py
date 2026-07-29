@@ -57,7 +57,7 @@ def post_message(
 
     if not body.stream:
         msg = orch.run_turn(db, project, body.content, body.language, body.dataset_id,
-                            effort=body.effort, model=body.model)
+                            effort=body.effort, model=body.model, thread_id=body.thread_id)
         return MessageOut.model_validate(msg)
 
     def event_stream():
@@ -65,7 +65,8 @@ def post_message(
             for ev in orch.stream_turn(db, project, body.content, body.language,
                                        body.dataset_id, effort=body.effort, model=body.model,
                                        regenerate=body.regenerate,
-                                       services_pref=body.services):
+                                       services_pref=body.services,
+                                       thread_id=body.thread_id):
                 yield _sse(ev["event"], ev["data"])
         except Exception as exc:  # noqa: BLE001
             yield _sse("error", {"message": str(exc)})

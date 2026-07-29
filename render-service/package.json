@@ -10,6 +10,9 @@
     "express": "4.21.2",
     "vega": "5.30.0",
     "vega-lite": "5.21.0",
-    "three": "0.149.0"
+    "three": "0.149.0",
+    "babylonjs": "7.54.3",
+    "babylonjs-loaders": "7.54.3",
+    "babylonjs-gui": "7.54.3"
   }
 }

@@ -16,15 +16,21 @@ const nextConfig = {
   reactStrictMode: true,
   compress: true,
   
-  // Browser compatibility for older devices (iOS 15, etc.)
   compiler: {
     // Remove console.log in production
     removeConsole: process.env.NODE_ENV === 'production',
   },
-  
-  // Transpile for older browsers
-  transpilePackages: ['lucide-react', 'react-markdown', 'remark-gfm'],
-  
+
+  /*
+    Browser floor is declared in package.json "browserslist" (iOS 14+), which is
+    what SWC compiles against. `transpilePackages` cannot help with the failure
+    we actually hit: react-markdown's `mdast-util-gfm-autolink-literal` contains
+    a regex LOOKBEHIND, which no transpiler can lower — it is a runtime regex
+    feature, and it is a parse-time SyntaxError on Safari < 16.4. That dependency
+    is gone; markdown is rendered by src/lib/markdown, which is lookbehind-free.
+  */
+  transpilePackages: ['lucide-react'],
+
   async rewrites() {
     const backend = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
     return [{ source: "/api/backend-health", destination: `${backend}/health` }];

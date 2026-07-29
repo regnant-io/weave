@@ -72,7 +72,7 @@ export default function ArtifactSkeleton({
 
   return (
     <div
-      className={`animate-rise tx-lines relative my-2.5 flex ${meta.aspect} w-full flex-col items-center justify-center overflow-hidden border border-border bg-surface-2/50`}
+      className={`animate-rise relative my-2.5 flex ${meta.aspect} w-full flex-col items-center justify-center overflow-hidden rounded-sm border border-border bg-surface-2/50`}
       role="status"
       aria-live="polite"
       aria-label={label}

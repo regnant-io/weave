@@ -15,34 +15,65 @@ _overrides: dict = {}
 EFFORT_LEVELS = ("spool", "weave", "tapestry")
 DEFAULT_EFFORT = "weave"
 
+# `output_fraction` is the share of the model's REAL context window this level is
+# allowed to spend on its own output; `floor`/`cap` bound that in absolute tokens
+# (cap 0 = unbounded). Fixed num_predict values were the reason a long file
+# generation stopped mid-line: a 2048-token ceiling truncates any substantial
+# file regardless of how much window the model actually has.
 EFFORT_SPEC = {
     "spool": {
         "label": "Spool",
-        "num_predict": 700,
+        "output_fraction": 0.10,
+        "floor": 1024,
+        "cap": 4096,
         "think": False,
         "prompt": ("EFFORT: Spool (quick). Answer concisely and directly. Prefer a "
                    "short answer; use tools only if clearly necessary."),
     },
     "weave": {
         "label": "Weave",
-        "num_predict": 2048,
+        "output_fraction": 0.35,
+        "floor": 4096,
+        "cap": 0,
         "think": False,
         "prompt": ("EFFORT: Weave (balanced). Give a complete, well-structured answer. "
-                   "Use tools (analysis, retrieval, web) when they improve accuracy."),
+                   "Use tools (analysis, retrieval, web) when they improve accuracy. "
+                   "Never truncate a file or a code block to save space — finish it."),
     },
     "tapestry": {
         "label": "Tapestry",
-        "num_predict": 4096,
+        "output_fraction": 1.0,
+        "floor": 8192,
+        "cap": 0,
         "think": True,
         "prompt": ("EFFORT: Tapestry (deep). Be thorough and rigorous. Plan, use tools "
                    "liberally (research the web, run analysis, verify), and produce a "
-                   "comprehensive, well-cited answer. Take the time you need."),
+                   "comprehensive, well-cited answer. Take the time you need. Write "
+                   "complete files — never abbreviate with '...' or 'rest unchanged'."),
     },
 }
 
 
 def effort_spec(effort: str | None) -> dict:
     return EFFORT_SPEC.get((effort or DEFAULT_EFFORT).lower(), EFFORT_SPEC[DEFAULT_EFFORT])
+
+
+def num_predict_for(effort: str | None, context_window: int) -> int:
+    """Output-token budget for one step, derived from the model's REAL window.
+
+    Returning -1 tells Ollama "generate until you decide to stop" — correct for
+    the deep level, where an artificial ceiling is the failure mode we are fixing.
+    """
+    spec = effort_spec(effort)
+    ctx = max(1, int(context_window or 0))
+    if spec["output_fraction"] >= 1.0:
+        return -1  # Ollama: unbounded generation
+    budget = int(ctx * float(spec["output_fraction"]))
+    budget = max(int(spec["floor"]), budget)
+    cap = int(spec["cap"] or 0)
+    if cap > 0:
+        budget = min(budget, cap)
+    return budget
 
 
 def ollama_host() -> str:

@@ -4,16 +4,19 @@
 // fully self-contained: no CDN, no external font, no network at runtime.
 //
 //   POST /chart      { spec (Vega-Lite), format }   -> SVG / PNG
-//   POST /deck       { slides, theme }              -> self-contained deck HTML
+//   POST /deck       { slides, theme }              -> designed, self-contained deck HTML
 //   POST /three      { scene, theme }               -> Three.js page (scatter/bars/surface/network)
 //   POST /diagram    { spec, theme }                -> SVG diagram (flow/tree/timeline/concept/wireframe)
 //   POST /simulation { spec, theme }                -> interactive parameterised simulation
 //   POST /animation  { spec, theme }                -> self-drawing animated SVG explainer
+//   POST /babylon    { code, assets, theme }        -> Babylon.js scene (games, 3D building)
 //   POST /custom     { code, html, libs, theme }    -> model-authored code under hard containment
 //
 // The first six are SPEC-DRIVEN: this service owns 100% of the rendering code
-// and the caller's payload is only ever data. /custom is the deliberate escape
-// hatch — see lib/custom.js for why that is safe and what actually contains it.
+// and the caller's payload is only ever data. /babylon and /custom are the
+// deliberate escape hatches — there is no schema for "a game", and inventing one
+// would only ever cover what we thought of first. See lib/custom.js for why that
+// is safe and what actually contains it.
 import express from "express";
 import * as vega from "vega";
 import * as vegaLite from "vega-lite";
@@ -25,32 +28,78 @@ import { renderSimulation } from "./lib/simulation.js";
 import { renderAnimation } from "./lib/animation.js";
 import { renderThree } from "./lib/three3d.js";
 import { renderCustom } from "./lib/custom.js";
+import { renderBabylon } from "./lib/babylon.js";
+import { renderDeck } from "./lib/deck.js";
+import { applyTheme } from "./lib/vegaTheme.js";
 
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+// Babylon scenes can carry inlined .glb meshes and textures as data URLs, which
+// is the only way an offline artifact can use them at all.
+app.use(express.json({ limit: "48mb" }));
 
-// Inline the Three.js UMD build once so 3D pages are fully self-contained (no CDN,
-// CSP-safe). Read the file directly — three's package `exports` map blocks
-// require.resolve of the build path.
-let THREE_SRC = "";
-for (const rel of ["node_modules/three/build/three.min.js", "node_modules/three/build/three.js"]) {
-  try {
-    THREE_SRC = readFileSync(path.join(process.cwd(), rel), "utf-8");
-    if (THREE_SRC) break;
-  } catch (e) { /* try next */ }
+/** Read the first readable path, or "" — a missing bundle degrades, never throws. */
+function readFirst(rels) {
+  for (const rel of rels) {
+    try {
+      const src = readFileSync(path.join(process.cwd(), rel), "utf-8");
+      if (src) return src;
+    } catch (e) { /* try next */ }
+  }
+  return "";
 }
+
+// Inline the UMD builds once at boot so generated pages are fully self-contained
+// (no CDN, CSP-safe). Read the files directly — these packages' `exports` maps
+// block require.resolve of the build paths.
+const THREE_SRC = readFirst([
+  "node_modules/three/build/three.min.js",
+  "node_modules/three/build/three.js",
+]);
 if (!THREE_SRC) console.warn("three build not found; /three will return a scaffold");
 
-app.get("/health", (_req, res) => res.json({ status: "ok", service: "render", ts: null }));
+const BABYLON_SRC = readFirst([
+  "node_modules/babylonjs/babylon.js",
+  "node_modules/babylonjs/babylon.max.js",
+]);
+// Loaders (glTF/OBJ/STL) and GUI are separate bundles; both are optional, and a
+// scene that does not import a mesh has no reason to pay for them.
+const BABYLON_LOADERS_SRC = readFirst([
+  "node_modules/babylonjs-loaders/babylonjs.loaders.min.js",
+  "node_modules/babylonjs-loaders/babylonjs.loaders.js",
+]);
+const BABYLON_GUI_SRC = readFirst([
+  "node_modules/babylonjs-gui/babylon.gui.min.js",
+  "node_modules/babylonjs-gui/babylon.gui.js",
+]);
+if (!BABYLON_SRC) console.warn("babylon build not found; /babylon will report unavailable");
+
+app.get("/health", (_req, res) => res.json({
+  status: "ok",
+  service: "render",
+  // Report which optional bundles are actually present, so the backend can
+  // advertise only the capabilities that will really work.
+  engines: {
+    vega: true,
+    three: Boolean(THREE_SRC),
+    babylon: Boolean(BABYLON_SRC),
+    babylon_loaders: Boolean(BABYLON_LOADERS_SRC),
+    babylon_gui: Boolean(BABYLON_GUI_SRC),
+  },
+}));
 
 // ---- charts: Vega-Lite spec -> SVG ----------------------------------------
 app.post("/chart", async (req, res) => {
   try {
-    const { spec, format = "svg" } = req.body || {};
+    const { spec, format = "svg", theme = "light" } = req.body || {};
     if (!spec) return res.status(400).json({ error: "missing spec" });
-    const vgSpec = spec.$schema && spec.$schema.includes("vega-lite")
-      ? vegaLite.compile(spec).spec
-      : spec;
+    // House style is applied here rather than asked for in a prompt: charts that
+    // each look fine but share no visual language read as amateur, and Vega's
+    // own defaults (blue, cramped labels, dark gridlines, a box border) are not
+    // a design. The caller's own `config` still wins — see lib/vegaTheme.js.
+    const themed = applyTheme(spec, theme);
+    const vgSpec = themed.$schema && themed.$schema.includes("vega-lite")
+      ? vegaLite.compile(themed).spec
+      : themed;
     const view = new vega.View(vega.parse(vgSpec), { renderer: "none" });
     const svg = await view.toSVG();
     if (format === "png") {
@@ -68,48 +117,19 @@ app.post("/chart", async (req, res) => {
   }
 });
 
-// ---- decks: slides -> self-contained Reveal.js HTML -----------------------
-function mdToHtml(md) {
-  // intentionally tiny: headings, bold, lists, paragraphs. The model supplies
-  // already-structured slide bodies; full markdown is a later enhancement.
-  return md
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/^- (.*)$/gm, "<li>$1</li>")
-    .replace(/(<li>.*<\/li>)/s, "<ul>$1</ul>")
-    .split(/\n{2,}/).map((b) => (b.startsWith("<") ? b : `<p>${b}</p>`)).join("\n");
-}
-
+// ---- decks: slides -> self-contained, designed HTML deck ------------------
+// See lib/deck.js: per-slide-shape layouts, the shared Weave type scale, touch
+// + keyboard navigation, and a print stylesheet so browser "Save as PDF"
+// produces a real landscape deck without needing Gotenberg.
 app.post("/deck", (req, res) => {
-  const { slides = [], title = "Weave deck", theme = "light" } = req.body || {};
-  const bg = theme === "dark" ? "#0f172a" : "#f8fafc";
-  const fg = theme === "dark" ? "#f1f5f9" : "#0f172a";
-  const sections = slides.map((s) => {
-    const head = s.title ? `<h2>${String(s.title)}</h2>` : "";
-    return `<section>${head}${mdToHtml(String(s.body_md || ""))}</section>`;
-  }).join("\n");
-  // Self-contained: no external CDN (CSP-safe). Minimal deck styling + keyboard nav.
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
-<style>
-  html,body{margin:0;height:100%;background:${bg};color:${fg};font-family:system-ui,sans-serif}
-  .deck{height:100%;overflow:hidden}
-  section{display:none;height:100%;box-sizing:border-box;padding:6vh 8vw}
-  section.active{display:block}
-  h1,h2{color:#0d9488} li{margin:.3em 0}
-  .nav{position:fixed;bottom:12px;right:16px;font-size:14px;opacity:.6}
-</style></head><body>
-<div class="deck">${sections}</div>
-<div class="nav">← / → to navigate</div>
-<script>
-  const s=[...document.querySelectorAll('section')];let i=0;
-  function show(n){s.forEach(x=>x.classList.remove('active'));i=Math.max(0,Math.min(s.length-1,n));if(s[i])s[i].classList.add('active')}
-  document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')show(i+1);if(e.key==='ArrowLeft')show(i-1)});
-  show(0);
-</script></body></html>`;
-  res.type("text/html").send(html);
+  const { slides = [], title = "Weave deck", subtitle = "", theme = "light" } = req.body || {};
+  try {
+    const out = renderDeck({ slides, title, subtitle, theme });
+    if (out.status !== "ok") return res.status(400).json(out);
+    res.type("text/html").send(out.html);
+  } catch (e) {
+    res.status(500).json({ status: "error", error: String(e?.message ?? e) });
+  }
 });
 
 // ---- 3D ------------------------------------------------------------------
@@ -149,6 +169,30 @@ app.post("/animation", (req, res) => {
   const { spec = {}, title = "Explainer", theme = "light" } = req.body || {};
   try {
     const out = renderAnimation({ spec, title, theme });
+    res.status(out.status === "ok" ? 200 : 400).json(out);
+  } catch (e) {
+    res.status(500).json({ status: "error", error: String(e?.message ?? e) });
+  }
+});
+
+// ---- Babylon.js: games, 3D builders, interactive scenes -------------------
+// Model-authored scene code, contained the same way /custom is (opaque-origin
+// iframe + strict CSP). Assets travel inline as data URLs because the artifact
+// has no network at runtime.
+app.post("/babylon", (req, res) => {
+  const {
+    code = "", title = "3D scene", subtitle = "", theme = "dark",
+    assets = {}, physics = false, controls = "", libs = [],
+  } = req.body || {};
+  try {
+    const wantsLoaders = libs.includes("loaders") || /SceneLoader|ImportMesh|glTF/i.test(code);
+    const wantsGui = libs.includes("gui") || /BABYLON\.GUI/.test(code);
+    const out = renderBabylon({
+      code, title, subtitle, theme, assets, physics, controls,
+      babylonSrc: BABYLON_SRC,
+      loadersSrc: wantsLoaders ? BABYLON_LOADERS_SRC : "",
+      guiSrc: wantsGui ? BABYLON_GUI_SRC : "",
+    });
     res.status(out.status === "ok" ? 200 : 400).json(out);
   } catch (e) {
     res.status(500).json({ status: "error", error: String(e?.message ?? e) });

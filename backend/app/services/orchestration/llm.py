@@ -100,16 +100,18 @@ class OllamaEngine:
         number the UI meter is drawn against — if they ever diverge the meter
         lies, which is worse than having no meter.
 
-        The window follows the MODEL, bounded by a configured ceiling. An
-        earlier version clamped to `ollama_num_ctx` unconditionally, which meant
-        a 262k-token model was requested (and reported) at 8k. `ollama_num_ctx`
-        is now only the fallback for a model whose window we cannot read.
+        The window follows the MODEL. `ollama_num_ctx` is only the fallback for
+        a model whose window we cannot read, and `ollama_max_num_ctx` is an
+        OPT-IN ceiling (0 = none). Both of those used to clamp unconditionally,
+        which is what capped every model at 32k and truncated long generations.
         """
         trained = self.model_context(name)
         if trained:
-            ceiling = settings.ollama_max_num_ctx or trained
-            return max(1, min(trained, ceiling))
-        return settings.ollama_num_ctx
+            ceiling = settings.ollama_max_num_ctx
+            ctx = min(trained, ceiling) if ceiling and ceiling > 0 else trained
+        else:
+            ctx = settings.ollama_num_ctx
+        return max(settings.ollama_min_num_ctx, int(ctx))
 
     def ping(self) -> bool:
         # Tolerant of cold starts: a remote / ngrok-tunnelled Ollama's first
@@ -195,10 +197,15 @@ class OllamaEngine:
         effort-tuned num_predict.
         """
         import json
-        from ...runtime import effort_spec
+        from ...runtime import effort_spec, num_predict_for
         max_iters = max_iters or settings.llm_max_tool_iters
         model = model or self.model_for_tier(tier)
         spec = effort_spec(effort)
+        # Resolved ONCE per turn: /api/show is memoised but the value is used on
+        # every tool iteration, and the meter must be drawn against this exact
+        # number.
+        num_ctx = self.effective_context(model)
+        num_predict = num_predict_for(effort, num_ctx)
         ollama_tools = self._to_ollama_tools(tools)
         convo: list[dict[str, Any]] = [{"role": "system", "content": system}, *messages]
         tool_events: list[dict] = []
@@ -218,9 +225,11 @@ class OllamaEngine:
                 "options": {
                     # Same resolution the UI meter is drawn against, so the
                     # gauge always reflects the window actually requested.
-                    "num_ctx": self.effective_context(model),
+                    "num_ctx": num_ctx,
                     "temperature": 0.4,
-                    "num_predict": spec["num_predict"],
+                    # -1 = let the model run to its natural stop. A fixed ceiling
+                    # here is what used to cut long files off mid-line.
+                    "num_predict": num_predict,
                 },
             }
             if spec.get("think"):

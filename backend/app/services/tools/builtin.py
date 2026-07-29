@@ -96,7 +96,8 @@ def _generate_visual(ctx: ToolContext, inp: dict) -> dict:
     client = ctx.services.get("render")
     if client is None or not client.enabled:
         return {"status": "unavailable", "message": "render service not configured"}
-    result = client.chart(inp.get("spec", {}))
+    result = client.chart(inp.get("spec", {}), fmt=inp.get("format", "svg"),
+                          theme=inp.get("theme", "light"))
     _emit_live(ctx, result, "generate_visual")
     return result
 
@@ -106,9 +107,56 @@ def _generate_deck(ctx: ToolContext, inp: dict) -> dict:
     if client is None or not client.enabled:
         return {"status": "unavailable", "message": "render service not configured"}
     result = client.deck(inp.get("slides", []), title=inp.get("title", "Weave deck"),
+                         subtitle=inp.get("subtitle", ""),
                          theme=inp.get("theme", "light"), fmt=inp.get("format", "html"))
     _emit_live(ctx, result, "generate_deck")
     return result
+
+
+def _create_3d_experience(ctx: ToolContext, inp: dict) -> dict:
+    """Babylon.js scene: games, 3D builders, physics toys, walkthroughs."""
+    client = ctx.services.get("render")
+    if client is None or not client.enabled:
+        return {"status": "unavailable", "message": "render service not configured"}
+
+    # Meshes and textures have to travel WITH the scene: the artifact runs with
+    # no network, so a scene that references a URL renders an empty world.
+    assets: dict[str, str] = {}
+    requested = inp.get("assets") or []
+    if requested:
+        workspace = ctx.services.get("workspace")
+        if workspace is None:
+            return {"status": "error",
+                    "error": "assets were requested but the workspace is unavailable; "
+                             "build the geometry in code instead"}
+        import base64
+        project_id = str(getattr(ctx.project, "id", "shared"))
+        for name in requested[:24]:
+            try:
+                path = workspace._resolve(project_id, str(name))
+            except ValueError as exc:
+                return {"status": "error", "error": f"asset {name!r}: {exc}"}
+            if not path.is_file():
+                return {"status": "error",
+                        "error": f"asset {name!r} is not in the workspace; download it with "
+                                 "workspace_exec first"}
+            assets[str(name)] = base64.b64encode(path.read_bytes()).decode("ascii")
+
+    out = client.babylon(
+        project_id=str(getattr(ctx.project, "id", "shared")),
+        code=inp.get("code", ""),
+        title=str(inp.get("title") or "3D scene"),
+        subtitle=str(inp.get("subtitle") or ""),
+        theme=inp.get("theme", "dark"),
+        assets=assets,
+        controls=str(inp.get("controls") or ""),
+        libs=inp.get("libs") or [],
+    )
+    out["tool"] = "create_3d_experience"
+    if out.get("status") == "ok":
+        from .visuals import _emit_artifacts
+        _emit_artifacts(ctx, out, str(inp.get("title") or "3D scene"))
+    return out
 
 
 def _generate_3d(ctx: ToolContext, inp: dict) -> dict:
@@ -190,25 +238,107 @@ def register_all(reg: ToolRegistry) -> None:
     ))
     reg.register(Tool(
         name="generate_visual",
-        description=("Render a chart from a Vega-Lite spec into an SVG image the user "
-                     "can view/download. Provide a valid Vega-Lite `spec`."),
+        description=(
+            "Render a chart from a Vega-Lite spec. Colours, fonts, gridlines and "
+            "spacing are applied automatically from the house style — do NOT set "
+            "`config`, hard-code hex colours, or add a chart border; that only "
+            "breaks the consistency between charts.\n\n"
+            "What you DO decide, and what makes a chart good:\n"
+            "  • the right mark — bar for comparing categories, line for change "
+            "over time, point for correlation, rule/tick for distributions. Never "
+            "a pie chart with more than three slices.\n"
+            "  • an honest y-axis: start bars at zero.\n"
+            "  • sort bars by value, not alphabetically, unless the order is "
+            "meaningful (time, size class).\n"
+            "  • a `title` that states the FINDING (\"Rainfall fell 22% after "
+            "2015\"), not the variables (\"Rainfall by year\").\n"
+            "  • axis titles with units, and no legend when there is one series.\n"
+            "Inline the data in `spec.data.values` — the renderer has no network."
+        ),
         input_schema={"type": "object", "properties": {
-            "spec": {"type": "object", "description": "A Vega-Lite specification."},
+            "spec": {"type": "object",
+                     "description": "Vega-Lite spec with data inlined in data.values."},
+            "format": {"type": "string", "enum": ["svg", "png"],
+                       "description": "png also returns a raster for low-bandwidth clients."},
+            "theme": {"type": "string", "enum": ["light", "dark"]},
         }, "required": ["spec"]},
         execute=_generate_visual, trust_required="verified", requires_services=("render",),
     ))
     reg.register(Tool(
         name="generate_deck",
-        description=("Generate a slide deck from a list of slides ({title, body_md}). "
-                     "format 'html' for an interactive deck, 'pdf' to also export a PDF "
-                     "(needs Gotenberg). Works bilingually."),
+        description=(
+            "Build a presentation. Each slide picks a LAYOUT, and varying them is "
+            "what makes a deck look designed instead of generated:\n"
+            "  title     — opening slide (title + one-line lede)\n"
+            "  section   — a numbered divider between parts\n"
+            "  statement — one short, strong idea, set large\n"
+            "  bullets   — a heading plus 3-5 short points (never more)\n"
+            "  split     — two columns via `left` and `right` (compare/contrast)\n"
+            "  quote     — a quotation; put the attribution in `title`\n"
+            "  data      — up to 4 headline `metrics` [{value,label,note}]\n"
+            "  end       — closing slide\n"
+            "Rules that matter: ONE idea per slide; body text under ~40 words; "
+            "never paste a paragraph onto a slide; open with `title` and change "
+            "layout at least every third slide. format 'pdf' also exports a PDF "
+            "(needs Gotenberg). Works bilingually."
+        ),
         input_schema={"type": "object", "properties": {
             "slides": {"type": "array", "items": {"type": "object", "properties": {
-                "title": {"type": "string"}, "body_md": {"type": "string"}}}},
-            "title": {"type": "string"}, "theme": {"type": "string", "enum": ["light", "dark"]},
+                "layout": {"type": "string",
+                           "enum": ["title", "section", "statement", "bullets",
+                                    "split", "quote", "data", "end"]},
+                "title": {"type": "string"},
+                "eyebrow": {"type": "string", "description": "Small label above the title."},
+                "body_md": {"type": "string", "description": "Markdown body."},
+                "left": {"type": "string", "description": "Left column (split layout)."},
+                "right": {"type": "string", "description": "Right column (split layout)."},
+                "metrics": {"type": "array", "description": "Data layout: up to 4 figures.",
+                            "items": {"type": "object", "properties": {
+                                "value": {"type": "string"}, "label": {"type": "string"},
+                                "note": {"type": "string"}}}},
+            }}},
+            "title": {"type": "string"},
+            "subtitle": {"type": "string", "description": "Shown in the deck footer."},
+            "theme": {"type": "string", "enum": ["light", "dark"]},
             "format": {"type": "string", "enum": ["html", "pdf"]},
         }, "required": ["slides"]},
         execute=_generate_deck, trust_required="verified", requires_services=("render",),
+    ))
+    reg.register(Tool(
+        name="create_3d_experience",
+        description=(
+            "Build an interactive Babylon.js scene the user can play with: a game, "
+            "a 3D building/room the camera can walk through, a physics toy, a "
+            "molecular or mechanical model.\n\n"
+            "Write the BODY of `createScene(engine, canvas, BABYLON, assets)` and "
+            "`return scene;` at the end. The engine, render loop, resize handling "
+            "and error reporting are provided — do not create them.\n\n"
+            "The scene runs fully OFFLINE inside a sandboxed frame: no fetch, no "
+            "CDN, no external URLs. Build geometry in code, or download a .glb into "
+            "the workspace with workspace_exec and name it in `assets` — those "
+            "files are inlined and reachable as `assets['name.glb']` (a data URL "
+            "you can pass to BABYLON.SceneLoader).\n\n"
+            "Always: add a light and a camera, call camera.attachControl(canvas, "
+            "true), and describe the keys/mouse in `controls` so the user knows how "
+            "to play. Prefer this over generate_3d when the user should INTERACT; "
+            "generate_3d is for 3D data plots."
+        ),
+        input_schema={"type": "object", "properties": {
+            "code": {"type": "string",
+                     "description": "Body of createScene(engine, canvas, BABYLON, assets); "
+                                    "must return a BABYLON.Scene."},
+            "title": {"type": "string"},
+            "subtitle": {"type": "string", "description": "One line explaining the scene."},
+            "controls": {"type": "string",
+                         "description": "How to interact, e.g. 'WASD to move · mouse to look · "
+                                        "Space to jump'. Shown on screen."},
+            "assets": {"type": "array", "items": {"type": "string"},
+                       "description": "Workspace file paths to inline (.glb, textures, audio)."},
+            "libs": {"type": "array", "items": {"type": "string", "enum": ["loaders", "gui"]},
+                     "description": "'loaders' for glTF/OBJ import, 'gui' for BABYLON.GUI."},
+            "theme": {"type": "string", "enum": ["light", "dark"]},
+        }, "required": ["code"]},
+        execute=_create_3d_experience, trust_required="verified", requires_services=("render",),
     ))
     reg.register(Tool(
         name="generate_3d",
@@ -233,6 +363,14 @@ def register_all(reg: ToolRegistry) -> None:
     # module to keep this file about the core capabilities.
     from .visuals import register_visual_tools
     register_visual_tools(reg)
+
+    # Asking the user, and remembering across chats.
+    from .collab import register_collab_tools
+    register_collab_tools(reg)
+
+    # The developer workspace: build, edit, test and package real software.
+    from .workspace import register_workspace_tools
+    register_workspace_tools(reg)
 
     reg.register(Tool(
         name="query_warehouse",

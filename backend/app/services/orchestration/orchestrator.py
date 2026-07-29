@@ -18,11 +18,13 @@ from sqlalchemy.orm import Session
 
 from ...models import Dataset, Message, Project
 from ..analysis import get_analysis_service
+from ..memory import get_memory_service
 from ..render import get_render
 from ..retrieval import get_retrieval_service
 from ..tools import ToolContext, get_registry
 from ..warehouse import get_warehouse
 from ..websearch import get_web_search
+from ..workspace import get_workspace_service
 from . import guardrails, prompts
 from .llm import OfflineEngine, TurnResult, get_engine
 from .router import classify
@@ -57,15 +59,17 @@ class Orchestrator:
     def __init__(self) -> None:
         self.retrieval = get_retrieval_service()
         self.analysis = get_analysis_service()
+        self.memory = get_memory_service()
 
     # -- public: non-streaming ----------------------------------------------
 
     def run_turn(
         self, db: Session, project: Project, user_text: str, language: str,
         dataset_id: str | None = None, effort: str | None = None, model: str | None = None,
+        thread_id: str | None = None,
     ) -> Message:
         assistant_msg, _ = self._process(db, project, user_text, language, dataset_id,
-                                         effort=effort, model=model)
+                                         effort=effort, model=model, thread_id=thread_id)
         return assistant_msg
 
     # -- public: streaming (SSE) --------------------------------------------
@@ -74,6 +78,7 @@ class Orchestrator:
         self, db: Session, project: Project, user_text: str, language: str,
         dataset_id: str | None = None, effort: str | None = None, model: str | None = None,
         regenerate: bool = False, services_pref: dict | None = None,
+        thread_id: str | None = None,
     ) -> Iterator[dict]:
         """Yield SSE events LIVE. The turn runs in a worker thread; _process emits
         every event onto a queue which this generator drains in real time. If the
@@ -94,7 +99,7 @@ class Orchestrator:
                 msg, meta = self._process(db, project, user_text, language, dataset_id,
                                           emit=emit, effort=effort, model=model,
                                           cancel=cancel, regenerate=regenerate,
-                                          services_pref=services_pref)
+                                          services_pref=services_pref, thread_id=thread_id)
                 holder["msg"] = msg
                 holder["meta"] = meta
             except Exception as exc:  # noqa: BLE001
@@ -120,7 +125,17 @@ class Orchestrator:
             if "error" in holder:
                 yield {"event": "error", "data": {"message": holder["error"]}}
                 return
-            yield {"event": "done", "data": {"message_id": holder.get("msg").id if holder.get("msg") else None}}
+            meta = holder.get("meta") or {}
+            yield {"event": "done", "data": {
+                "message_id": holder.get("msg").id if holder.get("msg") else None,
+                "thread_id": meta.get("thread_id"),
+                # Set when this turn filled the window and a successor thread was
+                # opened. The client switches to it rather than silently writing
+                # the next turn into a thread the model can no longer read.
+                "next_thread_id": meta.get("next_thread_id"),
+                "context_used": meta.get("context_used"),
+                "context_window": meta.get("context_window"),
+            }}
         except GeneratorExit:
             # client disconnected (Stop) — signal the worker to abort promptly
             cancel.set()
@@ -132,27 +147,37 @@ class Orchestrator:
         self, db: Session, project: Project, user_text: str, language: str,
         dataset_id: str | None, emit=None, effort: str | None = None, model: str | None = None,
         cancel=None, regenerate: bool = False, services_pref: dict | None = None,
+        thread_id: str | None = None,
     ) -> tuple[Message, dict]:
         engine = get_engine()
+
+        # 0. resolve the thread this turn belongs to, and the REAL context window
+        # of the model that will answer it. Every downstream budget (history
+        # trimming, rollover, the UI meter) is derived from this one number, so
+        # they can never disagree.
+        thread = self.memory.get_thread(db, project, thread_id)
+        context_window = self._context_window(engine, model)
 
         # 1. persist the user's message. On regenerate we reuse the last user turn
         # and drop the previous assistant answer instead of duplicating.
         if regenerate:
             last_user = (
-                db.query(Message).filter(Message.project_id == project.id, Message.role == "user")
+                db.query(Message).filter(Message.thread_id == thread.id, Message.role == "user")
                 .order_by(Message.created_at.desc()).first()
             )
             last_asst = (
-                db.query(Message).filter(Message.project_id == project.id, Message.role == "assistant")
+                db.query(Message).filter(Message.thread_id == thread.id, Message.role == "assistant")
                 .order_by(Message.created_at.desc()).first()
             )
             if last_asst:
                 db.delete(last_asst)
                 db.commit()
-            user_msg = last_user or self._store_message(db, project, "user", user_text, language, engine)
+            user_msg = last_user or self._store_message(db, project, "user", user_text, language,
+                                                        engine, thread)
             user_text = user_msg.content_en or user_msg.content_sw or user_text
         else:
-            user_msg = self._store_message(db, project, "user", user_text, language, engine)
+            user_msg = self._store_message(db, project, "user", user_text, language, engine, thread)
+            self.memory.rename_if_untitled(db, thread, user_text)
 
         # 2. route (model tiering + intent) — architecture 6.4
         route = classify(user_text, project.mode)
@@ -175,7 +200,7 @@ class Orchestrator:
 
         # 6. assistant placeholder so tool executions can link to it
         assistant_msg = Message(
-            project_id=project.id, role="assistant",
+            project_id=project.id, thread_id=thread.id, role="assistant",
             content_sw="", content_en="", original_language=language,
             tool_calls=[], citations=[],
         )
@@ -184,7 +209,8 @@ class Orchestrator:
 
         # -- capability bus: registry + per-turn context ----------------------
         trust = getattr(getattr(project, "user", None), "trust_tier", "verified") or "verified"
-        services = {"analysis": self.analysis, "retrieval": self.retrieval}
+        services = {"analysis": self.analysis, "retrieval": self.retrieval,
+                    "memory": self.memory}
         web = get_web_search()
         if web.enabled:
             services["websearch"] = web
@@ -194,6 +220,13 @@ class Orchestrator:
         warehouse = get_warehouse()
         if warehouse.enabled:
             services["warehouse"] = warehouse
+        workspace = get_workspace_service()
+        if workspace.enabled:
+            services["workspace"] = workspace
+        # `ask_user` is only offered when there is a live client to answer it.
+        # In a batch/WhatsApp turn a blocking question would simply hang.
+        if emit is not None:
+            services["interactive"] = True
 
         progress_events: list[dict] = []
 
@@ -206,6 +239,7 @@ class Orchestrator:
         ctx = ToolContext(
             db=db, project=project, dataset=dataset, message_id=assistant_msg.id,
             language=language, trust=trust, services=services, emit=_emit,
+            thread=thread, cancel=cancel,
         )
         registry = get_registry()
         # A user who has switched a service ON in the composer wants it available
@@ -217,11 +251,12 @@ class Orchestrator:
 
         # meta up front so the client has the message id immediately
         _emit("meta", {"message_id": assistant_msg.id, "intent": route.intent,
-                       "mode": project.mode, "effort": (effort or "weave")})
+                       "mode": project.mode, "effort": (effort or "weave"),
+                       "thread_id": thread.id, "context_window": context_window})
 
         tool_events: list[dict] = []
         from ...config import settings as _s
-        _counts = {"sandbox": 0, "web": 0}
+        _counts = {"sandbox": 0, "web": 0, "exec": 0}
         _web_tools = {"web_search", "deep_research"}
 
         _step_seq = {"n": 0}
@@ -237,6 +272,13 @@ class Orchestrator:
                 _counts["web"] += 1
                 if _counts["web"] > _s.max_web_calls_per_turn:
                     return {"status": "rejected", "error": "web call limit reached for this turn"}
+            if name == "workspace_exec":
+                # Each exec starts a container; a looping agent would otherwise
+                # spawn hundreds in a single turn.
+                _counts["exec"] += 1
+                if _counts["exec"] > _s.max_workspace_execs_per_turn:
+                    return {"status": "rejected",
+                            "error": "workspace command limit reached for this turn"}
 
             tool_input = dict(tool_input or {})
             # `note` is the model-authored step title. It is a UI concern, never a
@@ -308,9 +350,21 @@ class Orchestrator:
         # 7. generate
         translate_fn = engine.translate
         engine_streamed = False
+        history_trimmed = False
         if getattr(engine, "available", False):
-            system = self._system_prompt(project, language, passages, dataset_profile, integrity, effort)
-            messages = self._history_as_messages(db, project, language, up_to=user_msg)
+            system = self._system_prompt(project, language, passages, dataset_profile, integrity,
+                                         effort, thread=thread, db=db,
+                                         capabilities=set(services.keys()))
+            messages, history_trimmed = self._history_as_messages(
+                db, thread, language, up_to=user_msg, context_window=context_window,
+            )
+            if history_trimmed:
+                # Say so. Silently dropping the start of a conversation is how a
+                # model appears to "forget" what was agreed, with no signal to
+                # the reader that anything was lost.
+                _emit("context_trimmed", {
+                    "thread_id": thread.id, "context_window": context_window,
+                })
             try:
                 _emit("answer_start", {})
                 result: TurnResult = engine.generate(
@@ -375,6 +429,7 @@ class Orchestrator:
         # 10. rolling project summary (architecture 6.2 project-memory layer)
         self._update_summary(project, user_text, answer)
         db.add(project)
+        self.memory.touch(db, thread)
         db.commit()
         db.refresh(assistant_msg)
 
@@ -389,13 +444,55 @@ class Orchestrator:
         # 12. translate the mirror column OFF the critical path.
         self._translate_in_background(assistant_msg.id, answer, language, translate_fn)
 
+        # 13. context rollover. If this thread has now outgrown the model's
+        # window, summarise it and open a successor so the NEXT turn starts with
+        # a recap instead of a silently truncated history. Done after the answer
+        # is committed, so a summarisation failure can never lose the turn.
+        next_thread_id = None
+        if self.memory.should_roll(db, thread, context_window):
+            try:
+                _emit("summarizing", {"thread_id": thread.id})
+                successor = self.memory.roll_thread(db, project, thread, engine)
+                next_thread_id = successor.id
+                _emit("thread_rolled", {
+                    "from": thread.id,
+                    "to": successor.id,
+                    "title": successor.title,
+                    "summary": successor.summary[:600],
+                })
+            except Exception as exc:  # noqa: BLE001 - never fail a delivered turn
+                log.warning("thread rollover failed for %s: %s", thread.id, exc)
+                db.rollback()
+
         meta = {
             "intent": route.intent, "tier": tier_used, "grounded": grounded,
             "grounding_note": grounding_note if not grounded else "",
             "tool_events": tool_events, "progress": progress_events,
             "artifacts": artifacts, "images": images,
+            "thread_id": thread.id, "next_thread_id": next_thread_id,
+            "context_window": context_window,
+            "context_used": thread.token_estimate,
+            "history_trimmed": history_trimmed,
         }
         return assistant_msg, meta
+
+    @staticmethod
+    def _context_window(engine, model: str | None) -> int:
+        """The selected model's REAL context window.
+
+        Single source of truth: the number sent as Ollama's `num_ctx`, the
+        number history is trimmed against, and the number the UI meter is drawn
+        against are all this one value. When they diverge the meter lies, which
+        is worse than showing no meter at all.
+        """
+        from ...config import settings as _s
+        try:
+            if hasattr(engine, "effective_context"):
+                name = model or engine.model_for_tier("fast")
+                return int(engine.effective_context(name))
+        except Exception:  # noqa: BLE001 - unreachable server: fall back, don't fail
+            pass
+        return _s.ollama_num_ctx
 
     def _collect_artifacts(self, tool_events: list[dict]) -> list[dict]:
         """Turn tool output_files (charts/decks/PDFs/3D) into renderable artifact
@@ -504,37 +601,44 @@ class Orchestrator:
                 return text
 
     def _system_prompt(self, project, language, passages, dataset_profile, integrity,
-                       effort=None) -> str:
+                       effort=None, thread=None, db=None, capabilities=None) -> str:
         from ...runtime import effort_spec
         base = prompts.assemble_system_prompt(
             mode=project.mode, language=language, passages=passages,
             project_summary=project.summary, hypotheses=project.hypotheses or [],
-            dataset_profile=dataset_profile,
+            dataset_profile=dataset_profile, capabilities=capabilities,
         )
+        # Cross-thread memory: what makes a NEW chat in an existing project
+        # continuous rather than amnesiac.
+        if thread is not None and db is not None:
+            block = self.memory.context_block(db, project, thread, language)
+            if block:
+                base += "\n\n" + block
         base += "\n\n" + effort_spec(effort)["prompt"]
         if integrity:
             base += "\n\n" + guardrails.integrity_redirect_instruction(language)
         return base
 
-    def _history_as_messages(self, db, project, language, up_to: Message) -> list[dict]:
-        msgs = (
-            db.query(Message)
-            .filter(Message.project_id == project.id)
-            .order_by(Message.created_at)
-            .all()
+    def _history_as_messages(
+        self, db, thread, language, up_to: Message, context_window: int,
+    ) -> tuple[list[dict], bool]:
+        """History for this turn, budgeted against the model's real window.
+
+        The old version took a fixed last-12 slice of the PROJECT's messages.
+        That was wrong twice over: it ignored how large the turns actually were
+        (twelve long analyses overflow an 8k window; twelve one-liners waste a
+        128k one), and with threads it would mix unrelated conversations.
+        """
+        out, trimmed = self.memory.history_for(
+            db, thread, language, context_window=context_window,
         )
-        out: list[dict] = []
-        for m in msgs[-12:]:
-            if m.role not in {"user", "assistant"}:
-                continue
-            content = m.content_sw if language == "sw" else m.content_en
-            if not content.strip():
-                continue
-            out.append({"role": m.role, "content": content})
-        # ensure the just-stored user message is last
+        # The just-stored user message must be last, whatever the trim did.
         if not out or out[-1]["role"] != "user":
-            out.append({"role": "user", "content": up_to.content_sw if language == "sw" else up_to.content_en})
-        return out
+            out.append({
+                "role": "user",
+                "content": up_to.content_sw if language == "sw" else up_to.content_en,
+            })
+        return out, trimmed
 
     def _collect_citations(self, passages: list[dict], tool_events: list[dict]) -> list[dict]:
         cites: list[dict] = []
@@ -569,13 +673,14 @@ class Orchestrator:
                          "access_status": "open", "predatory_flag": False})
         return cites
 
-    def _store_message(self, db, project, role, text, language, engine) -> Message:
+    def _store_message(self, db, project, role, text, language, engine, thread=None) -> Message:
         # A user's own words are never machine-translated for storage — the literal
         # text is kept in both columns so the bilingual toggle always shows exactly
         # what they typed. (Assistant answers ARE translated, in _process.)
         content_sw = content_en = text
         msg = Message(
-            project_id=project.id, role=role, original_language=language,
+            project_id=project.id, thread_id=thread.id if thread is not None else None,
+            role=role, original_language=language,
             content_sw=content_sw, content_en=content_en, tool_calls=[], citations=[],
         )
         db.add(msg)

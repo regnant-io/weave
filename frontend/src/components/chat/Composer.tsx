@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import type { Dataset, Effort, Language } from "@/lib/types";
 import type { ServiceId, ServicePrefs } from "@/lib/services";
+import { formatTokens, type ModelInfo } from "@/lib/models";
 import { t } from "@/lib/i18n";
 import {
   IcoArrowUp,
@@ -17,11 +18,7 @@ import {
   IcoTerminal,
 } from "@/components/ui/icons";
 
-export interface ModelInfo {
-  name: string;
-  /** Context window in tokens, resolved from the Ollama model itself. */
-  context?: number;
-}
+export type { ModelInfo };
 
 const EFFORTS: { id: Effort; label: string; hint: [string, string] }[] = [
   { id: "spool", label: "Spool", hint: ["haraka", "quick"] },
@@ -195,14 +192,13 @@ function ContextMeter({
   if (!limit) return null;
   const pct = Math.min(100, Math.round((used / limit) * 100));
   const tone = pct >= 90 ? "bg-danger" : pct >= 70 ? "bg-warn" : "bg-accent";
-  const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
   return (
     <div
       className="flex items-center gap-1.5"
       title={
         language === "sw"
-          ? `Muktadha: takribani tokeni ${used} kati ya ${limit}`
-          : `Context: ~${used} of ${limit} tokens used`
+          ? `Muktadha: takribani tokeni ${used} kati ya ${limit}. Ukifika kikomo, mazungumzo hufupishwa na kuendelea kwenye gumzo jipya.`
+          : `Context: ~${used} of ${limit} tokens. At the limit this chat is summarised and continued in a new one.`
       }
     >
       <div className="h-1 w-12 overflow-hidden rounded-full bg-surface-3">
@@ -212,7 +208,7 @@ function ContextMeter({
         />
       </div>
       <span className="font-mono text-[10px] tabular-nums text-fg-faint">
-        {fmt(used)}/{fmt(limit)}
+        {formatTokens(used)}/{formatTokens(limit)}
       </span>
     </div>
   );
@@ -238,6 +234,7 @@ export default function Composer({
   services,
   setServices,
   contextUsed,
+  contextLimit,
 }: {
   input: string;
   setInput: (v: string) => void;
@@ -256,6 +253,8 @@ export default function Composer({
   services: ServicePrefs;
   setServices: (s: ServicePrefs) => void;
   contextUsed: number;
+  /** The selected model's REAL window, resolved server-side. 0 hides the meter. */
+  contextLimit: number;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const sw = language === "sw";
@@ -268,7 +267,6 @@ export default function Composer({
     ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   }, [input]);
 
-  const current = useMemo(() => models.find((m) => m.name === model), [models, model]);
   const activeServices = SERVICES.filter((s) => services[s.id]);
   const inputTokens = Math.ceil(input.length / 3.6);
 
@@ -283,11 +281,26 @@ export default function Composer({
   }
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20">
+    <div
+      className="pointer-events-none absolute inset-x-0 bottom-0 z-20"
+      /*
+        --kb-inset lifts the composer clear of the iOS on-screen keyboard. iOS
+        shrinks only the VISUAL viewport, so `bottom: 0` is still the bottom of
+        the (unchanged) layout viewport — i.e. underneath the keyboard. That is
+        the "input hides below the screen" bug; there is no CSS-only fix.
+      */
+      style={{
+        transform: "translateY(calc(-1 * var(--kb-inset)))",
+        transition: "transform 180ms var(--ease-out-soft)",
+      }}
+    >
       {/* Fade so text dissolves under the composer instead of being clipped. */}
-      <div className="h-14 bg-gradient-to-t from-bg via-bg/90 to-transparent" />
-      <div className="bg-bg px-3 pb-3">
-        <div className="pointer-events-auto mx-auto w-full max-w-chat">
+      <div className="pointer-events-none h-14 bg-gradient-to-t from-bg via-bg/90 to-transparent" />
+      <div
+        className="bg-bg px-2 sm:px-3"
+        style={{ paddingBottom: "calc(0.75rem + var(--safe-bottom))" }}
+      >
+        <div className="pointer-events-auto mx-auto w-full min-w-0 max-w-chat">
           {/* control rail */}
           <div className="hide-scrollbar mb-1.5 flex items-center gap-1.5 overflow-x-auto px-0.5 pb-0.5">
             <Popover
@@ -337,9 +350,7 @@ export default function Composer({
                       >
                         <span className="min-w-0 flex-1 truncate">{m.name}</span>
                         {m.context ? (
-                          <span className="eyebrow flex-shrink-0">
-                            {Math.round(m.context / 1024)}k
-                          </span>
+                          <span className="eyebrow flex-shrink-0">{formatTokens(m.context)}</span>
                         ) : null}
                       </button>
                     ))}
@@ -441,14 +452,20 @@ export default function Composer({
             <div className="ml-auto flex-shrink-0 pl-2">
               <ContextMeter
                 used={contextUsed + inputTokens}
-                limit={current?.context ?? 0}
+                limit={contextLimit}
                 language={language}
               />
             </div>
           </div>
 
           {/* input */}
-          <div className="flex items-end gap-2 rounded-lg border border-border bg-surface px-2 py-1.5 shadow-soft transition-colors duration-fast focus-within:border-accent-line">
+          {/*
+            Focus is expressed as a ring the whole field participates in, rather
+            than a single border colour change: at 1px the old treatment was
+            nearly invisible against --border on a bright phone screen. The
+            outline is suppressed because the ring IS the focus indicator.
+          */}
+          <div className="composer-field flex items-end gap-2 rounded-lg border border-border bg-surface px-2 py-1.5 shadow-soft">
             <textarea
               ref={taRef}
               rows={1}
@@ -461,7 +478,14 @@ export default function Composer({
                 }
               }}
               placeholder={t("askPlaceholder", language)}
-              className="max-h-[200px] flex-1 resize-none bg-transparent px-2 py-1.5 font-read text-[15.5px] leading-relaxed outline-none placeholder:text-fg-faint placeholder:italic"
+              /* enterKeyHint labels the iOS return key; autoCapitalize keeps a
+                 Kiswahili sentence from being auto-capitalised mid-thought. */
+              enterKeyHint="send"
+              autoCapitalize="sentences"
+              autoCorrect="on"
+              /* 16px minimum: below that, iOS Safari ZOOMS the whole page on
+                 focus and the layout never fully recovers. */
+              className="max-h-[200px] min-w-0 flex-1 resize-none bg-transparent px-2 py-1.5 font-read text-[16px] leading-relaxed outline-none placeholder:italic placeholder:text-fg-faint sm:text-[15.5px]"
             />
             {streaming ? (
               <button

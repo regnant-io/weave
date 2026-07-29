@@ -26,6 +26,8 @@ import {
   Layers,
   Library,
   LogOut,
+  Maximize2,
+  MessageSquarePlus,
   Menu,
   Monitor,
   Moon,
@@ -120,6 +122,8 @@ export const IcoCopy = mk(Copy);
 export const IcoTrash = mk(Trash2);
 export const IcoEye = mk(Eye);
 export const IcoExternal = mk(ExternalLink);
+export const IcoMaximize = mk(Maximize2);
+export const IcoNewChat = mk(MessageSquarePlus, 17);
 
 /** Tool name -> icon, so a step chip is recognisable before it is read. */
 export function iconForTool(tool?: string) {

@@ -57,6 +57,38 @@ def test_injection_sanitiser_strips_directives():
 
 
 def test_effort_levels():
-    assert effort_spec("spool")["num_predict"] < effort_spec("tapestry")["num_predict"]
     assert effort_spec("tapestry")["think"] is True
     assert effort_spec(None)["label"] == "Weave"
+
+
+def test_output_budget_scales_with_the_model_window():
+    """Effort levels must derive their output budget from the REAL context window.
+
+    A fixed `num_predict` (the previous design) is what truncated long file
+    generation: a 2048-token ceiling cuts off any substantial file no matter how
+    much room the model actually has.
+    """
+    from app.runtime import num_predict_for
+
+    # More window -> more room to answer.
+    assert num_predict_for("weave", 128_000) > num_predict_for("weave", 8_192)
+    # Deeper effort -> at least as much room, at the same window.
+    assert num_predict_for("spool", 32_768) < num_predict_for("weave", 32_768)
+    # The deep level is explicitly unbounded (-1 = "run to your natural stop").
+    assert num_predict_for("tapestry", 32_768) == -1
+    # Even a tiny window keeps a usable floor rather than collapsing to nothing.
+    assert num_predict_for("weave", 1_024) >= 4096
+
+
+def test_context_window_follows_the_model_not_a_constant():
+    """`ollama_max_num_ctx` is an OPT-IN ceiling, not a default clamp.
+
+    It defaulted to 32768, which silently threw away 75% of a 128k model's
+    window and reported the wrong number in the UI meter.
+    """
+    from app.config import settings
+
+    assert settings.ollama_max_num_ctx == 0, (
+        "the context ceiling must default to 0 (no cap) so each model gets its "
+        "own full window"
+    )
