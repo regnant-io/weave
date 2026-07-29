@@ -23,8 +23,8 @@ services:
       # LLM backend: auto | ollama | anthropic | offline
       WEAVE_LLM_BACKEND: ${WEAVE_LLM_BACKEND:-auto}
       # Reach an Ollama server running on the host from inside the container.
-      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-https://anyplace-portal-wagon.ngrok-free.dev/}
-      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-gemma4:cloud}
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-http://host.docker.internal:11434}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-llama3.2:3b}
       # Optional: use Ollama for retrieval embeddings too (needs the embed model pulled).
       WEAVE_OLLAMA_USE_EMBEDDINGS: ${WEAVE_OLLAMA_USE_EMBEDDINGS:-false}
       WEAVE_OLLAMA_EMBED_MODEL: ${WEAVE_OLLAMA_EMBED_MODEL:-nomic-embed-text}
@@ -108,8 +108,8 @@ services:
     environment:
       WEAVE_REDIS_URL: redis://redis:6379/0
       WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-postgresql+psycopg://weave:weave@postgres:5432/weave}
-      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-https://anyplace-portal-wagon.ngrok-free.dev/}
-      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-gemma4:cloud}
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-http://host.docker.internal:11434}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-llama3.2:3b}
     depends_on:
       - redis
     volumes:
