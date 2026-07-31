@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import CrawlerPanel from "./admin/CrawlerPanel";
 
 type Stats = Record<string, number>;
 type Source = { id: string; title: string; url: string | null; source_type: string; chunks: number; predatory_flag: boolean; ingested_at: string | null };
@@ -65,6 +66,12 @@ export default function AdminClient() {
           </button>
         </div>
         {msg && <p className="mt-2 text-xs text-accent">{msg}</p>}
+      </section>
+
+      {/* automated ingestion — crawlers and scrapers */}
+      <section className=" border border-border bg-surface p-5">
+        <h2 className="mb-3 text-sm font-semibold">Automated ingestion</h2>
+        <CrawlerPanel />
       </section>
 
       {/* sources */}

@@ -116,6 +116,19 @@ class Settings(BaseSettings):
     # Gotenberg for deterministic HTML/Markdown -> PDF.
     gotenberg_url: str | None = os.getenv("WEAVE_GOTENBERG_URL")
 
+    # --- live voice (optional server engines) ---
+    # Whisper-compatible transcription endpoint. Empty -> the browser's own
+    # SpeechRecognition does the work and this service only relays text, which
+    # is the default because it needs no models and runs on a phone.
+    stt_url: str | None = os.getenv("WEAVE_STT_URL")
+    # Piper-compatible synthesis endpoint. Empty -> the browser speaks the reply
+    # with speechSynthesis.
+    tts_url: str | None = os.getenv("WEAVE_TTS_URL")
+    # Ceiling on one screen-share frame after client-side downscaling. A frame
+    # larger than this is a client that ignored the downscale instruction, and
+    # accepting it would let one tab flood the socket.
+    screen_frame_max_bytes: int = 900_000
+
     # --- warehouse (mass data analysis) ---
     clickhouse_url: str | None = os.getenv("WEAVE_CLICKHOUSE_URL")
 
@@ -197,6 +210,7 @@ class Settings(BaseSettings):
 
     @field_validator("redis_url", "otel_exporter_otlp_endpoint", "searxng_url",
                      "browserless_url", "render_service_url", "gotenberg_url",
+                     "stt_url", "tts_url",
                      "clickhouse_url", "anthropic_api_key", "whatsapp_token",
                      "whatsapp_phone_id", "at_username", "at_api_key", mode="before")
     @classmethod

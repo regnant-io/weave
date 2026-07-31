@@ -18,6 +18,7 @@
 // control that makes this safe.
 
 import { esc, baseCss } from "./theme.js";
+import { prepareScript } from "./js.js";
 
 /** Patterns that indicate the page is trying to leave its box. */
 const FORBIDDEN = [
@@ -65,6 +66,15 @@ export function renderCustom({
   const source = `${html}\n${code}`;
   if (!source.trim()) return { status: "error", error: "no code supplied" };
   if (source.length > 400_000) return { status: "error", error: "code exceeds 400KB" };
+
+  // Resolve ESM syntax BEFORE anything else. A model that opens with
+  // `import * as THREE from "three"` used to get a page that parsed as far as
+  // the first line and then died; now the import either becomes a binding
+  // against the global we already inline, or the caller gets an error that says
+  // exactly which specifier is the problem.
+  const prepared = prepareScript(code);
+  if (!prepared.ok) return { status: "error", error: prepared.error };
+  code = prepared.code;
 
   const violations = screenCode(source);
   if (violations.length) {
@@ -115,19 +125,29 @@ ${wantsThree ? `<script>${threeSrc}</script>` : ""}
 // Surface runtime errors in the artifact itself. Without this a thrown error
 // inside an opaque-origin iframe is invisible to both the user and the model,
 // and the visual just silently renders blank.
+//
+// This also has to catch the PARSE error of the block below, which a try/catch
+// around the code physically cannot: a SyntaxError happens before any statement
+// in that script runs. That is why the model's code is no longer wrapped in a
+// try - the wrapper never caught the error people actually hit, and it put every
+// top-level const declaration in a block scope where inline handlers could not
+// reach it.
 window.addEventListener('error', function(e){
   var el=document.getElementById('weave-err');
-  if(el){ el.style.display='block'; el.textContent='Visual error: '+(e.message||e.type); }
+  if(el){ el.style.display='block';
+    el.textContent='Visual error: '+(e.message||e.type)+(e.lineno?(' (line '+e.lineno+')'):''); }
+});
+window.addEventListener('unhandledrejection', function(e){
+  var el=document.getElementById('weave-err');
+  var r=e.reason;
+  if(el){ el.style.display='block';
+    el.textContent='Visual error (async): '+((r&&r.message)?r.message:String(r)); }
 });
 </script>
-<script>
-try {
+<script${prepared.scriptType === "module" ? ' type="module"' : ""}>
 ${code}
-} catch (err) {
-  var el=document.getElementById('weave-err');
-  if(el){ el.style.display='block'; el.textContent='Visual error: '+(err && err.message ? err.message : err); }
-}
 </script>
 </body></html>`,
+    notes: prepared.notes,
   };
 }

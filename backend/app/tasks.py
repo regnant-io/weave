@@ -88,6 +88,43 @@ def ingest_source_job(source_id: str) -> None:
         db.close()
 
 
+@job("weave.crawl_seed")
+def crawl_seed_job(seed_id: str) -> None:
+    """Run one crawl seed to its budget.
+
+    Always a background job: a polite crawl is mostly time spent deliberately
+    waiting between requests, so it must never hold an API request open.
+    """
+    from .db import SessionLocal
+    from .models import CrawlSeed
+    from .services.crawler import get_crawler
+    db = SessionLocal()
+    try:
+        seed = db.query(CrawlSeed).filter(CrawlSeed.id == seed_id).first()
+        if seed is None:
+            return
+        if not seed.enabled:
+            log.info("crawl seed %s is disabled; not running", seed_id)
+            return
+        stats = get_crawler().run_seed(db, seed)
+        log.info("crawled %s: %d fetched, %d indexed, %d skipped, %d errors (%s)",
+                 seed.domain, stats.fetched, stats.indexed, stats.skipped,
+                 stats.errors, stats.stopped_because)
+    except Exception as exc:  # noqa: BLE001 - never let a crawl kill the worker
+        log.warning("crawl seed %s failed: %s", seed_id, exc)
+        try:
+            seed = db.query(CrawlSeed).filter(CrawlSeed.id == seed_id).first()
+            if seed is not None:
+                seed.status = "error"
+                seed.last_error = str(exc)[:500]
+                db.add(seed)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+    finally:
+        db.close()
+
+
 @job("weave.resummarize_project")
 def resummarize_project_job(project_id: str) -> None:
     from .db import SessionLocal

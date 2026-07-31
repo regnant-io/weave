@@ -78,7 +78,8 @@ class Orchestrator:
         self, db: Session, project: Project, user_text: str, language: str,
         dataset_id: str | None = None, effort: str | None = None, model: str | None = None,
         regenerate: bool = False, services_pref: dict | None = None,
-        thread_id: str | None = None,
+        thread_id: str | None = None, channel: str = "chat",
+        frames: list[str] | None = None,
     ) -> Iterator[dict]:
         """Yield SSE events LIVE. The turn runs in a worker thread; _process emits
         every event onto a queue which this generator drains in real time. If the
@@ -92,6 +93,12 @@ class Orchestrator:
         cancel = threading.Event()
 
         def emit(event: str, data: dict) -> None:
+            # The turn id is learned by watching the stream rather than being
+            # returned by _process, because it has to be known on the FAILURE
+            # paths too — a turn that raised halfway still holds a steering
+            # registration, and only the finally below can release it.
+            if event == "meta" and data.get("message_id"):
+                holder["turn_id"] = data["message_id"]
             q.put({"event": event, "data": data})
 
         def worker() -> None:
@@ -99,12 +106,16 @@ class Orchestrator:
                 msg, meta = self._process(db, project, user_text, language, dataset_id,
                                           emit=emit, effort=effort, model=model,
                                           cancel=cancel, regenerate=regenerate,
-                                          services_pref=services_pref, thread_id=thread_id)
+                                          services_pref=services_pref, thread_id=thread_id,
+                                          channel=channel, frames=frames)
                 holder["msg"] = msg
                 holder["meta"] = meta
             except Exception as exc:  # noqa: BLE001
                 holder["error"] = str(exc)
             finally:
+                if holder.get("turn_id"):
+                    from ..steering import get_steering
+                    get_steering().finish(holder["turn_id"])
                 q.put(None)
 
         t = threading.Thread(target=worker, daemon=True)
@@ -147,7 +158,8 @@ class Orchestrator:
         self, db: Session, project: Project, user_text: str, language: str,
         dataset_id: str | None, emit=None, effort: str | None = None, model: str | None = None,
         cancel=None, regenerate: bool = False, services_pref: dict | None = None,
-        thread_id: str | None = None,
+        thread_id: str | None = None, channel: str = "chat",
+        frames: list[str] | None = None,
     ) -> tuple[Message, dict]:
         engine = get_engine()
 
@@ -223,6 +235,15 @@ class Orchestrator:
         workspace = get_workspace_service()
         if workspace.enabled:
             services["workspace"] = workspace
+        from ..skills import get_skills
+        skills = get_skills()
+        if skills.enabled:
+            services["skills"] = skills
+        # The shared canvas needs a database session to read and write through,
+        # so it is only offered on turns that have one.
+        if db is not None:
+            from ..canvas import get_canvas_service
+            services["canvas"] = get_canvas_service()
         # `ask_user` is only offered when there is a live client to answer it.
         # In a batch/WhatsApp turn a blocking question would simply hang.
         if emit is not None:
@@ -252,7 +273,29 @@ class Orchestrator:
         # meta up front so the client has the message id immediately
         _emit("meta", {"message_id": assistant_msg.id, "intent": route.intent,
                        "mode": project.mode, "effort": (effort or "weave"),
-                       "thread_id": thread.id, "context_window": context_window})
+                       "thread_id": thread.id, "context_window": context_window,
+                       # The client may redirect this turn from now on.
+                       "steerable": emit is not None})
+
+        # Register for steering HERE, not at the generation call: the client has
+        # the turn id from the event above, and retrieval plus pre-generation
+        # tools can run for a long time before generation starts. A redirect sent
+        # in that window must be queued, not rejected for an unknown turn.
+        #
+        # Only for streaming turns. A batch turn (WhatsApp, run_turn) has no live
+        # client to send a redirect, so registering one would leak an entry until
+        # the sweeper collected it. `stream_turn` deregisters on every exit path.
+        from ..steering import get_steering as _get_steering
+        _steering = _get_steering()
+        _steer_turn = (
+            _steering.register(
+                turn_id=assistant_msg.id,
+                user_id=str(getattr(getattr(project, "user", None), "id", "") or ""),
+                project_id=str(project.id),
+            )
+            if emit is not None
+            else None
+        )
 
         tool_events: list[dict] = []
         from ...config import settings as _s
@@ -354,10 +397,20 @@ class Orchestrator:
         if getattr(engine, "available", False):
             system = self._system_prompt(project, language, passages, dataset_profile, integrity,
                                          effort, thread=thread, db=db,
-                                         capabilities=set(services.keys()))
+                                         capabilities=set(services.keys()),
+                                         model_class=self._model_class(engine, model),
+                                         channel=channel)
             messages, history_trimmed = self._history_as_messages(
                 db, thread, language, up_to=user_msg, context_window=context_window,
             )
+            # Screen-share frames ride on the LAST user message, in the
+            # engine-neutral `images` shape Ollama consumes natively and the
+            # Anthropic engine converts (see `AnthropicEngine._with_images`).
+            # They are attached here rather than persisted with the message: a
+            # screenshot is context for one turn, and storing every frame would
+            # grow the conversation without making the next answer better.
+            if frames and messages and messages[-1].get("role") == "user":
+                messages[-1] = {**messages[-1], "images": list(frames)[:2]}
             if history_trimmed:
                 # Say so. Silently dropping the start of a conversation is how a
                 # model appears to "forget" what was agreed, with no signal to
@@ -365,17 +418,66 @@ class Orchestrator:
                 _emit("context_trimmed", {
                     "thread_id": thread.id, "context_window": context_window,
                 })
+            # --- steerable generation ---------------------------------------
+            # The turn is registered under the assistant message id, which the
+            # client already has from the `meta` event above. A redirect POSTed
+            # while this runs aborts the generation (the engines poll the cancel
+            # object between tokens and between tool calls), lands in the
+            # conversation as a real user turn, and generation restarts from
+            # there. See services/steering.py for why restarting beats splicing.
+            from ..steering import SteerAwareCancel
+            steering = _steering
+            steer_cancel = (
+                SteerAwareCancel(cancel, _steer_turn.event) if _steer_turn else cancel
+            )
             try:
                 _emit("answer_start", {})
-                result: TurnResult = engine.generate(
-                    system=system, messages=messages, tools=tool_schemas,
-                    tool_executor=tool_executor, tier=route.tier,
-                    on_event=_emit, effort=effort, model=model, cancel=cancel,
-                )
-                answer = result.text
-                tool_events = result.tool_events
-                tier_used = result.tier_used
-                engine_streamed = getattr(engine, "name", "") == "ollama"
+                while True:
+                    result: TurnResult = engine.generate(
+                        system=system, messages=messages, tools=tool_schemas,
+                        tool_executor=tool_executor, tier=route.tier,
+                        on_event=_emit, effort=effort, model=model,
+                        cancel=steer_cancel,
+                    )
+                    answer = result.text
+                    tool_events = result.tool_events
+                    tier_used = result.tier_used
+                    engine_streamed = getattr(engine, "name", "") == "ollama"
+
+                    if _steer_turn is None:
+                        break
+                    redirects = steering.drain(assistant_msg.id)
+                    if not redirects or steer_cancel.cancelled:
+                        break
+                    if steering.restarts_left(assistant_msg.id) <= 0:
+                        # Out of budget: still deliver the redirect so it is not
+                        # silently swallowed, but stop restarting so the turn
+                        # terminates. It becomes context for the next turn.
+                        for r in redirects:
+                            _emit("steer_deferred", {"text": r["text"]})
+                        break
+
+                    steering.note_restart(assistant_msg.id)
+                    for r in redirects:
+                        # A redirect is a user instruction, so it enters the
+                        # conversation as one. Marking it as mid-stream is what
+                        # tells the model this supersedes the direction it was
+                        # taking rather than being a fresh, separate request.
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[REDIRECT — sent while you were still working, and it "
+                                "supersedes the direction you were taking] " + r["text"]
+                            ),
+                        })
+                        _emit("steer_applied", {
+                            "text": r["text"], "kind": r.get("kind", "redirect"),
+                            "restarts_left": steering.restarts_left(assistant_msg.id),
+                        })
+                    # Everything streamed so far was reasoning the user has now
+                    # overridden. Tell the client to clear it, so what is on
+                    # screen matches what the model actually reasoned about.
+                    _emit("answer_restart", {"reason": "steered"})
             except Exception as exc:  # noqa: BLE001
                 # Remote LLM (Ollama/Anthropic) failed after retries -> degrade to
                 # the offline engine so the turn still completes rather than 500s.
@@ -416,15 +518,22 @@ class Orchestrator:
         artifacts = self._collect_artifacts(tool_events)
         images = self._collect_web_images(tool_events, passages)
         assistant_msg.citations = citations
-        assistant_msg.tool_calls = [
-            {"name": e.get("name"), "status": e.get("result", {}).get("status"),
-             "output_files": e.get("result", {}).get("output_files", [])}
-            for e in tool_events
-        ]
+        # Persist the STEP TIMELINE, not just a list of tool names. Reloading a
+        # conversation used to drop every tool panel on the floor: the work the
+        # assistant did — what it searched, what it ran, what each step produced
+        # — existed only in the live SSE stream, so a refresh turned a detailed
+        # audit trail into a bare paragraph. `_step_timeline` reconstructs it
+        # from the events the client actually received, which keeps the replayed
+        # transcript identical to the live one by construction.
+        assistant_msg.tool_calls = _step_timeline(progress_events)
         # persist artifacts + images on the message so history re-renders them
         assistant_msg.artifacts = artifacts
         assistant_msg.images = images
         db.add(assistant_msg)
+
+        # 9b. Offer the domains this turn consulted as crawl candidates, so the
+        # library grows with real use. Consent-gated; creates nothing enabled.
+        self._note_session_sources(db, project, tool_events)
 
         # 10. rolling project summary (architecture 6.2 project-memory layer)
         self._update_summary(project, user_text, answer)
@@ -494,6 +603,34 @@ class Orchestrator:
             pass
         return _s.ollama_num_ctx
 
+    @staticmethod
+    def _model_class(engine, model: str | None) -> str:
+        """"large" or "small" — how much prompt guidance is worth its tokens.
+
+        Both classes get the same RULES; the difference is how much explanatory
+        text accompanies them. A 3B local model handed eight pages of working
+        standards produces worse output than the same model handed two, because
+        it spends its attention on the instructions rather than the task.
+
+        Classification is by engine and by parameter count in the model tag,
+        which is what Ollama names actually encode ("llama3.2:3b",
+        "qwen2.5:14b"). Anything hosted (Claude) is large; an unrecognised local
+        tag is treated as small, because under-instructing a capable model costs
+        far less than drowning a small one.
+        """
+        import re
+
+        if type(engine).__name__ == "AnthropicEngine":
+            return "large"
+        name = (model or getattr(engine, "model", "") or "").lower()
+        match = re.search(r"[:\-](\d+(?:\.\d+)?)\s*b\b", name)
+        if match:
+            try:
+                return "large" if float(match.group(1)) >= 27 else "small"
+            except ValueError:
+                pass
+        return "small"
+
     def _collect_artifacts(self, tool_events: list[dict]) -> list[dict]:
         """Turn tool output_files (charts/decks/PDFs/3D) into renderable artifact
         references with a frontend-proxied URL."""
@@ -522,6 +659,57 @@ class Orchestrator:
                     seen.add(u)
                     imgs.append({"url": u, "title": im.get("title", ""), "source": im.get("source", "")})
         return imgs[:4]
+
+    def _note_session_sources(self, db, project, tool_events: list[dict]) -> None:
+        """Record the DOMAINS this turn actually consulted as crawl candidates.
+
+        This is the mechanism that makes the library grow with real use rather
+        than only with an operator's attention: the pages people genuinely read
+        are a far better signal of what belongs in a Tanzanian research library
+        than anything we would guess.
+
+        Three properties make it defensible:
+          * it is per-user consent — `User.allow_source_crawl`, on by default and
+            switchable off in Settings, and checked inside the crawler service so
+            there is exactly one place it can be got wrong;
+          * it records a DOMAIN as a DISABLED candidate and crawls nothing. An
+            operator approves it on the admin page before a single page is
+            fetched, so one odd link in one chat cannot start a crawl;
+          * it never touches anything the user wrote — only public URLs the
+            session already fetched.
+
+        Failures here are swallowed: growing the library is a background nicety
+        and must never affect the answer the user is waiting for.
+        """
+        user = getattr(project, "user", None)
+        if user is None or not getattr(user, "allow_source_crawl", True):
+            return
+        urls: list[str] = []
+        for event in tool_events:
+            result = event.get("result") or {}
+            if result.get("url"):
+                urls.append(str(result["url"]))
+            for passage in result.get("passages", []) or []:
+                if isinstance(passage, dict) and passage.get("url"):
+                    urls.append(str(passage["url"]))
+            for row in result.get("results", []) or []:
+                if isinstance(row, dict) and row.get("url"):
+                    urls.append(str(row["url"]))
+        if not urls:
+            return
+        try:
+            from ..crawler import get_crawler
+            crawler = get_crawler()
+            seen_domains: set[str] = set()
+            for url in urls[:20]:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc.lower()
+                if not domain or domain in seen_domains:
+                    continue
+                seen_domains.add(domain)
+                crawler.note_session_source(db, url, user)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not record session sources: %s", exc)
 
     # -- helpers -------------------------------------------------------------
 
@@ -601,12 +789,14 @@ class Orchestrator:
                 return text
 
     def _system_prompt(self, project, language, passages, dataset_profile, integrity,
-                       effort=None, thread=None, db=None, capabilities=None) -> str:
+                       effort=None, thread=None, db=None, capabilities=None,
+                       model_class: str = "large", channel: str = "chat") -> str:
         from ...runtime import effort_spec
         base = prompts.assemble_system_prompt(
             mode=project.mode, language=language, passages=passages,
             project_summary=project.summary, hypotheses=project.hypotheses or [],
             dataset_profile=dataset_profile, capabilities=capabilities,
+            model_class=model_class, channel=channel,
         )
         # Cross-thread memory: what makes a NEW chat in an existing project
         # continuous rather than amnesiac.
@@ -753,6 +943,92 @@ _PENDING_ARTIFACT_KIND = {
     "render_custom": "visual",
     "run_analysis": "analysis",
 }
+
+
+def _step_timeline(events: list[dict]) -> list[dict]:
+    """Rebuild the tool-step timeline from the events the client was sent.
+
+    Derived from `progress_events` rather than assembled separately on purpose:
+    anything the UI rendered live is, by construction, in that list, so the
+    replayed transcript cannot drift from the streamed one as new event types
+    are added.
+
+    `name` is kept on every entry because the stats endpoint counts tool usage
+    from this column.
+    """
+    steps: list[dict] = []
+    by_id: dict[str, dict] = {}
+    current: dict | None = None
+
+    for ev in events:
+        kind = ev.get("event")
+        data = ev.get("data") or {}
+
+        if kind == "step_start":
+            step = {
+                "id": data.get("id"),
+                "name": data.get("tool"),        # stats reads this key
+                "tool": data.get("tool"),
+                "title": data.get("title", ""),
+                "args": data.get("args") or {},
+                "state": "running",
+                "status": "",
+                "summary": "",
+                "detail": "",
+                "substeps": [],
+                "artifacts": [],
+            }
+            steps.append(step)
+            if step["id"]:
+                by_id[str(step["id"])] = step
+            current = step
+
+        elif kind == "step_note":
+            target = by_id.get(str(data.get("id"))) or current
+            if target and data.get("title"):
+                target["title"] = data["title"]
+
+        elif kind == "step_sub":
+            target = by_id.get(str(data.get("id"))) or current
+            if target:
+                for prior in target["substeps"]:
+                    if prior.get("state") == "running":
+                        prior["state"] = "done"
+                target["substeps"].append({
+                    "text": data.get("text", ""),
+                    "url": data.get("url", ""),
+                    "detail": data.get("detail", ""),
+                    "state": "running",
+                })
+
+        elif kind == "step_end":
+            target = by_id.get(str(data.get("id"))) or current
+            if target:
+                status = data.get("status", "ok")
+                target["status"] = status
+                target["state"] = "error" if status in {"error", "rejected"} else "done"
+                target["summary"] = data.get("summary", "")
+                target["detail"] = data.get("detail", "")
+                if data.get("error"):
+                    target["error"] = data["error"]
+                for sub in target["substeps"]:
+                    sub["state"] = "done"
+            current = None
+
+        elif kind == "artifact" and current is not None:
+            # Mirrors the live client, which records an artifact on the open step
+            # AND renders it inline. Keeping both means history looks the same.
+            current["artifacts"].append(data)
+
+    # A turn cancelled mid-tool leaves a step open; close it so the replayed
+    # panel does not spin forever.
+    for step in steps:
+        if step["state"] == "running":
+            step["state"] = "done"
+            step["status"] = step["status"] or "ok"
+        for sub in step["substeps"]:
+            sub["state"] = "done"
+    return steps
 
 
 def _preview_args(args: dict) -> dict:

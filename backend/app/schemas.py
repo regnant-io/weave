@@ -54,6 +54,15 @@ class UserOut(BaseModel):
     trust_tier: str
     phone_verified: bool
     institution_id: str | None
+    #: May the public sources this user's sessions consult be offered as crawl
+    #: candidates for the shared library? On by default, switchable in Settings.
+    allow_source_crawl: bool = True
+
+
+class UserPrefsIn(BaseModel):
+    """Partial update of the signed-in user's own preferences."""
+    preferred_language: str | None = None
+    allow_source_crawl: bool | None = None
 
 
 # --- projects ---
@@ -233,6 +242,38 @@ class CitationCheckResponse(BaseModel):
     flagged_predatory: bool
     reason: str
     matched_source: SourcePassage | None = None
+
+
+# --- steering: redirecting a turn that is still running ---
+class SteerIn(BaseModel):
+    text: str
+    #: "redirect" (change direction), "focus" (go deeper on this), "skip" (drop
+    #: what you are doing). Purely a UI label — the model receives the text.
+    kind: str = "redirect"
+
+
+# --- collaborative canvas ---
+class CanvasOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    project_id: str
+    title: str
+    content: str
+    revision: int
+    updated_at: datetime
+    updated_by: str
+
+
+class CanvasPatchIn(BaseModel):
+    """A human edit.
+
+    `base_revision` is what the editor last saw. The server rejects a write built
+    on a stale revision rather than overwriting whatever landed in between — see
+    services/canvas.py.
+    """
+    content: str
+    base_revision: int
+    title: str | None = None
 
 
 TokenResponse.model_rebuild()

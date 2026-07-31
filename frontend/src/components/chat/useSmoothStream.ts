@@ -163,7 +163,22 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
 
   const pending = useCallback(() => buffer.current.length, []);
 
+  /**
+   * Discard everything undrained without committing it.
+   *
+   * Distinct from `flushNow`, which hands the remainder back so the caller can
+   * keep it. This is for the case where the buffered text should never appear:
+   * the user redirected the turn mid-stream, so the tokens still in flight
+   * belong to reasoning that has been overridden. Committing them would leave
+   * the answer contradicting its own opening.
+   */
+  const reset = useCallback(() => {
+    buffer.current = "";
+    finishing.current = false;
+    stop();
+  }, [stop]);
+
   useEffect(() => () => stop(), [stop]);
 
-  return { push, finish, flushNow, pending };
+  return { push, finish, flushNow, pending, reset };
 }

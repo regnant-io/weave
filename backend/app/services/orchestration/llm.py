@@ -328,6 +328,35 @@ class AnthropicEngine:
     def model_for_tier(self, tier: str) -> str:
         return settings.model_tier_frontier if tier == "frontier" else settings.model_tier_fast
 
+    @staticmethod
+    def _with_images(message: dict[str, Any]) -> dict[str, Any]:
+        """Translate Weave's engine-neutral `images` key into Anthropic blocks.
+
+        Screen sharing attaches base64 JPEG frames to the user's turn as
+        `{"role": "user", "content": "...", "images": [b64, ...]}`. Ollama
+        consumes exactly that shape natively, so it is the format the
+        orchestrator produces; Anthropic wants typed content blocks instead.
+        Converting here keeps the orchestrator free of per-vendor branching, and
+        a message with no images passes through untouched.
+        """
+        images = message.get("images")
+        if not images:
+            return message
+        blocks: list[dict[str, Any]] = []
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            blocks.extend(content)
+        for data in images:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": data},
+            })
+        out = {k: v for k, v in message.items() if k != "images"}
+        out["content"] = blocks
+        return out
+
     def generate(
         self,
         *,
@@ -341,7 +370,7 @@ class AnthropicEngine:
     ) -> TurnResult:
         max_iters = max_iters or settings.llm_max_tool_iters
         model = model or self.model_for_tier(tier)
-        convo = list(messages)
+        convo = [self._with_images(m) for m in messages]
         tool_events: list[dict] = []
 
         for _ in range(max_iters):
@@ -459,21 +488,31 @@ class OfflineEngine:
                     "Kumbuka kuangalia hali ya upatikanaji (wazi/inayolipiwa) kabla ya kutumia chanzo."
                 )
         elif not analysis and not integrity_triggered:
+            # A retrieval miss is not a refusal.
+            #
+            # This branch used to end the answer with "I won't state specific
+            # statistics… or we can narrow the question" — the same defensive
+            # posture that was removed from the system prompt, hardcoded here
+            # where no prompt change can reach it. Since the offline engine is
+            # what runs when there is no Ollama and no API key, that made the
+            # DEFAULT experience of Weave a decline.
+            #
+            # Now it says what is actually true — nothing was retrieved, so
+            # specifics need checking — and then gets on with helping.
             if intent in {"literature", "concept"}:
                 if sw:
                     parts.append(
-                        "Sina chanzo cha ndani kilichopatikana kwa swali hili, hivyo sitatoa takwimu "
-                        "au sheria mahususi kama ukweli uliothibitishwa. Naweza kukueleza dhana kwa "
-                        "ujumla, au tuboreshe swali liwe mahususi zaidi."
+                        "Sikupata chanzo cha ndani kwa swali hili, hivyo takwimu au sheria "
+                        "mahususi zinahitaji kuhakikiwa kabla ya kuzitegemea. Hebu tuanze na "
+                        "dhana yenyewe:"
                     )
                 else:
                     parts.append(
-                        "I have no grounded local source for this question, so I won't state specific "
-                        "statistics or laws as established fact. I can explain the concept generally, "
-                        "or we can narrow the question."
+                        "I did not retrieve a local source for this, so treat any specific "
+                        "figure or legal provision below as needing a check. Here is the "
+                        "concept itself:"
                     )
-            else:
-                parts.append(self._generic_help(user_text, sw, mode))
+            parts.append(self._generic_help(user_text, sw, mode))
 
         if mode == "student" and not integrity_triggered:
             parts.append(

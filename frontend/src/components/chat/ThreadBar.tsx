@@ -32,6 +32,7 @@ export default function ThreadBar({
   activeId,
   language,
   onSelect,
+  onPrefetch,
   onChanged,
 }: {
   projectId: string;
@@ -39,6 +40,12 @@ export default function ThreadBar({
   activeId: string;
   language: Language;
   onSelect: (id: string) => void;
+  /**
+   * Warm a transcript before it is opened. Called when the list is opened and
+   * on hover/focus of a row, so the common case — pick a chat, read it — has
+   * its fetch already finished by the time the click lands.
+   */
+  onPrefetch?: (id: string) => void;
   onChanged: () => void;
 }) {
   const sw = language === "sw";
@@ -121,12 +128,28 @@ export default function ThreadBar({
         /* Sits between the fixed menu button (left) and the thread-options
            button (right); the max-width reserves room for both so nothing
            overlaps at 360px. */
-        className="pointer-events-none absolute left-1/2 z-30 flex w-full max-w-[min(24rem,calc(100%-8rem))] -translate-x-1/2 justify-center"
-        style={{ top: "calc(0.5rem + var(--safe-top))" }}
+        /* Sits on the shared floating rail (--float-top / --float-h in
+           globals.css) so it centres on exactly the same line as the menu
+           button on the left and the options button on the right. The row is
+           given the rail's height and centres its contents, which lets the pill
+           keep its own smaller height without drifting off that line. */
+        className="pointer-events-none absolute left-1/2 z-30 flex w-full max-w-[min(24rem,calc(100%-8rem))] -translate-x-1/2 items-center justify-center"
+        style={{ top: "var(--float-top)", height: "var(--float-h)" }}
       >
         <div className="pointer-events-auto relative flex max-w-full items-center gap-1">
           <button
-            onClick={() => setOpen((v) => !v)}
+            onClick={() => {
+              const next = !open;
+              setOpen(next);
+              // Opening the list is the strongest signal a switch is coming.
+              // Warming the few most recent chats now means the click that
+              // follows renders from cache instead of behind a spinner.
+              if (next && onPrefetch) {
+                threads.slice(0, 6).forEach((t) => {
+                  if (t.id !== activeId) onPrefetch(t.id);
+                });
+              }
+            }}
             aria-expanded={open}
             aria-haspopup="menu"
             className="flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-surface/90 px-3 py-1 text-[12.5px] text-fg-muted shadow-sm backdrop-blur transition-colors duration-fast hover:border-border-mid hover:text-fg"
@@ -202,6 +225,8 @@ export default function ThreadBar({
                             onSelect(t.id);
                             setOpen(false);
                           }}
+                          onMouseEnter={() => onPrefetch?.(t.id)}
+                          onFocus={() => onPrefetch?.(t.id)}
                           className="min-w-0 flex-1 px-1 py-0.5 text-left"
                         >
                           <span

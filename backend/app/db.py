@@ -84,6 +84,14 @@ def init_db() -> None:
             pcols = {r[1] for r in conn.execute(text("PRAGMA table_info(projects)"))}
             if "notes" not in pcols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN notes JSON DEFAULT '[]'"))
+            # Consent for contributing session sources to the shared library.
+            # Defaults to 1 (on) for existing users, matching the column default
+            # and the documented behaviour — it is switchable in Settings.
+            ucols = {r[1] for r in conn.execute(text("PRAGMA table_info(users)"))}
+            if "allow_source_crawl" not in ucols:
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN allow_source_crawl BOOLEAN DEFAULT 1"
+                ))
 
     _backfill_threads()
 

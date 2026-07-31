@@ -3,7 +3,8 @@
 // Generated artifacts are viewed inside the Weave right-hand panel, so they must
 // read as part of the product rather than as whatever a chart library defaults
 // to. These tokens mirror frontend/src/app/globals.css: warm monochrome paper
-// with a single burnt-orange ink, editorial serif display, sharp corners.
+// with a single burnt-orange ink, one grotesque plus a true monospace, sharp
+// corners.
 //
 // Every page is fully self-contained — no CDN, no external font, no network —
 // because artifacts are served from object storage under a strict sandbox.
@@ -87,14 +88,19 @@ export function baseCss(theme = "light") {
   --fg-faint:${t.fgFaint};--accent:${t.accent};--accent-soft:${t.accentSoft};--grid:${t.grid};
 }
 *{box-sizing:border-box}
+/* Artifacts are viewed inside the Weave panel, so their type has to be the same
+   voice as the app: one grotesque for everything, one monospace for labels and
+   figures. These are system stacks rather than webfonts because an artifact has
+   no network — it cannot fetch Geist or JetBrains Mono, and the nearest local
+   equivalent is closer than a fallback to Georgia ever was. */
 html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
-  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
-  -webkit-font-smoothing:antialiased}
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;font-variant-numeric:lining-nums tabular-nums}
 .wrap{padding:20px 22px;max-width:1100px;margin:0 auto}
-.eyebrow{font-family:ui-monospace,Consolas,monospace;font-size:10px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--fg-faint)}
-h1.title{font-family:Georgia,"Times New Roman",serif;font-size:26px;font-weight:600;
-  letter-spacing:-.02em;margin:.15em 0 .1em;line-height:1.15}
+.eyebrow{font-family:ui-monospace,"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+  font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--fg-faint)}
+h1.title{font-size:25px;font-weight:600;
+  letter-spacing:-.022em;margin:.15em 0 .1em;line-height:1.15}
 p.sub{color:var(--fg-muted);font-size:13.5px;line-height:1.6;margin:.5em 0 0;max-width:62ch}
 .rule{height:1px;background:var(--border);margin:16px 0}
 .rule-thick{height:2px;background:var(--border-strong);opacity:.85;margin:16px 0}

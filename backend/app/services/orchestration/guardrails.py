@@ -11,17 +11,34 @@ from __future__ import annotations
 
 import re
 
+# These patterns must match "write my assignment for me" and NOT "draft the
+# report", "write the introduction with me", or "help me write this up".
+#
+# The previous set was far too broad and was a significant cause of the
+# assistant refusing ordinary work: `(write|draft|complete|finish|do).{0,40}
+# (my|the)?\s?(essay|assignment|homework|coursework|answer|report)` matches
+# "draft the report" and even "do the answer", and the bare Swahili stem
+# `\bni(andik|fany|tengenez)\w*\b` matched any first-person request to write,
+# make or produce ANYTHING — including "nitengenezee grafu" (make me a graph),
+# which is not an integrity question at all.
+#
+# The guard now requires possession of schoolwork specifically ("MY essay",
+# "insha YANGU"), so a request to draft, edit or co-write is left alone.
 _INTEGRITY_PATTERNS = [
-    # English: write/do my essay/assignment...
-    r"\b(write|draft|complete|finish|do)\b.{0,40}\b"
-    r"(my|the)?\s?(essay|assignment|homework|coursework|answer|report)\b",
-    r"\bdo my (assignment|homework|essay|coursework)\b",
-    # Swahili: match the 'andik-' write stem in any conjugation (andika, niandikie,
-    # uniandikie), plus fanyie/tengenez, near a work noun. This is what the eval
-    # harness surfaced: 'niandikie insha' was previously missed.
-    r"\b\w*andik\w*\b.{0,40}\b(insha|kazi|zoezi|jibu|ripoti|assignment)\b",
-    r"\b(nifanyie|unifanyie|nitengenezee|unitengenezee)\b.{0,40}\b(kazi|zoezi|insha|jibu)\b",
-    r"\bni(andik|fany|tengenez)\w*\b",
+    # English: write/do MY essay|assignment|homework|coursework|dissertation.
+    r"\b(write|do|complete|finish|submit)\b[^.?!]{0,30}\bmy\b[^.?!]{0,20}\b"
+    r"(essay|assignment|homework|coursework|dissertation|thesis|term\s?paper)\b",
+    # "write it for me" / "do this for me" attached to schoolwork.
+    r"\b(essay|assignment|homework|coursework)\b[^.?!]{0,40}\bfor me\b",
+    r"\bfor me to (submit|hand in|turn in)\b",
+    # Swahili: a write/make stem (andik-, tengenez-, fany-) near a piece of
+    # SCHOOLWORK carrying a possessive ('yangu'/'langu'/'zangu'). The possessive
+    # is what separates "make me my exercise" from "nitengenezee grafu ya mvua"
+    # (make me a rainfall graph), which is ordinary work and must not trigger.
+    r"\b\w*(andik|tengenez|fany)\w*\b[^.?!]{0,40}"
+    r"\b(insha|zoezi|kazi ya (shule|darasa)|tasnifu)\b"
+    r"[^.?!]{0,20}\b(yangu|langu|zangu|yetu)\b",
+    r"\b(niwasilishe|kuwasilisha)\b[^.?!]{0,30}\b(insha|zoezi|kazi)\b",
 ]
 _INTEGRITY_RE = re.compile("|".join(_INTEGRITY_PATTERNS), re.I | re.S)
 
@@ -40,16 +57,31 @@ def triggers_integrity_guard(user_text: str, mode: str) -> bool:
 
 
 def integrity_redirect_instruction(language: str) -> str:
+    """Steer towards co-writing — not a refusal.
+
+    The old text was a flat "do NOT write it", which produced an assistant that
+    argued with the student about the request instead of helping with the work.
+    Writing WITH them achieves the same end (the understanding transfers, the
+    submitted argument is theirs) without a standoff, and it is far more likely
+    to actually be followed than a prohibition the student can rephrase around.
+    """
     if language == "sw":
         return (
-            "MAELEZO YA UADILIFU WA KITAALUMA: Mwanafunzi ameomba uandike kazi yake. "
-            "USIANDIKE insha/zoezi kwa niaba yake. Badala yake, msaidie kupanga muundo, "
-            "kuelewa hoja, na kuandika mwenyewe hatua kwa hatua."
+            "UADILIFU WA KITAALUMA: mwanafunzi ameomba umwandikie kazi yake ya shule. "
+            "Andika NAYE, si KWA NIABA yake: jengeni muhtasari pamoja, andika sehemu "
+            "moja baada ya nyingine, na kila hatua mwombe atoe hoja, ushahidi na "
+            "hitimisho lake mwenyewe. Eleza sababu ya kila chaguo ili aelewe. Sema "
+            "MARA MOJA tu, kwa ufupi, kwamba kazi anayowasilisha inapaswa kuwa yake — "
+            "kisha endelea kumsaidia. Usikatae kujadili mada."
         )
     return (
-        "ACADEMIC INTEGRITY NOTICE: the student asked you to write their work. Do NOT "
-        "write the essay/assignment for them. Instead, coach them: help outline, "
-        "understand, and draft it themselves, step by step."
+        "ACADEMIC INTEGRITY: the student asked you to write their schoolwork. Write "
+        "WITH them, not FOR them: build the outline together, draft it section by "
+        "section, and at each step ask them to supply their own argument, evidence "
+        "and conclusion. Explain the reasoning behind every choice so the "
+        "understanding transfers. Say ONCE, briefly, that the work they submit needs "
+        "to be theirs — then get on with helping. Do not refuse to engage with the "
+        "topic and do not lecture."
     )
 
 

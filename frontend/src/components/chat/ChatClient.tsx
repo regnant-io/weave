@@ -27,7 +27,9 @@ import { categorise, PANEL_META, PANEL_ORDER, panelCounts, type PanelId } from "
 import AskUserCard from "./AskUserCard";
 import Composer from "./Composer";
 import InlineArtifact from "./InlineArtifact";
+import LiveBar from "./LiveBar";
 import Markdown from "./Markdown";
+import SteerBar from "./SteerBar";
 import StepChip from "./StepChip";
 import TurnRail from "./TurnRail";
 import { readingLine, summaryForResult, titleForTool } from "./stepTitles";
@@ -48,12 +50,49 @@ function fromHistory(messages: Message[], language: Language): ChatTurn[] {
   return messages.map((m) => {
     const text = language === "sw" ? m.content_sw : m.content_en;
     const artifacts = m.artifacts ?? [];
-    // Reloading a conversation must look like the conversation did: charts and
-    // scenes render inline, not as a row of pills at the bottom. Prose first,
-    // then the output it produced — the tool-by-tool ordering isn't persisted.
+
+    /*
+      Reloading a conversation must look like the conversation did.
+
+      The server persists the whole step timeline (see `_step_timeline`), so the
+      tool panels — what was searched, what was run, what each step produced —
+      replay instead of vanishing on refresh. Steps come first, then the prose,
+      then the artifacts: tool work precedes the answer it supports, which is
+      the order the live stream produces for all but the rarest turn. Exact
+      interleaving of prose and steps is not stored, and reconstructing it would
+      mean persisting token offsets for a difference nobody can see.
+
+      Entries written before this shape existed only carried `name`/`status`;
+      those are skipped rather than rendered as blank chips.
+    */
+    const steps: Block[] = (m.tool_calls ?? [])
+      .filter((c) => c && (c.id || c.title || c.tool))
+      .map((c, i) => ({
+        kind: "step" as const,
+        id: c.id ?? `${m.id}-s${i}`,
+        tool: c.tool ?? c.name,
+        args: c.args,
+        detail: c.detail,
+        title: c.title || titleForTool(c.tool ?? c.name ?? "", c.args ?? {}, language),
+        state: c.state === "error" ? ("error" as const) : ("done" as const),
+        substeps: (c.substeps ?? []).map((s, j) => ({
+          id: `${m.id}-s${i}-${j}`,
+          text: s.text,
+          url: s.url,
+          detail: s.detail,
+          state: "done" as const,
+        })),
+        artifacts: c.artifacts ?? [],
+        pending: [],
+        startedAt: Date.parse(m.created_at) || Date.now(),
+        summary: c.summary,
+        error: c.error,
+      }));
+
     const blocks: Block[] =
       m.role === "assistant"
         ? [
+            ...steps,
             { kind: "text", id: `${m.id}-t`, text },
             ...artifacts.map((a, i) => ({
               kind: "artifact" as const,
@@ -116,6 +155,14 @@ export default function ChatClient({
   const [services, setServices] = useState<ServicePrefs>(initialServices);
   /** Set when the server summarised this chat and opened a successor. */
   const [rolled, setRolled] = useState<{ to: string; title: string } | null>(null);
+  /**
+   * The turn currently in flight, if it can be redirected. Comes from `meta`,
+   * which the server sends before any tool runs — so steering is available from
+   * the first second of a turn rather than only once tokens appear.
+   */
+  const [steerTurn, setSteerTurn] = useState<string | null>(null);
+  /** Transient message from the steering path ("noted for the next turn"). */
+  const [steerNote, setSteerNote] = useState<string | null>(null);
   /** Set when history had to be trimmed to fit the model's window. */
   const [trimmed, setTrimmed] = useState(false);
 
@@ -517,6 +564,7 @@ export default function ChatClient({
             break;
           case "meta":
             if (data.message_id) patchLast((m) => ({ ...m, id: data.message_id }));
+            if (data.steerable && data.message_id) setSteerTurn(String(data.message_id));
             break;
           case "answer_start":
             // Any tool still open belongs to the phase before the answer.
@@ -561,6 +609,55 @@ export default function ChatClient({
                   ? { ...b, request: { ...b.request, answered: true } }
                   : b,
               ),
+            );
+            break;
+
+          /* ---- steering: the user redirected this turn mid-flight ---- */
+          case "steer_applied":
+            // Record it in the timeline so the transcript shows WHY the answer
+            // changed direction. Without this the restart below looks like a
+            // glitch rather than the model doing as it was told.
+            patchBlocks((blocks) => [
+              ...blocks,
+              {
+                kind: "step",
+                id: nextId("steer"),
+                tool: "steer",
+                title:
+                  (language === "sw" ? "Umeelekeza upya: " : "You redirected: ") +
+                  String(data.text ?? ""),
+                state: "done",
+                substeps: [],
+                artifacts: [],
+                pending: [],
+                startedAt: Date.now(),
+                summary:
+                  typeof data.restarts_left === "number"
+                    ? language === "sw"
+                      ? `mabadiliko ${data.restarts_left} yamebaki`
+                      : `${data.restarts_left} redirects left`
+                    : undefined,
+              } satisfies StepBlock,
+            ]);
+            setSteerNote(null);
+            break;
+          case "answer_restart":
+            // Everything streamed so far was reasoning the user has overridden.
+            // Drop the in-flight text block so what is on screen matches what
+            // the model actually reasoned about.
+            stream.reset();
+            patchBlocks((blocks) => {
+              const out = [...blocks];
+              while (out.length && out[out.length - 1].kind === "text") out.pop();
+              return out;
+            });
+            patchLast((m) => ({ ...m, text: "" }));
+            break;
+          case "steer_deferred":
+            setSteerNote(
+              language === "sw"
+                ? "Maelekezo yamehifadhiwa kwa zamu ijayo."
+                : "Noted — I'll pick that up on the next turn.",
             );
             break;
 
@@ -616,8 +713,47 @@ export default function ChatClient({
       patchLast((m) => ({ ...m, pending: false }));
       abortRef.current = null;
       setStreaming(false);
+      // The turn is over, so there is nothing left to redirect.
+      setSteerTurn(null);
+      setSteerNote(null);
     }
   }
+
+  /**
+   * Redirect the turn that is still running.
+   *
+   * Fire-and-forget by design: the visible result is the `steer_applied` and
+   * `answer_restart` events coming back down the stream, and blocking the input
+   * on the POST would make the interaction feel slower than it is. A 404 means
+   * the turn finished between the keypress and the request — the honest thing to
+   * say is that it was too late, not to invent a queue for it.
+   */
+  const sendSteer = useCallback(
+    async (text: string, kind = "redirect") => {
+      const turn = steerTurn;
+      if (!turn || !text.trim()) return;
+      setSteerNote(language === "sw" ? "Inatuma…" : "Sending…");
+      try {
+        const res = await fetch(`/api/steer/${turn}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, kind }),
+        });
+        if (!res.ok) {
+          setSteerNote(
+            language === "sw"
+              ? "Umechelewa — zamu imekwisha."
+              : "Too late — that turn already finished.",
+          );
+          return;
+        }
+        setSteerNote(null);
+      } catch {
+        setSteerNote(language === "sw" ? "Imeshindikana." : "Could not send that.");
+      }
+    },
+    [steerTurn, language],
+  );
 
   /* ------------------------------------------------------------ derived UI */
 
@@ -627,8 +763,11 @@ export default function ChatClient({
       images: turns.flatMap((t) => t.images) as WebImage[],
       citations: turns.flatMap((t) => t.citations) as Citation[],
       datasets,
+      // The canvas panel loads its own document rather than reading from the
+      // turn stream, so it needs the project it belongs to.
+      projectId,
     }),
-    [turns, datasets],
+    [turns, datasets, projectId],
   );
 
   const counts = useMemo(() => panelCounts(payload), [payload]);
@@ -708,7 +847,14 @@ export default function ChatClient({
       */}
       <div className="relative flex min-w-0 flex-1 flex-col lg:shrink-0 lg:basis-[380px]">
         {/* thread menu */}
-        <div className="pointer-events-none absolute right-2 top-2 z-30">
+        {/* On the shared floating rail — see --float-top / --float-h. This used
+            to be `top-2` with no safe-area allowance, so on a notched phone it
+            sat higher than the other two controls and, at the extreme, under
+            the status bar. */}
+        <div
+          className="pointer-events-none absolute right-2 z-30 flex items-center"
+          style={{ top: "var(--float-top)", height: "var(--float-h)" }}
+        >
           <div className="pointer-events-auto relative">
             <button
               onClick={() => setMenuOpen((v) => !v)}
@@ -853,6 +999,19 @@ export default function ChatClient({
         >
           <IcoArrowDown size={16} />
         </button>
+
+        {/* Redirect the model while it is still working. Only while a turn is
+            live, and directly above the composer — where the user's hands
+            already are when they see it going the wrong way. */}
+        {streaming && steerTurn && (
+          <SteerBar language={language} note={steerNote} onSteer={sendSteer} />
+        )}
+
+        {/* Live voice, ambient listening and screen sharing. Collapsed to a
+            single button until started — a chat that permanently shows
+            microphone controls implies the microphone is already doing
+            something. */}
+        {!streaming && <LiveBar projectId={projectId} language={language} />}
 
         <Composer
           input={input}

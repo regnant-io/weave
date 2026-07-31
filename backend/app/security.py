@@ -76,6 +76,41 @@ def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> st
     return f"{signing_input.decode('ascii')}.{_b64e(sig)}"
 
 
+#: A WebSocket ticket lives just long enough to open one socket.
+#:
+#: Browsers cannot set an Authorization header on a WebSocket handshake, so the
+#: credential has to travel in the query string — where it lands in proxy logs
+#: and browser history. Handing out the ordinary session token for that would be
+#: a straight downgrade of the httpOnly cookie protecting it: any script on the
+#: page could then read a long-lived credential.
+#:
+#: So sockets take their own token instead: sixty seconds, `scope: "ws"`, and
+#: rejected by every REST route. Leaking one costs an attacker a socket they must
+#: open within the minute, not an account.
+WS_TICKET_TTL_SECONDS = 60
+
+
+def create_ws_ticket(subject: str) -> str:
+    return _signed_token({"sub": subject, "scope": "ws"}, WS_TICKET_TTL_SECONDS)
+
+
+def decode_ws_ticket(token: str) -> dict[str, Any] | None:
+    """Decode a socket ticket. Rejects anything that is not scoped to sockets."""
+    payload = decode_access_token(token)
+    if not isinstance(payload, dict) or payload.get("scope") != "ws":
+        return None
+    return payload
+
+
+def _signed_token(claims: dict[str, Any], ttl_seconds: int) -> str:
+    now = int(time.time())
+    payload: dict[str, Any] = {"iat": now, "exp": now + ttl_seconds, "iss": "weave", **claims}
+    header = {"alg": "HS256", "typ": "JWT"}
+    signing_input = f"{_b64e_json(header)}.{_b64e_json(payload)}".encode("ascii")
+    sig = hmac.new(settings.secret_key.encode(), signing_input, hashlib.sha256).digest()
+    return f"{signing_input.decode('ascii')}.{_b64e(sig)}"
+
+
 def decode_access_token(token: str) -> dict[str, Any] | None:
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")

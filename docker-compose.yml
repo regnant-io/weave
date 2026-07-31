@@ -37,6 +37,12 @@ services:
       WEAVE_RENDER_URL: ${WEAVE_RENDER_URL:-}
       WEAVE_GOTENBERG_URL: ${WEAVE_GOTENBERG_URL:-}
       WEAVE_CLICKHOUSE_URL: ${WEAVE_CLICKHOUSE_URL:-}
+      # Optional server-side voice. Empty (the default) means the BROWSER does
+      # both recognition and synthesis with the Web Speech API — no models, no
+      # GPU, works on a mid-range Android. Bring these up with --profile voice
+      # for much better Kiswahili at a considerable resource cost.
+      WEAVE_STT_URL: ${WEAVE_STT_URL:-}
+      WEAVE_TTS_URL: ${WEAVE_TTS_URL:-}
       # Background jobs / cache / observability / channels (all optional).
       WEAVE_REDIS_URL: ${WEAVE_REDIS_URL:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -77,6 +83,12 @@ services:
       - "3000:3000"
     environment:
       WEAVE_API_BASE: http://backend:8000
+      # Where the BROWSER opens WebSockets (live voice, screen share, the shared
+      # canvas). Next.js route handlers proxy HTTP but not upgrade requests, so
+      # sockets go straight to the API — which means this has to be an address
+      # the browser can reach, not the internal service name. Override it when
+      # deploying behind a domain, e.g. wss://weave.example.tz.
+      WEAVE_PUBLIC_WS_BASE: ${WEAVE_PUBLIC_WS_BASE:-ws://localhost:8001}
       NODE_ENV: production
     depends_on:
       - backend
@@ -162,6 +174,36 @@ services:
     ports:
       - "3100:3100"
 
+  # ---- optional server-side voice (profile: voice) ------------------------
+  # The DEFAULT voice path needs none of this: the browser's Web Speech API does
+  # recognition and synthesis on the device, which is why live voice works out of
+  # the box on a phone. These two exist for deployments that want much better
+  # Kiswahili and can afford the models.
+  #
+  #   docker compose --profile deep --profile voice up -d
+  #   WEAVE_STT_URL=http://whisper:8080 WEAVE_TTS_URL=http://piper:5000 ...
+  #
+  # First boot downloads a model, so give it a few minutes before it answers.
+  whisper:
+    image: ghcr.io/ggerganov/whisper.cpp:main
+    profiles: ["voice"]
+    command: ["./server", "-m", "/models/ggml-base.bin", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8090:8080"
+    volumes:
+      - whisper_models:/models
+
+  piper:
+    image: lscr.io/linuxserver/piper:latest
+    profiles: ["voice"]
+    environment:
+      PIPER_VOICE: ${PIPER_VOICE:-en_GB-alba-medium}
+      PIPER_LENGTH: "1.0"
+    ports:
+      - "10200:10200"
+    volumes:
+      - piper_data:/config
+
   # ---- developer-workspace image (built, never run as a service) ----------
   # `docker compose --profile build-images build workspace-image` produces the
   # image the backend starts per command. It is defined here so the build is one
@@ -209,3 +251,5 @@ volumes:
   minio_data:
   qdrant_data:
   clickhouse_data:
+  whisper_models:
+  piper_data:

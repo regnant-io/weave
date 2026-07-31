@@ -95,6 +95,57 @@ def _create_animation(ctx: ToolContext, inp: dict) -> dict:
     return out
 
 
+def _create_knowledge_graph(ctx: ToolContext, inp: dict) -> dict:
+    client = _render(ctx)
+    if not client:
+        return _unavailable()
+    title = str(inp.get("title") or "Knowledge graph")
+    out = client.graph(inp.get("spec") or {}, project_id=_project_id(ctx), title=title,
+                       subtitle=str(inp.get("subtitle") or ""),
+                       theme=inp.get("theme", "light"))
+    out["tool"] = "create_knowledge_graph"
+    if out.get("status") == "ok":
+        _emit_artifacts(ctx, out, title)
+    return out
+
+
+def _create_html_page(ctx: ToolContext, inp: dict) -> dict:
+    client = _render(ctx)
+    if not client:
+        return _unavailable()
+    title = str(inp.get("title") or "Page")
+    html = str(inp.get("html") or "")
+    out = client.html_page(html, project_id=_project_id(ctx), title=title,
+                           strict=bool(inp.get("strict")))
+    out["tool"] = "create_html_page"
+    if out.get("status") == "ok":
+        _emit_artifacts(ctx, out, title)
+    return out
+
+
+def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
+    """Check a page opens BEFORE it is handed over.
+
+    Deliberately read-only and cheap: the point is that the model can run it on
+    its own output, see a concrete failure, and fix it in the same turn instead
+    of shipping something that renders blank.
+    """
+    client = _render(ctx)
+    if not client:
+        return _unavailable()
+    html = str(inp.get("html") or "")
+    if not html.strip():
+        vid = str(inp.get("visual_id") or "")
+        if vid:
+            from ..render import visuals
+            html = visuals.load_html(_project_id(ctx), vid)
+        if not html.strip():
+            return {"status": "error", "error": "supply html, or a visual_id that exists"}
+    result = client.verify_html(html)
+    result["tool"] = "verify_artifact"
+    return result
+
+
 def _render_custom(ctx: ToolContext, inp: dict) -> dict:
     client = _render(ctx)
     if not client:
@@ -317,6 +368,84 @@ def register_visual_tools(reg: ToolRegistry) -> None:
             "spec": ANIM_SPEC, "title": {"type": "string"}, "theme": _THEME,
         }, "required": ["spec"]},
         execute=_create_animation, trust_required="verified", requires_services=("render",),
+    ))
+
+    reg.register(Tool(
+        name="create_knowledge_graph",
+        description=(
+            "Draw a knowledge graph / concept network as an INTERACTIVE React Flow "
+            "canvas: pan, zoom, drag nodes, search to highlight, minimap, click a node "
+            "for its detail. This is the right tool whenever the answer is a set of "
+            "entities and the relationships between them — a literature map, a causal "
+            "chain, a syllabus topic map, an argument structure, a system's parts. "
+            "Prefer it over create_diagram when the reader should EXPLORE the structure "
+            "rather than read a fixed picture. Every edge endpoint must be an id that "
+            "exists in `nodes`, or the call is rejected. Group nodes to colour them; the "
+            "legend is generated from the groups."
+        ),
+        input_schema={"type": "object", "properties": {
+            "spec": {"type": "object", "properties": {
+                "nodes": {"type": "array", "items": {"type": "object", "properties": {
+                    "id": {"type": "string"},
+                    "label": {"type": "string"},
+                    "group": {"type": "string", "description": "Colours the node; drives the legend."},
+                    "detail": {"type": "string", "description": "Shown in the side panel on click."},
+                    "url": {"type": "string"},
+                    "x": {"type": "number"}, "y": {"type": "number"},
+                }, "required": ["id", "label"]}},
+                "edges": {"type": "array", "items": {"type": "object", "properties": {
+                    "source": {"type": "string"}, "target": {"type": "string"},
+                    "label": {"type": "string"}, "animated": {"type": "boolean"},
+                }, "required": ["source", "target"]}},
+                "layout": {"type": "string", "enum": ["lr", "tb", "rl", "bt", "radial", "preset"],
+                           "description": "lr/tb are layered (dagre); radial centres the "
+                                          "most-connected node; preset honours x/y."},
+                "caption": {"type": "string"},
+            }, "required": ["nodes"]},
+            "title": {"type": "string"}, "subtitle": {"type": "string"}, "theme": _THEME,
+        }, "required": ["spec"]},
+        execute=_create_knowledge_graph, trust_required="verified",
+        requires_services=("render",),
+    ))
+
+    reg.register(Tool(
+        name="create_html_page",
+        description=(
+            "Publish one complete, self-contained HTML page — a big responsive "
+            "interactive document: a revision sheet, an explainer, a small tool, a "
+            "report. Write the WHOLE document (doctype, head, styles, body, scripts) in "
+            "one string. It is validated before it is stored: external URLs, CDN "
+            "scripts, web fonts and network calls are rejected, so inline everything "
+            "(data as literals, images as data: URIs). Write plain browser JavaScript "
+            "— there is no bundler and no module resolver, so `import` statements do "
+            "not work; if you use one it is rewritten to an inlined global where "
+            "possible and otherwise reported back to you. If validation fails you get "
+            "the specific reason: fix it and call again."
+        ),
+        input_schema={"type": "object", "properties": {
+            "html": {"type": "string", "description": "The complete HTML document."},
+            "title": {"type": "string"},
+            "strict": {"type": "boolean",
+                       "description": "Also fail on warnings (truncation, offline hints)."},
+        }, "required": ["html"]},
+        execute=_create_html_page, trust_required="verified", requires_services=("render",),
+    ))
+
+    reg.register(Tool(
+        name="verify_artifact",
+        description=(
+            "Check that a page you generated will actually OPEN, before you tell the "
+            "user it is ready. Catches the failures that look fine in the source and "
+            "render blank in the browser: ESM syntax in a classic script, external "
+            "resources that the sandbox blocks, and truncated files. Pass either the "
+            "raw `html` or the `visual_id` of something you already created. Read-only "
+            "— it never stores or changes anything."
+        ),
+        input_schema={"type": "object", "properties": {
+            "html": {"type": "string"},
+            "visual_id": {"type": "string"},
+        }},
+        execute=_verify_artifact, trust_required="anonymous", requires_services=("render",),
     ))
 
     reg.register(Tool(

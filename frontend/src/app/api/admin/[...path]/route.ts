@@ -12,7 +12,12 @@ async function proxy(req: NextRequest, path: string[], method: string) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     cache: "no-store",
   };
-  if (method === "POST") init.body = await req.text();
+  // PATCH and PUT carry bodies too. The crawler admin edits seed budgets and
+  // approves session-discovered seeds over PATCH, and forwarding only POST
+  // bodies would turn every one of those edits into a silent no-op.
+  if (method === "POST" || method === "PATCH" || method === "PUT") {
+    init.body = await req.text();
+  }
   const res = await fetch(`${API_BASE}/api/v1/admin/${path.join("/")}${qs}`, init);
   return NextResponse.json(await res.json().catch(() => ({})), { status: res.status });
 }
@@ -22,4 +27,10 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
 }
 export async function POST(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return proxy(req, (await ctx.params).path, "POST");
+}
+export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  return proxy(req, (await ctx.params).path, "PATCH");
+}
+export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  return proxy(req, (await ctx.params).path, "DELETE");
 }

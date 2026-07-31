@@ -50,7 +50,7 @@ html,body{margin:0;height:100%;overflow:hidden;background:${t.bg};color:${t.fg};
 .hud{position:fixed;top:12px;left:14px;pointer-events:none}
 .hud .eyebrow{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.14em;
   text-transform:uppercase;color:${t.fgFaint}}
-.hud h1{font-family:Georgia,serif;font-size:18px;font-weight:600;margin:2px 0 0;letter-spacing:-.02em}
+.hud h1{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:18px;font-weight:600;margin:2px 0 0;letter-spacing:-.02em}
 .hint{position:fixed;bottom:12px;left:14px;font-size:11px;color:${t.fgFaint}}
 .tip{position:fixed;padding:4px 8px;background:${t.surface};border:1px solid ${t.border};
   font-size:11.5px;color:${t.fg};pointer-events:none;display:none;transform:translate(10px,-50%)}

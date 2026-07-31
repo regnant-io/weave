@@ -1,2 +1,5 @@
 node_modules
 npm-debug.log
+# dist/ is produced inside the image by `npm run build:flow`. Copying a host
+# build in would let a stale local bundle silently override the fresh one.
+dist

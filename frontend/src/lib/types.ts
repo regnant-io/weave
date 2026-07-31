@@ -31,10 +31,28 @@ export interface Citation {
   predatory_flag: boolean | null;
 }
 
+/**
+ * One persisted step of a turn's tool work.
+ *
+ * This is the stored form of what the SSE stream rendered live, written by
+ * `_step_timeline` on the server. Reloading a conversation replays these, so a
+ * refresh no longer discards every tool panel. `name` is retained because the
+ * stats endpoint counts tool usage from the same column.
+ */
 export interface ToolCall {
   name: string;
   status?: string;
   output_files?: Array<{ name: string; s3_key: string; mime: string; bytes: number }>;
+  id?: string;
+  tool?: string;
+  title?: string;
+  args?: Record<string, unknown>;
+  state?: "running" | "done" | "error";
+  summary?: string;
+  detail?: string;
+  error?: string;
+  substeps?: Array<{ text: string; url?: string; detail?: string; state?: string }>;
+  artifacts?: Artifact[];
 }
 
 export interface Artifact {

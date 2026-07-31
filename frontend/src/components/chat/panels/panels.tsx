@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Artifact, Citation, Dataset, Language, WebImage } from "@/lib/types";
 import PanelFrame, { PanelEmpty } from "./PanelFrame";
 import { ArtifactGrid, ArtifactView, FocusBar } from "./ArtifactViewer";
+import CanvasPanel from "../CanvasPanel";
 import {
   IcoChart,
   IcoCube,
@@ -22,7 +23,14 @@ import {
  * user comparing a chart against its sources wants both open at once.
  */
 
-export type PanelId = "charts" | "visuals" | "docs" | "images" | "data" | "sources";
+export type PanelId =
+  | "canvas"
+  | "charts"
+  | "visuals"
+  | "docs"
+  | "images"
+  | "data"
+  | "sources";
 
 const VISUAL_TOOLS = new Set([
   "generate_3d",
@@ -48,12 +56,15 @@ export interface PanelData {
   images: WebImage[];
   citations: Citation[];
   datasets: Dataset[];
+  /** Needed by the canvas panel, which loads its own document. */
+  projectId: string;
 }
 
 export const PANEL_META: Record<
   PanelId,
   { icon: any; label: [sw: string, en: string]; width: number }
 > = {
+  canvas: { icon: IcoFile, label: ["Ubao", "Canvas"], width: 520 },
   charts: { icon: IcoChart, label: ["Chati", "Charts"], width: 440 },
   visuals: { icon: IcoCube, label: ["Taswira", "Visuals & 3D"], width: 560 },
   docs: { icon: IcoFile, label: ["Nyaraka", "Documents"], width: 520 },
@@ -62,10 +73,15 @@ export const PANEL_META: Record<
   sources: { icon: IcoQuote, label: ["Vyanzo", "Sources"], width: 360 },
 };
 
-export const PANEL_ORDER: PanelId[] = ["charts", "visuals", "docs", "images", "data", "sources"];
+export const PANEL_ORDER: PanelId[] = [
+  "canvas", "charts", "visuals", "docs", "images", "data", "sources",
+];
 
 export function panelCounts(d: PanelData): Record<PanelId, number> {
   const c: Record<PanelId, number> = {
+    // The canvas is a single living document, not a collection, so it has no
+    // meaningful count — the dock shows the icon without a badge.
+    canvas: 0,
     charts: 0,
     visuals: 0,
     docs: 0,
@@ -146,8 +162,11 @@ export function Panel({
       icon={meta.icon}
       onClose={onClose}
       defaultWidth={meta.width}
+      padded={id !== "canvas"}
     >
-      {id === "images" ? (
+      {id === "canvas" ? (
+        <CanvasPanel projectId={data.projectId} language={language} />
+      ) : id === "images" ? (
         <ImagesBody images={data.images} language={language} />
       ) : id === "sources" ? (
         <SourcesBody citations={data.citations} language={language} />

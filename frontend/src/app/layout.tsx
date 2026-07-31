@@ -1,51 +1,41 @@
 import type { Metadata, Viewport } from "next";
-import { Fraunces, Geist, Geist_Mono, Instrument_Serif } from "next/font/google";
+import { Geist, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { getLanguage, getTheme, isAuthed } from "@/lib/session";
 import AppShell from "@/components/shell/AppShell";
 
 /*
-  Editorial type stack, self-hosted by next/font (no third-party request at
-  runtime, no FOUT). Four roles, each with a job:
+  Type stack, self-hosted by next/font (no third-party request at runtime, no
+  FOUT).
 
-    display — Instrument Serif. A high-contrast modern serif with real vertical
-      stress. Playfair was doing this job but reads period-revival at large
-      sizes; Instrument is the same drama with a contemporary spine.
-    read    — Fraunces (variable). The answer column. Its default optical size
-      keeps the letterforms calm at 16-17px while retaining warmth, and the
-      variable weight axis gives genuine 400/600 rather than a synthesised bold.
-    ui      — Geist. Engineered, tight, neutral; built for interfaces.
-    mono    — Geist Mono. Metrically related to Geist, so labels and code sit on
-      the same rhythm instead of looking borrowed from another system.
+  This was an editorial pairing — Instrument Serif for display, Fraunces for the
+  answer column. It has been replaced wholesale with a single grotesque plus a
+  true monospace. The serifs gave the product a magazine voice it was not
+  actually speaking in: Weave is a working instrument for students and
+  researchers, and it should read like precise machinery, not like a feature
+  article. One neutral typeface carrying display, reading and UI also means the
+  three never disagree about the rhythm of a line.
+
+    display / read / ui — Geist. Engineered, tight, neutral; built for
+      interfaces, and calm enough at 16-17px to hold a long Kiswahili paragraph.
+    mono — JetBrains Mono. Designed for reading code at small sizes: tall
+      x-height, unmistakable 0/O and 1/l/I, and it carries the eyebrows, step
+      chips, figures and code blocks that give the UI its instrument feel.
 
   `adjustFontFallback` is left on (default) so the fallback metrics are matched
   and there is no layout shift when the webfont lands.
 */
-const instrument = Instrument_Serif({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-display-src",
-  weight: ["400"],
-  style: ["normal", "italic"],
-  fallback: ["Georgia", "Times New Roman", "serif"],
-});
-const fraunces = Fraunces({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-read-src",
-  style: ["normal", "italic"],
-  fallback: ["Georgia", "serif"],
-});
 const geist = Geist({
   subsets: ["latin"],
   display: "swap",
   variable: "--font-ui-src",
   fallback: ["ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "sans-serif"],
 });
-const geistMono = Geist_Mono({
+const jetbrains = JetBrains_Mono({
   subsets: ["latin"],
   display: "swap",
   variable: "--font-mono-src",
+  style: ["normal", "italic"],
   fallback: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
 });
 
@@ -71,7 +61,9 @@ export const viewport: Viewport = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const [language, authed, theme] = await Promise.all([getLanguage(), isAuthed(), getTheme()]);
   const htmlThemeAttr = theme === "light" || theme === "dark" ? theme : undefined;
-  const fontVars = `${instrument.variable} ${fraunces.variable} ${geist.variable} ${geistMono.variable}`;
+  // Display and read are the same face as UI now, so one variable feeds all
+  // three roles in globals.css rather than three families feeding four.
+  const fontVars = `${geist.variable} ${jetbrains.variable}`;
 
   return (
     <html

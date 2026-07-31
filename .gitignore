@@ -6,12 +6,20 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
-
+.claude
+.vscode
 # Node / Next
 frontend/node_modules/
 frontend/.next/
 frontend/.env.local
 npm-debug.log*
+
+# The render service's dependencies were tracked, which meant any `npm install`
+# produced hundreds of spurious deletions in `git status`. They are installed by
+# its Dockerfile and are not source.
+render-service/node_modules/
+# Built by `npm run build:flow` inside the image (the React Flow IIFE bundle).
+render-service/dist/
 
 # OS
 .DS_Store

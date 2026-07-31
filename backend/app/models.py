@@ -48,6 +48,12 @@ class User(Base):
     preferred_language: Mapped[str] = mapped_column(String(8), default="sw")  # sw | en
     trust_tier: Mapped[str] = mapped_column(String(16), default="verified")  # anon|verified|institutional
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: May the sources this user's sessions actually consult be queued for
+    #: crawling into the shared library? ON by default — the library only gets
+    #: richer if real use feeds it — and switchable off in Settings. Nothing is
+    #: crawled from a user who turns this off, and nothing user-authored is ever
+    #: ingested either way: only public pages the session already fetched.
+    allow_source_crawl: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     institution: Mapped[Institution | None] = relationship(back_populates="users")
@@ -236,6 +242,119 @@ class Source(Base):
     chunks: Mapped[list["SourceChunk"]] = relationship(
         back_populates="source", cascade="all, delete-orphan"
     )
+
+
+class Canvas(Base):
+    """A document the user and the assistant edit together, live.
+
+    CONCURRENCY MODEL — read this before changing anything here.
+
+    This is not a CRDT and does not pretend to be. It is server-authoritative
+    with a monotonic `revision`, and the two parties are given different edit
+    primitives because they edit in genuinely different ways:
+
+      * The HUMAN sends whole-document writes carrying the `base_revision` their
+        editor last saw. If that is stale the write is REJECTED with the current
+        text, and the client resolves it. Nothing is silently overwritten.
+
+      * The ASSISTANT sends ANCHORED edits — find/replace, append, insert near a
+        heading. Those rebase naturally: they are applied to whatever the
+        document currently says, and if the anchor has vanished the tool fails
+        with a message the model can act on rather than clobbering the user's
+        paragraph.
+
+    That asymmetry is what makes simultaneous editing safe without character-wise
+    transforms. A human typing in one paragraph and the assistant rewriting
+    another do not conflict; a genuine overlap surfaces as a rejection instead of
+    a silent loss.
+    """
+    __tablename__ = "canvases"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255), default="Untitled")
+    content: Mapped[str] = mapped_column(Text, default="")
+    #: Bumped on every accepted write. The whole concurrency scheme rests on it.
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    #: "human" | "assistant" — drives the "who changed this last" affordance.
+    updated_by: Mapped[str] = mapped_column(String(16), default="human")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CrawlSeed(Base):
+    """A starting point for the crawler, plus the politeness budget for it.
+
+    Seeds are per-DOMAIN rather than per-URL because every limit that matters —
+    request rate, page budget, robots.txt — is a property of the host, not of
+    one address. Two seeds on the same host would otherwise each think they were
+    the only one crawling it.
+
+    `origin` records how the seed got here: "admin" for one an operator added,
+    "session" for a domain a user's session actually consulted. That distinction
+    is what makes the Settings opt-out meaningful — turning it off stops session
+    seeds being created without touching the curated ones.
+    """
+    __tablename__ = "crawl_seeds"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    url: Mapped[str] = mapped_column(String(1024))
+    domain: Mapped[str] = mapped_column(String(255), index=True)
+    source_type: Mapped[str] = mapped_column(String(32), default="gov")
+    language: Mapped[str] = mapped_column(String(8), default="en")
+    #: admin | session
+    origin: Mapped[str] = mapped_column(String(16), default="admin")
+    #: The user whose session surfaced this domain, when origin == "session".
+    discovered_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # --- politeness budget, per seed -------------------------------------
+    max_depth: Mapped[int] = mapped_column(Integer, default=2)
+    max_pages: Mapped[int] = mapped_column(Integer, default=40)
+    #: Seconds between requests to this host. Below 1.0 is not polite.
+    delay_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    #: Stay on the seed's own domain. Off-domain crawling from a session-derived
+    #: seed is how a focused library turns into a copy of the open web.
+    same_domain_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Render with the headless browser before extracting (JS-heavy sites).
+    render_js: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # --- state -----------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|running|done|error
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    pages_fetched: Mapped[int] = mapped_column(Integer, default=0)
+    pages_indexed: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CrawlPage(Base):
+    """One URL the crawler considered, and what became of it.
+
+    Kept for every outcome, not just successes: "why is this page not in the
+    library" is the question an operator actually asks, and "it was disallowed
+    by robots.txt" is only answerable if the refusal was recorded.
+
+    It doubles as the visited-set across runs, so a re-crawl does not re-fetch
+    everything it already has.
+    """
+    __tablename__ = "crawl_pages"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    seed_id: Mapped[str] = mapped_column(ForeignKey("crawl_seeds.id"), index=True)
+    url: Mapped[str] = mapped_column(String(1024), index=True)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    #: indexed | skipped_robots | skipped_type | skipped_thin | skipped_duplicate
+    #: | error | pending_review
+    status: Mapped[str] = mapped_column(String(24), default="pending_review")
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    #: Hash of the extracted text — near-identical pages under different URLs
+    #: (print views, session ids, calendar pages) are the classic spider trap.
+    content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    chars: Mapped[int] = mapped_column(Integer, default=0)
+    source_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class SourceChunk(Base):

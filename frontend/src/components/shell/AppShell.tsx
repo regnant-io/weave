@@ -81,8 +81,8 @@ function Frame({
         <button
           onClick={() => setMobileOpen(true)}
           aria-label={language === "sw" ? "Fungua menyu" : "Open menu"}
-          style={{ top: "calc(0.75rem + var(--safe-top))" }}
-          className="fixed left-3 z-30 grid h-10 w-10 place-items-center rounded-full border border-border bg-surface/85 text-fg-muted shadow-soft backdrop-blur transition-all duration-fast ease-soft hover:text-fg active:scale-95 md:hidden"
+          style={{ top: "var(--float-top)", height: "var(--float-h)", width: "var(--float-h)" }}
+          className="fixed left-3 z-30 grid place-items-center rounded-full border border-border bg-surface/85 text-fg-muted shadow-soft backdrop-blur transition-all duration-fast ease-soft hover:text-fg active:scale-95 md:hidden"
         >
           <IcoMenu />
         </button>
@@ -91,8 +91,8 @@ function Frame({
           <button
             onClick={toggle}
             aria-label={language === "sw" ? "Onyesha kando" : "Show sidebar"}
-            style={{ top: "calc(0.75rem + var(--safe-top))" }}
-            className="animate-fade fixed left-3 z-30 hidden h-9 w-9 place-items-center rounded-full border border-border bg-surface/85 text-fg-faint shadow-soft backdrop-blur transition-all duration-fast ease-soft hover:text-fg md:grid"
+            style={{ top: "var(--float-top)", height: "var(--float-h)", width: "var(--float-h)" }}
+            className="animate-fade fixed left-3 z-30 hidden place-items-center rounded-full border border-border bg-surface/85 text-fg-faint shadow-soft backdrop-blur transition-all duration-fast ease-soft hover:text-fg md:grid"
           >
             <IcoPanelLeft />
           </button>

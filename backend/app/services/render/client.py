@@ -207,6 +207,49 @@ class RenderClient:
             tool="create_3d_experience", spec=spec,
         )
 
+    def graph(self, spec: dict, *, project_id: str, title: str = "Knowledge graph",
+              subtitle: str = "", theme: str = "light", visual_id: str | None = None) -> dict:
+        """Node-edge knowledge graph, rendered with React Flow.
+
+        Spec-driven: the caller supplies nodes and edges as DATA and the render
+        service owns pan/zoom/layout/search/minimap. Hand-rolling that per
+        request is how you end up with eight subtly different graphs.
+        """
+        from . import visuals
+        vid = visual_id or visuals.new_id()
+        return self._visual(
+            "/graph",
+            {"spec": spec, "title": title, "subtitle": subtitle, "theme": theme},
+            project_id=project_id, visual_id=vid, title=title,
+            tool="create_knowledge_graph", spec=spec,
+        )
+
+    def html_page(self, html: str, *, project_id: str, title: str = "Page",
+                  strict: bool = False, visual_id: str | None = None) -> dict:
+        """A complete single-file HTML page written by the model.
+
+        The render service validates and repairs it before it is stored — see
+        render-service/lib/htmlpage.js. Anything it cannot repair comes back as
+        an error naming the problem, which is what lets the model fix its own
+        output instead of shipping a blank page.
+        """
+        from . import visuals
+        vid = visual_id or visuals.new_id()
+        return self._visual(
+            "/html", {"html": html, "title": title, "strict": strict},
+            project_id=project_id, visual_id=vid, title=title,
+            tool="create_html_page", spec={"bytes": len(html)},
+        )
+
+    def verify_html(self, html: str) -> dict:
+        """Static check that a generated page will actually open. Never stores."""
+        try:
+            r = self._httpx.post(f"{self._base()}/verify", json={"html": html}, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "error", "ok": False, "errors": [str(exc)], "warnings": []}
+
     def engines(self) -> dict:
         """Which optional render engines this service actually has bundled.
 

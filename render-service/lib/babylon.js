@@ -23,6 +23,7 @@
 
 import { esc, baseCss } from "./theme.js";
 import { screenCode } from "./custom.js";
+import { prepareScript } from "./js.js";
 
 const MAX_CODE_BYTES = 400_000;
 //: Inlined binary assets (.glb, textures, audio) as data URLs. Kept modest: the
@@ -86,6 +87,13 @@ export function renderBabylon({
     };
   }
 
+  // Scene code becomes a FUNCTION BODY below, where an `import` is a syntax
+  // error even in a module script. Rewrite what maps onto the BABYLON global we
+  // already inline, and reject the rest with a message that names the specifier.
+  const prepared = prepareScript(code, { allowModule: false });
+  if (!prepared.ok) return { status: "error", error: prepared.error };
+  code = prepared.code;
+
   const built = buildAssets(assets);
   if (built.error) return { status: "error", error: built.error };
 
@@ -111,7 +119,7 @@ html,body{height:100%;margin:0;overflow:hidden;background:var(--bg)}
 #hud{position:fixed;left:0;right:0;top:0;padding:10px 14px;pointer-events:none;
   background:linear-gradient(to bottom,rgba(0,0,0,.42),transparent);color:#fff}
 #hud .eyebrow{color:rgba(255,255,255,.66)}
-#hud h1{font-family:Georgia,"Times New Roman",serif;font-size:17px;font-weight:600;
+#hud h1{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:17px;font-weight:600;
   margin:1px 0 0;letter-spacing:-.01em;text-shadow:0 1px 3px rgba(0,0,0,.5)}
 #hud p{margin:2px 0 0;font-size:12px;opacity:.8;max-width:60ch}
 #hints{position:fixed;left:14px;bottom:12px;font-size:11.5px;color:#fff;opacity:.62;

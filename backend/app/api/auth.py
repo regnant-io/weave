@@ -17,7 +17,8 @@ from ..db import get_db
 from ..deps import get_current_user
 from ..models import OtpCode, User
 from ..schemas import (
-    LoginRequest, OtpRequestBody, OtpVerifyBody, RegisterRequest, TokenResponse, UserOut,
+    LoginRequest, OtpRequestBody, OtpVerifyBody, RegisterRequest, TokenResponse,
+    UserOut, UserPrefsIn,
 )
 from ..security import (
     create_access_token, generate_otp, hash_otp, hash_password, verify_password,
@@ -128,6 +129,27 @@ def verify_otp(body: OtpVerifyBody, db: Session = Depends(get_db)) -> TokenRespo
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)) -> UserOut:
+    return UserOut.model_validate(user)
+
+
+@router.patch("/me", response_model=UserOut)
+def update_me(body: UserPrefsIn, db: Session = Depends(get_db),
+              user: User = Depends(get_current_user)) -> UserOut:
+    """Update the signed-in user's own preferences.
+
+    `allow_source_crawl` is the control over whether the public pages this
+    user's sessions consult may be offered as crawl candidates for the shared
+    library. Turning it off takes effect immediately and creates no further
+    candidates; it does not retroactively remove ones already suggested, which
+    is what the admin page's delete is for.
+    """
+    if body.preferred_language in {"sw", "en"}:
+        user.preferred_language = body.preferred_language
+    if body.allow_source_crawl is not None:
+        user.allow_source_crawl = bool(body.allow_source_crawl)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return UserOut.model_validate(user)
 
 

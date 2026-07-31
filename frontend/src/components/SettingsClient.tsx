@@ -99,6 +99,7 @@ export default function SettingsClient({
     role: string;
     trust_tier: string;
     phone_verified: boolean;
+    allow_source_crawl?: boolean;
   };
   health: Health;
   workspace: WorkspaceStatus;
@@ -114,7 +115,17 @@ export default function SettingsClient({
   const [servicePrefs, setServicePrefs] = useState<ServicePrefs>(services);
   const [confirmWipe, setConfirmWipe] = useState(false);
   const [wipeResult, setWipeResult] = useState<string | null>(null);
+  const [allowCrawl, setAllowCrawl] = useState(account.allow_source_crawl !== false);
   const sw = lang === "sw";
+
+  /** Account preferences live on the user row, not in a cookie — see /api/me. */
+  async function saveAccount(patch: Record<string, unknown>) {
+    await fetch("/api/me", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }).catch(() => {});
+  }
 
   async function save(patch: Record<string, unknown>) {
     await fetch("/api/prefs", {
@@ -367,6 +378,40 @@ export default function SettingsClient({
           )}
         </Section>
       )}
+
+      {/* Contributing to the shared library. */}
+      <Section
+        title={sw ? "Faragha na maktaba" : "Privacy and the library"}
+        note={
+          sw
+            ? "Weave hujibu vizuri zaidi maktaba yake inapokuwa tajiri. Vyanzo vya wazi ambavyo mazungumzo yako yamesoma vinaweza kupendekezwa kwa kutambazwa."
+            : "Weave answers better when its library is richer. Public pages your sessions actually read can be suggested as candidates for it."
+        }
+      >
+        <label className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={allowCrawl}
+            onChange={(e) => {
+              setAllowCrawl(e.target.checked);
+              void saveAccount({ allow_source_crawl: e.target.checked });
+            }}
+            className="mt-0.5"
+          />
+          <span className="min-w-0">
+            <span className="block text-[13px]">
+              {sw
+                ? "Ruhusu vyanzo vya wazi vinavyotumiwa na mazungumzo yangu kupendekezwa kwa maktaba"
+                : "Let public sources my sessions use be suggested for the shared library"}
+            </span>
+            <span className="mt-1 block text-xs leading-relaxed text-fg-faint">
+              {sw
+                ? "Kinachohifadhiwa ni jina la tovuti pekee, na hakuna kinachotambazwa hadi msimamizi akubali. Ujumbe wako, data zako na faili zako HAZITAMBAZWI kamwe. Ukizima, hakuna pendekezo jipya litakalotengenezwa."
+                : "Only the website's domain is recorded, and nothing is crawled until an administrator approves it. Your messages, datasets and files are never included. Turning this off stops any new suggestions being created."}
+            </span>
+          </span>
+        </label>
+      </Section>
 
       {/* Data management — last, and visually separated. */}
       <section className="border border-danger/30 bg-surface p-4 sm:p-5">

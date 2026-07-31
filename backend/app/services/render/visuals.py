@@ -57,6 +57,21 @@ def save(project_id: str, visual_id: str, html: str, meta: dict) -> dict:
     return {"key": hk, "record": record}
 
 
+def load_html(project_id: str, visual_id: str) -> str:
+    """The stored page itself, so a visual can be re-checked after the fact.
+
+    Returns "" when the visual does not exist — callers treat a missing artifact
+    and an empty one the same way.
+    """
+    hk = html_key(project_id, visual_id)
+    if not storage.exists(hk):
+        return ""
+    try:
+        return storage.get_bytes(hk).decode("utf-8")
+    except (ValueError, OSError):
+        return ""
+
+
 def load_meta(project_id: str, visual_id: str) -> dict | None:
     mk = meta_key(project_id, visual_id)
     if not storage.exists(mk):

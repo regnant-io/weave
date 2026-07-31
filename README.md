@@ -254,3 +254,9 @@ docker-compose.yml
 
 See [`architecture.md`](architecture.md) for the full design rationale; inline
 code comments cross-reference the relevant sections.
+
+## DEPLOY FROM WEB
+
+curl -o deploy-kamatera.sh https://gitlab.com/daudi.abinallah/weave/-/raw/master/deploy-kamatera.sh
+chmod +x deploy-kamatera.sh
+./deploy-kamatera.sh

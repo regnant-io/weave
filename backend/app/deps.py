@@ -29,6 +29,12 @@ def get_current_user(
     payload = decode_access_token(token)
     if not payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
+    # WebSocket tickets travel in query strings, where they end up in proxy logs
+    # and browser history. They open a socket and nothing else — accepting one
+    # here would make that exposure equivalent to leaking a session token.
+    if payload.get("scope") == "ws":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                            "this token is only valid for opening a websocket")
     user = db.query(User).filter(User.id == payload["sub"]).first()
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")

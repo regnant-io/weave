@@ -143,8 +143,64 @@ def _package(ctx: ToolContext, inp: dict) -> dict:
     return result
 
 
+def _grep(ctx: ToolContext, inp: dict) -> dict:
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    return svc.grep(
+        _project_id(ctx), str(inp.get("pattern") or ""),
+        glob=str(inp.get("glob") or ""),
+        case_sensitive=bool(inp.get("case_sensitive")),
+        context=int(inp.get("context") or 0),
+    )
+
+
+def _glob(ctx: ToolContext, inp: dict) -> dict:
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    return svc.glob_files(_project_id(ctx), str(inp.get("pattern") or "**/*"))
+
+
 def register_workspace_tools(reg: ToolRegistry) -> None:
     common = {"trust_required": "verified", "requires_services": ("workspace",)}
+
+    reg.register(Tool(
+        name="workspace_grep",
+        description=(
+            "Search the project workspace for a regular expression and get back the "
+            "matching lines with their file and line number. This is how you find "
+            "where something is defined or used WITHOUT reading whole files into "
+            "context — use it before workspace_read, not instead of it. Dependency "
+            "and build directories (node_modules, .git, .venv, dist) are skipped. "
+            "Narrow with `glob` when you know the file type."
+        ),
+        input_schema={"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Python regular expression."},
+            "glob": {"type": "string",
+                     "description": "Restrict to matching paths, e.g. '*.py' or 'src/**/*.ts'."},
+            "case_sensitive": {"type": "boolean", "description": "Default false."},
+            "context": {"type": "integer",
+                        "description": "Lines of surrounding context per match (0-5)."},
+            "note": {"type": "string"},
+        }, "required": ["pattern"]},
+        execute=_grep, **common,
+    ))
+
+    reg.register(Tool(
+        name="workspace_glob",
+        description=(
+            "List workspace files matching a glob pattern ('**/*.py', 'src/*.ts'), "
+            "with their sizes. Returns paths only. Use it to orient yourself in a "
+            "project whose layout you do not know, then read or grep the few files "
+            "that matter."
+        ),
+        input_schema={"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Glob, default '**/*'."},
+            "note": {"type": "string"},
+        }},
+        execute=_glob, **common,
+    ))
 
     reg.register(Tool(
         name="workspace_write",

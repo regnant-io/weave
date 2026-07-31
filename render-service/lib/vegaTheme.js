@@ -34,7 +34,9 @@ export function vegaConfig(theme = "light") {
     padding: { left: 8, top: 12, right: 16, bottom: 8 },
 
     title: {
-      font: 'Georgia,"Times New Roman",serif',
+      // Chart titles use the same face as everything else now — the display
+      // serif they used to be set in is gone from the whole product.
+      font: FONT,
       fontSize: 15,
       fontWeight: 600,
       color: t.fg,

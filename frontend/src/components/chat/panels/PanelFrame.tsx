@@ -23,6 +23,7 @@ export default function PanelFrame({
   onClose,
   children,
   defaultWidth = 420,
+  padded = true,
 }: {
   id: string;
   title: string;
@@ -31,6 +32,14 @@ export default function PanelFrame({
   onClose: () => void;
   children: React.ReactNode;
   defaultWidth?: number;
+  /**
+   * Most panels are scrolling lists and want the frame's padding. A panel that
+   * owns its whole surface — the canvas, with its own toolbar and a textarea
+   * that must fill the remaining height — sets this false and manages its own
+   * scrolling, because a padded `overflow-y-auto` wrapper would give it a
+   * second scrollbar and stop the editor reaching the bottom edge.
+   */
+  padded?: boolean;
 }) {
   const [width, setWidth] = useState(defaultWidth);
   const [dragging, setDragging] = useState(false);
@@ -121,7 +130,9 @@ export default function PanelFrame({
         </button>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">{children}</div>
+      <div className={`min-h-0 flex-1 ${padded ? "overflow-y-auto p-3" : "overflow-hidden"}`}>
+        {children}
+      </div>
     </section>
   );
 }

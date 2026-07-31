@@ -84,7 +84,7 @@ svg.scene{display:block;width:100%;height:auto}
 .lbl{opacity:0;animation:appear 420ms ease-out var(--delay) forwards}
 @keyframes appear{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .narration{margin-top:12px;min-height:44px;border-left:2px solid var(--accent);padding-left:12px}
-.narration p{margin:0;font-family:Georgia,serif;font-size:14.5px;line-height:1.6;color:var(--fg-muted);
+.narration p{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:14.5px;line-height:1.6;color:var(--fg-muted);
   opacity:0;transition:opacity .3s}
 .narration p.on{opacity:1}
 .abar{display:flex;align-items:center;gap:8px;margin-top:12px}

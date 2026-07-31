@@ -22,6 +22,7 @@ import * as vega from "vega";
 import * as vegaLite from "vega-lite";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Resvg } from "@resvg/resvg-js";
 import { renderDiagram } from "./lib/diagram.js";
 import { renderSimulation } from "./lib/simulation.js";
@@ -29,6 +30,9 @@ import { renderAnimation } from "./lib/animation.js";
 import { renderThree } from "./lib/three3d.js";
 import { renderCustom } from "./lib/custom.js";
 import { renderBabylon } from "./lib/babylon.js";
+import { renderGraph } from "./lib/graph.js";
+import { renderHtmlPage } from "./lib/htmlpage.js";
+import { lintHtml } from "./lib/js.js";
 import { renderDeck } from "./lib/deck.js";
 import { applyTheme } from "./lib/vegaTheme.js";
 
@@ -37,11 +41,17 @@ const app = express();
 // is the only way an offline artifact can use them at all.
 app.use(express.json({ limit: "48mb" }));
 
+// Resolve bundles relative to THIS FILE, not the working directory. `npm start`
+// happens to run with cwd=/app, so a cwd-relative read worked by luck; anything
+// that starts the server from elsewhere silently lost every optional engine and
+// reported "babylon unavailable" with no indication why.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
 /** Read the first readable path, or "" — a missing bundle degrades, never throws. */
 function readFirst(rels) {
   for (const rel of rels) {
     try {
-      const src = readFileSync(path.join(process.cwd(), rel), "utf-8");
+      const src = readFileSync(path.resolve(HERE, rel), "utf-8");
       if (src) return src;
     } catch (e) { /* try next */ }
   }
@@ -73,18 +83,45 @@ const BABYLON_GUI_SRC = readFirst([
 ]);
 if (!BABYLON_SRC) console.warn("babylon build not found; /babylon will report unavailable");
 
+// React Flow has no UMD build, so it is bundled to an IIFE by esbuild during the
+// image build (`npm run build:flow`). Its stylesheet is read straight from the
+// package — inlining it is what makes a graph artifact work offline.
+const FLOW_SRC = readFirst(["dist/weaveflow.js"]);
+const FLOW_CSS = readFirst([
+  "node_modules/reactflow/dist/style.css",
+  "node_modules/reactflow/dist/base.css",
+]);
+if (!FLOW_SRC) console.warn("react-flow bundle not found; run `npm run build:flow`");
+
+// Package version, read at boot. A stale container reporting an old version here
+// is the difference between "why is Babylon missing" and "this image is old" —
+// which is exactly the diagnosis that was missing before.
+const PKG = (() => {
+  try {
+    return JSON.parse(readFileSync(path.resolve(HERE, "package.json"), "utf-8"));
+  } catch { return { version: "unknown" }; }
+})();
+
+const ENGINES = {
+  vega: true,
+  three: Boolean(THREE_SRC),
+  babylon: Boolean(BABYLON_SRC),
+  babylon_loaders: Boolean(BABYLON_LOADERS_SRC),
+  babylon_gui: Boolean(BABYLON_GUI_SRC),
+  flow: Boolean(FLOW_SRC),
+  html: true,
+};
+
 app.get("/health", (_req, res) => res.json({
   status: "ok",
   service: "render",
+  version: PKG.version,
   // Report which optional bundles are actually present, so the backend can
   // advertise only the capabilities that will really work.
-  engines: {
-    vega: true,
-    three: Boolean(THREE_SRC),
-    babylon: Boolean(BABYLON_SRC),
-    babylon_loaders: Boolean(BABYLON_LOADERS_SRC),
-    babylon_gui: Boolean(BABYLON_GUI_SRC),
-  },
+  engines: ENGINES,
+  // Named explicitly so an operator can see WHICH engine is missing without
+  // reading container logs.
+  missing: Object.entries(ENGINES).filter(([, v]) => !v).map(([k]) => k),
 }));
 
 // ---- charts: Vega-Lite spec -> SVG ----------------------------------------
@@ -194,6 +231,51 @@ app.post("/babylon", (req, res) => {
       guiSrc: wantsGui ? BABYLON_GUI_SRC : "",
     });
     res.status(out.status === "ok" ? 200 : 400).json(out);
+  } catch (e) {
+    res.status(500).json({ status: "error", error: String(e?.message ?? e) });
+  }
+});
+
+// ---- knowledge graphs: React Flow ----------------------------------------
+// Spec-driven on purpose. A node-edge graph is the visual a research assistant
+// reaches for most often, and hand-rolling pan/zoom/layout per request produces
+// a different half-working implementation every time.
+app.post("/graph", (req, res) => {
+  const { spec = {}, title = "Knowledge graph", subtitle = "", theme = "light" } = req.body || {};
+  try {
+    const out = renderGraph({ spec, title, subtitle, theme, flowSrc: FLOW_SRC, flowCss: FLOW_CSS });
+    res.status(out.status === "ok" ? 200 : 400).json(out);
+  } catch (e) {
+    res.status(500).json({ status: "error", error: String(e?.message ?? e) });
+  }
+});
+
+// ---- single-file HTML pages ----------------------------------------------
+// Validates and repairs a complete page the model wrote (see lib/htmlpage.js).
+app.post("/html", (req, res) => {
+  const { html = "", title = "Page", strict = false } = req.body || {};
+  try {
+    const out = renderHtmlPage({ html, title, strict });
+    res.status(out.status === "ok" ? 200 : 400).json(out);
+  } catch (e) {
+    res.status(500).json({ status: "error", error: String(e?.message ?? e) });
+  }
+});
+
+// ---- verification --------------------------------------------------------
+// Read-only static check, so the assistant can confirm a page it just wrote will
+// open BEFORE handing it to the user. Never mutates and never stores anything.
+app.post("/verify", (req, res) => {
+  const { html = "" } = req.body || {};
+  try {
+    const problems = lintHtml(html);
+    const errors = problems.filter((p) => p.severity === "error");
+    res.json({
+      status: errors.length ? "fail" : "ok",
+      ok: errors.length === 0,
+      errors: errors.map((p) => p.message),
+      warnings: problems.filter((p) => p.severity === "warn").map((p) => p.message),
+    });
   } catch (e) {
     res.status(500).json({ status: "error", error: String(e?.message ?? e) });
   }

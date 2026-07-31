@@ -168,9 +168,14 @@
   --dur-slow: 420ms;
   --dur-panel: 520ms;
 
-  /* type */
-  --font-display: var(--font-display-src), Georgia, "Times New Roman", serif;
-  --font-read: var(--font-read-src), Georgia, serif;
+  /* type
+     One grotesque carries display, reading and UI; one monospace carries code,
+     figures and every small label. The roles are kept as separate variables
+     even though two now resolve to the same family — they mean different
+     things, and collapsing them would make a future change to just one of them
+     a find-and-replace across the stylesheet. */
+  --font-display: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-read: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-ui: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: var(--font-mono-src), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
@@ -235,6 +240,18 @@ body {
   --kb-inset: 0px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-top: env(safe-area-inset-top, 0px);
+
+  /* THE FLOATING TOP RAIL.
+     Three controls hover over the chat: the menu/sidebar button (left), the
+     thread switcher (centre), and the thread options button (right). They were
+     each positioned independently — three different `top` offsets, three
+     different heights, and only two of them safe-area aware — so on a phone they
+     sat on three visibly different lines. These two tokens are the single
+     definition of that rail: same top edge, same control height, so the three
+     centre on one line at every width. Anything added to the rail must use
+     them rather than inventing another offset. */
+  --float-top: calc(0.625rem + var(--safe-top));
+  --float-h: 2.25rem;
 }
 
 .h-app {
@@ -413,7 +430,7 @@ body,
 }
 
 /* ==========================================================================
-   READING COLUMN — assistant answers are set as editorial prose, not UI text.
+   READING COLUMN — assistant answers, set for sustained reading.
    ========================================================================== */
 
 .md {
@@ -422,8 +439,12 @@ body,
   font-size: var(--read-size);
   line-height: var(--read-leading);
   font-weight: 400;
-  letter-spacing: -0.001em;
-  font-variant-numeric: oldstyle-nums proportional-nums;
+  letter-spacing: -0.003em;
+  /* Lining, tabular figures. Old-style numerals belonged to the serif this
+     column used to be set in; in a grotesque they read as a mistake, and this
+     is a product where a paragraph is as likely to contain a sample size or a
+     year as a sentence. Tabular keeps a column of figures aligned. */
+  font-variant-numeric: lining-nums tabular-nums;
   /* Break only where a break is unavoidable. `anywhere` used to be set here,
      which shattered ordinary words mid-syllable on a narrow phone. A long URL
      or hash still has to break, so `break-word` handles that case alone. */
@@ -456,9 +477,11 @@ body,
 .md h5,
 .md h6 {
   font-family: var(--font-display);
-  font-weight: 400;
+  /* A grotesque needs real weight to read as a heading; the serif it replaced
+     got its authority from contrast rather than mass. */
+  font-weight: 600;
   line-height: 1.16;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
   margin: 1.7em 0 0.5em;
   color: var(--fg);
   text-wrap: balance;
@@ -476,12 +499,13 @@ body,
 .md h3 {
   font-size: 1.2em;
 }
-/* h4-h6 step down into the UI face: at these sizes a display serif stops
-   reading as a heading and starts reading as emphasis. */
+/* h4-h6 step down to the mono face: with one grotesque doing display, reading
+   and UI, a small bold heading is otherwise indistinguishable from bold body
+   text. Monospace at a smaller size reads unmistakably as a label. */
 .md h4,
 .md h5,
 .md h6 {
-  font-family: var(--font-ui);
+  font-family: var(--font-mono);
   font-weight: 600;
   font-size: 0.95em;
   letter-spacing: 0.01em;

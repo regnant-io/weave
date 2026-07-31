@@ -33,6 +33,7 @@ capability.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -293,6 +294,124 @@ class WorkspaceService:
             return p.name
 
     # ------------------------------------------------------------- verification
+
+    #: Directories that are never worth searching and are frequently enormous.
+    #: Walking node_modules once can be more files than the rest of the project
+    #: put together, and nothing in it is the model's own code.
+    _SEARCH_SKIP = {
+        "node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "build",
+        ".next", ".cache", "target", ".pytest_cache", ".mypy_cache",
+    }
+    _TEXT_SUFFIXES = {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".txt", ".csv", ".tsv",
+        ".html", ".css", ".scss", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sh",
+        ".sql", ".r", ".R", ".java", ".c", ".h", ".cpp", ".go", ".rs", ".rb", ".php",
+        ".xml", ".svg", ".env", ".gitignore", ".dockerignore", "",
+    }
+
+    def _walk_files(self, base: Path):
+        """Every file under `base`, skipping dependency and build directories."""
+        stack = [base]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_symlink():
+                    continue  # never follow a link out of the tree
+                if entry.is_dir():
+                    if entry.name not in self._SEARCH_SKIP:
+                        stack.append(entry)
+                elif entry.is_file():
+                    yield entry
+
+    def glob_files(self, project_id: str, pattern: str = "**/*", limit: int = 200) -> dict:
+        """Find files by glob. Returns paths only — reading them is a separate step.
+
+        Locating a file is a different question from reading it, and answering
+        the first with the contents of forty files is how a context window
+        disappears before any work starts.
+        """
+        base = self.project_dir(project_id).resolve()
+        pattern = (pattern or "**/*").strip().lstrip("/")
+        out: list[dict] = []
+        truncated = False
+        try:
+            for path in base.glob(pattern):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                if any(part in self._SEARCH_SKIP for part in path.parts):
+                    continue
+                if len(out) >= limit:
+                    truncated = True
+                    break
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                out.append({"path": self._rel(project_id, path), "bytes": stat.st_size})
+        except (ValueError, OSError) as exc:
+            return {"status": "error", "error": f"bad pattern: {exc}"}
+        out.sort(key=lambda f: f["path"])
+        return {"status": "ok", "pattern": pattern, "count": len(out),
+                "truncated": truncated, "files": out}
+
+    def grep(self, project_id: str, pattern: str, *, glob: str = "",
+             case_sensitive: bool = False, max_matches: int = 120,
+             context: int = 0) -> dict:
+        """Regex search across the workspace, returning matching LINES.
+
+        Implemented in Python rather than by shelling out to grep because this
+        must work identically whether or not the exec container is available —
+        searching is how the model orients itself in an existing project, and it
+        should not stop working when Docker does.
+        """
+        if not (pattern or "").strip():
+            return {"status": "error", "error": "a search pattern is required"}
+        try:
+            regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            return {"status": "error", "error": f"invalid regular expression: {exc}"}
+
+        base = self.project_dir(project_id).resolve()
+        want = (glob or "").strip()
+        matches: list[dict] = []
+        files_searched = 0
+        truncated = False
+
+        for path in self._walk_files(base):
+            if path.suffix.lower() not in self._TEXT_SUFFIXES:
+                continue
+            rel = self._rel(project_id, path)
+            if want and not fnmatch.fnmatch(rel, want) and not fnmatch.fnmatch(path.name, want):
+                continue
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue  # a 2MB single file is data, not source
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            files_searched += 1
+            for i, line in enumerate(lines):
+                if not regex.search(line):
+                    continue
+                if len(matches) >= max_matches:
+                    truncated = True
+                    break
+                entry = {"path": rel, "line": i + 1, "text": line.rstrip()[:400]}
+                if context > 0:
+                    lo, hi = max(0, i - context), min(len(lines), i + context + 1)
+                    entry["context"] = [ln.rstrip()[:400] for ln in lines[lo:hi]]
+                matches.append(entry)
+            if truncated:
+                break
+
+        return {
+            "status": "ok", "pattern": pattern, "files_searched": files_searched,
+            "count": len(matches), "truncated": truncated, "matches": matches,
+        }
 
     def verify_file(self, project_id: str, path: str) -> dict:
         """Is this file actually parseable?

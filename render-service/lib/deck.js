@@ -8,7 +8,7 @@
 // What actually makes a generated deck look designed is not more decoration —
 // it is consistency and restraint:
 //
-//   * ONE typographic hierarchy, shared with the rest of Weave (editorial serif
+//   * ONE typographic hierarchy, shared with the rest of Weave (one grotesque
 //     display, sans for body, mono for labels).
 //   * A LAYOUT PER SLIDE SHAPE. A section divider, a statement, a two-column
 //     comparison and a data slide want different geometry; giving them all the
@@ -216,9 +216,9 @@ section{position:absolute;inset:0;display:none;flex-direction:column;justify-con
 section.active{display:flex;animation:slideIn .42s cubic-bezier(.16,1,.3,1) both}
 @keyframes slideIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 
-h1{font-family:Georgia,"Times New Roman",serif;font-size:clamp(34px,6.4vw,74px);font-weight:600;
+h1{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:clamp(34px,6.4vw,74px);font-weight:600;
   line-height:1.04;letter-spacing:-.028em;margin:.12em 0 0}
-h2{font-family:Georgia,"Times New Roman",serif;font-size:clamp(25px,3.9vw,44px);font-weight:600;
+h2{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:clamp(25px,3.9vw,44px);font-weight:600;
   line-height:1.12;letter-spacing:-.022em;margin:.1em 0 .5em}
 h3{font-size:clamp(16px,1.7vw,20px);font-weight:600;margin:1.1em 0 .35em;letter-spacing:-.01em}
 h4,h5{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg-muted);
@@ -238,17 +238,17 @@ blockquote{margin:.6em 0;padding-left:1em;border-left:2px solid var(--accent);
 .s-title .lede,.s-section .lede{max-width:56ch;margin-top:1.1rem}
 .s-section .num{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:var(--accent);
   letter-spacing:.14em;margin-bottom:.7rem}
-.s-statement .big,.s-quote .big{font-family:Georgia,"Times New Roman",serif;
+.s-statement .big,.s-quote .big{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
   font-size:clamp(24px,3.6vw,42px);line-height:1.28;letter-spacing:-.018em;color:var(--fg);max-width:22ch}
 .s-statement .big p,.s-quote .big p{font-size:inherit;line-height:inherit;color:inherit;max-width:none}
 .s-quote{align-items:flex-start}
-.s-quote .mark{font-family:Georgia,serif;font-size:76px;line-height:.6;color:var(--accent);opacity:.5}
+.s-quote .mark{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:76px;line-height:.6;color:var(--accent);opacity:.5}
 .s-quote .attrib{margin-top:1.6rem;font-size:14px;color:var(--fg-faint);letter-spacing:.02em}
 .s-split .cols{display:grid;grid-template-columns:1fr 1fr;gap:3.2rem;align-items:start}
 .s-split .col p,.s-split .col ul{max-width:none}
 .s-data .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
   gap:1.6rem;margin:.6rem 0 1.4rem}
-.s-data .mv{font-family:Georgia,serif;font-size:clamp(30px,4.4vw,54px);font-weight:600;
+.s-data .mv{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;font-size:clamp(30px,4.4vw,54px);font-weight:600;
   letter-spacing:-.03em;line-height:1}
 .s-data .ml{font-size:13px;color:var(--fg-muted);margin-top:.35rem;line-height:1.4}
 .s-data .mn{font-size:11.5px;color:var(--fg-faint);margin-top:.2rem}
