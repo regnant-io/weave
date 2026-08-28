@@ -190,6 +190,8 @@ class MessageOut(BaseModel):
     citations: list[Any]
     artifacts: list[Any] = []
     images: list[Any] = []
+    # The supervised loop's plan ledger for this turn ({} when it had none).
+    plan: dict[str, Any] = {}
     created_at: datetime
 
 

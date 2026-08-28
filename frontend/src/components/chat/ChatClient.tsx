@@ -8,6 +8,7 @@ import type {
   Effort,
   Language,
   Message,
+  Plan,
   WebImage,
 } from "@/lib/types";
 import type { ServicePrefs } from "@/lib/services";
@@ -29,6 +30,7 @@ import Composer from "./Composer";
 import InlineArtifact from "./InlineArtifact";
 import LiveBar from "./LiveBar";
 import Markdown from "./Markdown";
+import PlanRail from "./PlanRail";
 import SteerBar from "./SteerBar";
 import StepChip from "./StepChip";
 import TurnRail from "./TurnRail";
@@ -111,6 +113,12 @@ function fromHistory(messages: Message[], language: Language): ChatTurn[] {
       images: m.images ?? [],
       artifacts,
       pending: false,
+      // A plan the turn worked to is provenance, so it replays with the rest of
+      // the transcript rather than existing only in the live stream.
+      plan:
+        m.plan && "steps" in m.plan && Array.isArray(m.plan.steps) && m.plan.steps.length
+          ? (m.plan as Plan)
+          : undefined,
       createdAt: Date.parse(m.created_at) || Date.now(),
     } satisfies ChatTurn;
   });
@@ -498,6 +506,101 @@ export default function ChatClient({
             endStep(data.status ?? "ok", data.summary, data.error, data.detail);
             break;
 
+          /* ---- the supervised loop ---- */
+          case "plan":
+            patchLast((m) => ({
+              ...m,
+              plan: {
+                goal: data.goal ?? "",
+                steps: Array.isArray(data.steps) ? data.steps : [],
+                checks: Array.isArray(data.checks) ? data.checks : [],
+              },
+            }));
+            break;
+          case "plan_step":
+            patchLast((m) =>
+              m.plan
+                ? {
+                    ...m,
+                    plan: {
+                      ...m.plan,
+                      steps: m.plan.steps.map((s) =>
+                        s.n === data.n
+                          ? { ...s, status: data.status ?? s.status, note: data.note ?? s.note }
+                          : s,
+                      ),
+                    },
+                  }
+                : m,
+            );
+            break;
+          case "phase":
+            patchLast((m) => ({ ...m, phase: String(data.name ?? "") }));
+            break;
+          case "continuing":
+            // The model stopped early and is being sent back to finish. Say so
+            // in the timeline: an unexplained second burst of work reads as the
+            // assistant repeating itself.
+            appendBlock({
+              kind: "step",
+              id: nextId("cont"),
+              tool: "continue",
+              title:
+                language === "sw"
+                  ? `Bado hakijakamilika — inaendelea (${(data.gaps ?? []).length})`
+                  : `Not finished yet — continuing (${(data.gaps ?? []).length} outstanding)`,
+              detail: (data.gaps ?? []).join("
+"),
+              state: "done",
+              substeps: [],
+              artifacts: [],
+              pending: [],
+              startedAt: Date.now(),
+            } satisfies StepBlock);
+            break;
+          case "review":
+            appendBlock({
+              kind: "step",
+              id: nextId("rev"),
+              tool: "review",
+              title:
+                data.verdict === "revise"
+                  ? language === "sw"
+                    ? `Ukaguzi umepata matatizo ${(data.defects ?? []).length}`
+                    : `Review found ${(data.defects ?? []).length} problem(s)`
+                  : language === "sw"
+                    ? "Ukaguzi umepita"
+                    : "Reviewed — no problems found",
+              detail: (data.defects ?? []).join("
+"),
+              state: data.verdict === "revise" ? "error" : "done",
+              substeps: [],
+              artifacts: [],
+              pending: [],
+              startedAt: Date.now(),
+            } satisfies StepBlock);
+            break;
+
+          /* ---- artifact verification (opened in a real browser) ---- */
+          case "verify_start":
+            mutateStep(data.id ?? activeStep.current, (s) => ({
+              ...s,
+              verification: { state: "running" },
+            }));
+            break;
+          case "verify_end":
+            mutateStep(data.id ?? activeStep.current, (s) => ({
+              ...s,
+              verification: {
+                state: data.checked ? (data.ok ? "ok" : "failed") : "ok",
+                attempt: data.attempt,
+                errors: data.errors ?? [],
+                warnings: data.warnings ?? [],
+                summary: data.summary ?? "",
+              },
+            }));
+            break;
+
           /* ---- announced-but-not-yet-produced output ---- */
           case "artifact_pending":
             mutateStep(data.id ?? activeStep.current, (s) => ({
@@ -710,7 +813,7 @@ export default function ChatClient({
       if (activeStep.current) endStep("ok");
       const rest = stream.flushNow();
       if (rest) appendText(rest);
-      patchLast((m) => ({ ...m, pending: false }));
+      patchLast((m) => ({ ...m, pending: false, phase: undefined }));
       abortRef.current = null;
       setStreaming(false);
       // The turn is over, so there is nothing left to redirect.
@@ -1142,6 +1245,10 @@ function AssistantTurn({
 
   return (
     <div ref={(el) => register(turn.id, el)} data-turn-id={turn.id} className="animate-rise mb-2">
+      {turn.plan && (
+        <PlanRail plan={turn.plan} language={language} live={turn.pending} />
+      )}
+
       {turn.thinking && <Reasoning text={turn.thinking} active={turn.pending} language={language} />}
 
       {/* The block timeline: prose, work, questions and generated output,
@@ -1182,10 +1289,15 @@ function AssistantTurn({
 
       {/* No prebuilt loader. Just an honest, unbounded presence indicator that
           says "still here" without implying a duration. */}
-      {turn.pending && nothingYet && (
+      {turn.pending && (nothingYet || turn.phase === "planning" || turn.phase === "reviewing") && (
         <div className="flex items-center gap-2 py-1">
           <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-accent" />
           <span className="h-px w-8 bg-border" />
+          {turn.phase && (
+            <span className="text-2xs uppercase tracking-widest text-fg-faint">
+              {phaseLabel(turn.phase, language)}
+            </span>
+          )}
         </div>
       )}
 
@@ -1202,6 +1314,29 @@ function AssistantTurn({
       )}
     </div>
   );
+}
+
+/**
+ * What the supervisor is doing between bursts of visible work.
+ *
+ * Planning and reviewing are model calls whose output is deliberately NOT
+ * streamed — they are scaffolding, not the answer. Without a label the reader
+ * sees ten silent seconds and concludes the thing has hung.
+ */
+function phaseLabel(phase: string, language: Language): string {
+  const sw: Record<string, string> = {
+    planning: "inapanga",
+    working: "inafanya kazi",
+    reviewing: "inakagua kazi",
+    repairing: "inarekebisha",
+  };
+  const en: Record<string, string> = {
+    planning: "planning",
+    working: "working",
+    reviewing: "checking its work",
+    repairing: "fixing what the check found",
+  };
+  return (language === "sw" ? sw : en)[phase] ?? phase;
 }
 
 function Reasoning({

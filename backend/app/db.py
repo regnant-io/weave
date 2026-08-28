@@ -77,6 +77,10 @@ def init_db() -> None:
             for col in ("artifacts", "images"):
                 if col not in mcols:
                     conn.execute(text(f"ALTER TABLE messages ADD COLUMN {col} JSON DEFAULT '[]'"))
+            # The supervised loop's plan ledger. Object, not array — hence its
+            # own line rather than joining the loop above.
+            if "plan" not in mcols:
+                conn.execute(text("ALTER TABLE messages ADD COLUMN plan JSON DEFAULT '{}'"))
             if "thread_id" not in mcols:
                 # No FK constraint in the ALTER: SQLite cannot add one after the
                 # fact, and create_all has already declared it for fresh DBs.
