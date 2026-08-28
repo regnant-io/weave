@@ -1,0 +1,28 @@
+# Development overrides. Docker Compose loads this file automatically on top of
+# docker-compose.yml, so `docker compose up` picks it up with no extra flags and
+# a deployment that only ships docker-compose.yml is unaffected.
+#
+# WHY THIS EXISTS
+# ---------------
+# The backend image COPYs the source in at build time, so every one-line change
+# to a prompt, a tool description or an orchestration rule meant a full image
+# rebuild before it could be tried. That is a minute of waiting per edit, which
+# is enough to change how you work: you batch up changes, test them together,
+# and lose track of which one broke things.
+#
+# Bind-mounting the source and running uvicorn with --reload turns that minute
+# into about a second. Dependencies still come from the image — only the
+# application code is mounted — so this never diverges from what is built.
+services:
+  backend:
+    volumes:
+      - ./backend/app:/app/app
+      - backend_var:/app/var
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WEAVE_WORKSPACE_HOST_DIR:-./var/workspaces}:/app/var/workspaces
+    # Seeding is skipped here: the database already exists after the first boot,
+    # and re-running the seeder on every reload is noise.
+    command: >
+      sh -c "python -m app.seed.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --reload --reload-dir /app/app"

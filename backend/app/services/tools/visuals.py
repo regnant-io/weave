@@ -126,24 +126,75 @@ def _create_html_page(ctx: ToolContext, inp: dict) -> dict:
 def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
     """Check a page opens BEFORE it is handed over.
 
-    Deliberately read-only and cheap: the point is that the model can run it on
-    its own output, see a concrete failure, and fix it in the same turn instead
-    of shipping something that renders blank.
+    Two passes, because they catch different things:
+
+      * the STATIC lint reads the source and finds what is visibly wrong — ESM
+        syntax in a classic script, a CDN `<script src>`, a truncated file;
+      * the LIVE run opens the page in a real browser and finds what is only
+        discoverable by executing it. This is the pass that catches
+        "createScene did not return a BABYLON.Scene", which is a perfectly
+        well-formed document that renders a black rectangle.
+
+    Artifacts produced by the tools are gated automatically (see
+    services/orchestration/verification.py), so this tool is for pages the model
+    has written but not yet submitted — checking a draft, or a page it read out
+    of the workspace.
     """
     client = _render(ctx)
     if not client:
         return _unavailable()
     html = str(inp.get("html") or "")
+    source = "supplied html"
     if not html.strip():
         vid = str(inp.get("visual_id") or "")
+        path = str(inp.get("workspace_path") or "")
         if vid:
             from ..render import visuals
             html = visuals.load_html(_project_id(ctx), vid)
+            source = f"visual {vid}"
+        elif path:
+            # Checking a page the model built in the workspace is the same
+            # question, and refusing to answer it just because the file lives
+            # somewhere else would send the model back to guessing.
+            workspace = ctx.services.get("workspace")
+            if workspace is None:
+                return {"status": "error",
+                        "error": "the workspace is not available on this server"}
+            read = workspace.read_file(_project_id(ctx), path)
+            if read.get("status") != "ok":
+                return {"status": "error", "error": read.get("error") or "could not read the file"}
+            html = read.get("content") or ""
+            source = path
         if not html.strip():
-            return {"status": "error", "error": "supply html, or a visual_id that exists"}
-    result = client.verify_html(html)
-    result["tool"] = "verify_artifact"
-    return result
+            return {"status": "error",
+                    "error": "supply `html`, a `visual_id`, or a `workspace_path` that exists"}
+
+    static = client.verify_html(html)
+    errors = [str(e) for e in (static.get("errors") or [])]
+    warnings = [str(w) for w in (static.get("warnings") or [])]
+
+    from ..render.probe import get_probe
+    run = get_probe().run(html, heavy=bool(inp.get("heavy", True)))
+    if run.available:
+        errors += run.errors
+        warnings += run.warnings
+
+    ok = not errors
+    return {
+        "status": "ok",
+        "tool": "verify_artifact",
+        "checked": source,
+        "executed": run.available,
+        "ok": ok,
+        "errors": errors[:12],
+        "warnings": warnings[:8],
+        "note": (
+            "The page opens and renders without errors."
+            if ok else
+            "This page is BROKEN. Fix the errors listed and check it again before "
+            "showing it to the user."
+        ),
+    }
 
 
 def _render_custom(ctx: ToolContext, inp: dict) -> dict:
@@ -434,16 +485,23 @@ def register_visual_tools(reg: ToolRegistry) -> None:
     reg.register(Tool(
         name="verify_artifact",
         description=(
-            "Check that a page you generated will actually OPEN, before you tell the "
-            "user it is ready. Catches the failures that look fine in the source and "
-            "render blank in the browser: ESM syntax in a classic script, external "
-            "resources that the sandbox blocks, and truncated files. Pass either the "
-            "raw `html` or the `visual_id` of something you already created. Read-only "
-            "— it never stores or changes anything."
+            "OPEN a page in a real headless browser and report what actually "
+            "happened: uncaught exceptions, console errors, blocked network "
+            "requests, and whether anything was painted at all. This catches the "
+            "failures that look perfectly fine in the source — a scene function "
+            "that never returns its scene, setup code that throws halfway, a page "
+            "that draws nothing — as well as the static ones (ESM syntax in a "
+            "classic script, external resources, truncated files). Pass raw "
+            "`html`, the `visual_id` of something you created, or a "
+            "`workspace_path` to a page in the project workspace. Read-only."
         ),
         input_schema={"type": "object", "properties": {
             "html": {"type": "string"},
             "visual_id": {"type": "string"},
+            "workspace_path": {"type": "string",
+                               "description": "Path to an HTML file in the workspace."},
+            "heavy": {"type": "boolean",
+                      "description": "Allow longer to boot (3D/WebGL). Default true."},
         }},
         execute=_verify_artifact, trust_required="anonymous", requires_services=("render",),
     ))
