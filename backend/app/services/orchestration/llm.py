@@ -13,10 +13,13 @@ The active engine is chosen at startup and exposed via get_engine().
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ...config import settings
+
+log = logging.getLogger("weave.llm")
 
 ToolExecutor = Callable[[str, dict], dict]
 
@@ -56,15 +59,158 @@ class OllamaEngine:
             headers={"ngrok-skip-browser-warning": "true", "User-Agent": "weave/1.0"},
         )
 
-    def list_models(self) -> list[str]:
-        """Names of models available on the Ollama server (for the model picker)."""
+    #: How long a /api/tags listing stays fresh. Long enough that a turn does not
+    #: pay for it repeatedly, short enough that pulling a new model shows up
+    #: without a restart.
+    _TAGS_TTL = 60.0
+
+    def tags(self, *, force: bool = False) -> list[dict]:
+        """The raw model listing from Ollama, memoised briefly.
+
+        Kept as the full records rather than just names because the fields that
+        matter most for routing — `capabilities` (does it support tools at all?)
+        and `details.parameter_size` — are only here. Deciding those from the
+        model NAME, which is what this code used to do, is guesswork that gets
+        `minimax-m3:cloud` and `gemma4:cloud` wrong.
+        """
+        import time
+
+        cached = getattr(self, "_tags_cache", None)
+        if cached and not force and (time.monotonic() - cached[0]) < self._TAGS_TTL:
+            return cached[1]
         try:
             r = self._client.get("/api/tags", timeout=10.0)
             r.raise_for_status()
-            models = [m.get("name", "") for m in r.json().get("models", [])]
-            return sorted(n for n in models if n)
-        except Exception:  # noqa: BLE001
-            return []
+            models = [m for m in (r.json().get("models") or []) if m.get("name")]
+        except Exception:  # noqa: BLE001 - unreachable server: report nothing
+            models = cached[1] if cached else []
+        self._tags_cache = (time.monotonic(), models)
+        return models
+
+    def list_models(self) -> list[str]:
+        """Names of models available on the Ollama server (for the model picker)."""
+        return sorted(m["name"] for m in self.tags())
+
+    def capabilities(self, name: str) -> set[str]:
+        """What the server says this model can do ('tools', 'thinking', 'vision')."""
+        for m in self.tags():
+            if m.get("name") == name:
+                return {str(c) for c in (m.get("capabilities") or [])}
+        return set()
+
+    def parameter_billions(self, name: str) -> float:
+        """Parameter count in billions, or 0.0 when the server does not say.
+
+        Hosted `:cloud` models report "0" for some entries, which is why this is
+        only ever one input to `model_class` and never the deciding one.
+        """
+        for m in self.tags():
+            if m.get("name") != name:
+                continue
+            raw = str((m.get("details") or {}).get("parameter_size") or "").strip().upper()
+            try:
+                if raw.endswith("B"):
+                    return float(raw[:-1])
+                if raw.endswith("M"):
+                    return float(raw[:-1]) / 1000.0
+                return float(raw)
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def supports_tools(self, name: str) -> bool:
+        """Whether this model can drive the orchestrator at all.
+
+        A model with no tool support cannot run analysis, cannot search, cannot
+        render — it can only talk. Selecting one silently turns Weave back into
+        a chat window, so it is filtered out of automatic selection (a user who
+        explicitly picks one still gets it).
+        """
+        caps = self.capabilities(name)
+        # An older Ollama omits the field entirely; absence is not evidence of
+        # absence, so an unannotated model stays eligible.
+        return "tools" in caps if caps else True
+
+    def model_class(self, name: str) -> str:
+        """"large" or "small" — how much prompt guidance is worth its tokens.
+
+        Judged from what the SERVER reports, not from the model's name:
+
+          * a model advertising `thinking` is a reasoning model by construction,
+            whatever it is called;
+          * 27B+ parameters is large;
+          * a hosted `:cloud` tag is a frontier-class endpoint even when the
+            parameter count comes back as 0, which is exactly the case that made
+            the old name-regex classify `minimax-m3:cloud` as a small local
+            model and hand it the cut-down prompt.
+        """
+        caps = self.capabilities(name)
+        if "thinking" in caps:
+            return "large"
+        if self.parameter_billions(name) >= 27:
+            return "large"
+        if name.endswith(":cloud") or ":cloud-" in name:
+            return "large"
+        return "small"
+
+    def resolve_model(self, requested: str | None = None) -> str:
+        """A model that actually EXISTS on this server and can use tools.
+
+        The configured default is a string in a `.env` file, and it drifts: the
+        shipped default was `llama3.2:3b` on a server that had never pulled it.
+        Every turn then made three retried calls to a 404, gave up, and fell
+        back to the deterministic offline engine — so the product answered every
+        question with its no-LLM fallback path while reporting `llm_engine:
+        "ollama"` as healthy. Nothing surfaced the mismatch.
+
+        So: honour what is asked for when it is really there, and otherwise pick
+        the best thing that is, loudly.
+        """
+        names = {m["name"] for m in self.tags()}
+        if requested and requested in names:
+            return requested
+        # Ollama accepts an implicit ':latest'; treat that as a match.
+        if requested and f"{requested}:latest" in names:
+            return f"{requested}:latest"
+
+        usable = [n for n in sorted(names) if self.supports_tools(n)]
+        if not usable:
+            # Nothing tool-capable. Returning the request unchanged keeps the
+            # failure honest rather than substituting a model that cannot work.
+            return requested or settings.ollama_model
+
+        def rank(n: str) -> tuple:
+            """Preference order, most significant first.
+
+            Reasoning capability outranks raw size because this orchestrator
+            plans, critiques and repairs its own work — a model that cannot
+            think through a multi-step plan is the wrong instrument however
+            many parameters it has. Size then decides among reasoning models,
+            and vision and context window break the remaining ties (vision
+            matters for screen sharing and for critiquing a rendered artifact).
+            """
+            caps = self.capabilities(n)
+            try:
+                ctx = self.effective_context(n)
+            except Exception:  # noqa: BLE001
+                ctx = 0
+            return (
+                self.model_class(n) == "large",
+                "thinking" in caps,
+                self.parameter_billions(n),
+                "vision" in caps,
+                ctx,
+                n,
+            )
+
+        best = max(usable, key=rank)
+        if requested:
+            log.warning(
+                "configured Ollama model %r is not present on %s; using %r instead. "
+                "Pull it, or set WEAVE_OLLAMA_MODEL to one of: %s",
+                requested, self._client.base_url, best, ", ".join(usable[:8]),
+            )
+        return best
 
     def model_context(self, name: str) -> int | None:
         """The model's trained context window, from Ollama's /api/show.
@@ -128,9 +274,10 @@ class OllamaEngine:
 
     def model_for_tier(self, tier: str) -> str:
         from ...runtime import ollama_model
-        if tier == "frontier":
-            return settings.ollama_model_frontier or ollama_model()
-        return settings.ollama_model_fast or ollama_model()
+        configured = (
+            settings.ollama_model_frontier if tier == "frontier" else settings.ollama_model_fast
+        ) or ollama_model()
+        return self.resolve_model(configured)
 
     def _post_chat(self, payload: dict, attempts: int = 3):
         """POST /api/chat with retries on transient errors. A remote/ngrok-tunnelled
@@ -199,7 +346,10 @@ class OllamaEngine:
         import json
         from ...runtime import effort_spec, num_predict_for
         max_iters = max_iters or settings.llm_max_tool_iters
-        model = model or self.model_for_tier(tier)
+        # Resolve even an explicit choice: a model the user picked before it was
+        # removed from the server would otherwise 404 three times and silently
+        # degrade the whole turn to the offline engine.
+        model = self.resolve_model(model) if model else self.model_for_tier(tier)
         spec = effort_spec(effort)
         # Resolved ONCE per turn: /api/show is memoised but the value is used on
         # every tool iteration, and the meter must be drawn against this exact

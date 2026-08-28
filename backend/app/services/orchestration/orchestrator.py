@@ -304,6 +304,12 @@ class Orchestrator:
 
         _step_seq = {"n": 0}
 
+        # The artifact gate. Nothing a tool renders reaches the transcript until
+        # it has been opened in a real browser — see services/orchestration/
+        # verification.py for why this cannot be left to the model's discretion.
+        from .verification import MAX_REPAIRS, ArtifactGate
+        gate = ArtifactGate(str(project.id))
+
         def tool_executor(name: str, tool_input: dict) -> dict:
             # Per-turn caps: a runaway agentic loop must not hammer the sandbox or
             # crawl the web unboundedly (defence-in-depth atop the iter limit).
@@ -354,7 +360,65 @@ class Orchestrator:
                     "title": str(tool_input.get("title") or note or "").strip()[:120],
                 })
 
-            result = registry.execute(name, ctx, tool_input)
+            # --- gated execution ------------------------------------------
+            # An artifact-producing tool pushes its output into the transcript
+            # the instant the render service accepts it. That is exactly the
+            # emit-and-continue behaviour we are removing, so for gated tools
+            # the `artifact` events are BUFFERED here and released only once the
+            # page has been proven to open. Buffering at the emit boundary keeps
+            # every tool implementation untouched.
+            gated = gate.gates(name)
+            buffered: list[dict] = []
+            saved_emit = ctx.emit
+            if gated:
+                def _capture(event: str, data: dict) -> None:
+                    if event == "artifact":
+                        buffered.append(dict(data))
+                        return
+                    saved_emit(event, data)
+
+                ctx.emit = _capture
+
+            try:
+                result = registry.execute(name, ctx, tool_input)
+            finally:
+                if gated:
+                    ctx.emit = saved_emit
+
+            verdict = None
+            if gated:
+                _emit("verify_start", {"id": step_id, "tool": name})
+                verdict = gate.check(name, tool_input, result)
+                _emit("verify_end", {
+                    "id": step_id,
+                    "tool": name,
+                    "checked": verdict.checked,
+                    "ok": verdict.ok,
+                    "attempt": verdict.attempt,
+                    "max_attempts": MAX_REPAIRS,
+                    "exhausted": verdict.exhausted,
+                    "errors": verdict.errors[:4],
+                    "warnings": verdict.warnings[:3],
+                    "summary": verdict.summary,
+                    "ms": verdict.duration_ms,
+                })
+                if verdict.released:
+                    from ...security import sign_path as _sign
+                    preview = ""
+                    if verdict.screenshot_key:
+                        preview = (f"/api/artifact/{verdict.screenshot_key}"
+                                   f"?sig={_sign(verdict.screenshot_key)}")
+                    for art in buffered:
+                        # A real screenshot of the real page: proof it rendered,
+                        # and a poster frame so a transcript full of 3D scenes
+                        # does not need a dozen live WebGL contexts at once.
+                        if preview:
+                            art["preview"] = preview
+                        art["verified"] = verdict.ok
+                        if not verdict.ok:
+                            art["defects"] = verdict.errors[:4]
+                        _emit("artifact", art)
+                result = ArtifactGate.apply(result, verdict, name)
 
             # Always resolve the placeholder — on failure too, or the skeleton
             # would shimmer forever.
@@ -515,7 +579,7 @@ class Orchestrator:
         assistant_msg.content_sw = answer
         assistant_msg.content_en = answer
         citations = self._collect_citations(passages, tool_events)
-        artifacts = self._collect_artifacts(tool_events)
+        artifacts = _artifacts_from_events(progress_events)
         images = self._collect_web_images(tool_events, passages)
         assistant_msg.citations = citations
         # Persist the STEP TIMELINE, not just a list of tool names. Reloading a
@@ -612,18 +676,29 @@ class Orchestrator:
         standards produces worse output than the same model handed two, because
         it spends its attention on the instructions rather than the task.
 
-        Classification is by engine and by parameter count in the model tag,
-        which is what Ollama names actually encode ("llama3.2:3b",
-        "qwen2.5:14b"). Anything hosted (Claude) is large; an unrecognised local
-        tag is treated as small, because under-instructing a capable model costs
-        far less than drowning a small one.
+        The engine classifies when it can, because it knows what the server
+        actually reports — parameter count and whether the model advertises
+        reasoning. Only when it cannot do we fall back to reading the name, and
+        that fallback is why `minimax-m3:cloud` and `gemma4:cloud` were being
+        handed the cut-down prompt meant for a 3B model: neither tag contains a
+        parameter count to match on.
         """
         import re
 
         if type(engine).__name__ == "AnthropicEngine":
             return "large"
-        name = (model or getattr(engine, "model", "") or "").lower()
-        match = re.search(r"[:\-](\d+(?:\.\d+)?)\s*b\b", name)
+        name = model or getattr(engine, "model", "") or ""
+        classifier = getattr(engine, "model_class", None)
+        if callable(classifier):
+            try:
+                resolved = getattr(engine, "resolve_model", lambda n: n)(name) if name else name
+                return classifier(resolved or engine.model_for_tier("fast"))
+            except Exception:  # noqa: BLE001 - unreachable server: fall through
+                pass
+        low = name.lower()
+        if low.endswith(":cloud") or ":cloud-" in low:
+            return "large"
+        match = re.search(r"[:\-](\d+(?:\.\d+)?)\s*b\b", low)
         if match:
             try:
                 return "large" if float(match.group(1)) >= 27 else "small"
@@ -632,8 +707,12 @@ class Orchestrator:
         return "small"
 
     def _collect_artifacts(self, tool_events: list[dict]) -> list[dict]:
-        """Turn tool output_files (charts/decks/PDFs/3D) into renderable artifact
-        references with a frontend-proxied URL."""
+        """Kept for callers outside the turn loop (tests, batch channels).
+
+        The live path uses `_artifacts_from_events` instead — see its docstring
+        for why deriving from what the client was actually sent is the only way
+        history and the live transcript stay identical.
+        """
         from ...security import sign_path
         arts: list[dict] = []
         for e in tool_events:
@@ -945,6 +1024,31 @@ _PENDING_ARTIFACT_KIND = {
 }
 
 
+def _artifacts_from_events(events: list[dict]) -> list[dict]:
+    """The artifacts the client was actually shown, in the order it saw them.
+
+    Derived from the emitted events rather than re-walked from `tool_events`
+    for one reason that matters: an artifact that FAILED verification was never
+    emitted, and re-collecting from tool results would put it back — the exact
+    broken output the gate exists to withhold would reappear on reload.
+
+    It also preserves what the gate attached (`preview`, `verified`, `defects`),
+    which the tool result does not carry.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ev in events:
+        if ev.get("event") != "artifact":
+            continue
+        data = ev.get("data") or {}
+        url = str(data.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(dict(data))
+    return out
+
+
 def _step_timeline(events: list[dict]) -> list[dict]:
     """Rebuild the tool-step timeline from the events the client was sent.
 
@@ -1000,6 +1104,21 @@ def _step_timeline(events: list[dict]) -> list[dict]:
                     "detail": data.get("detail", ""),
                     "state": "running",
                 })
+
+        elif kind == "verify_end":
+            # Keep the verdict on the step so a reloaded transcript still shows
+            # that the artifact was opened and what the browser reported. A
+            # "verified" badge that vanishes on refresh teaches the user not to
+            # trust it.
+            target = by_id.get(str(data.get("id"))) or current
+            if target and data.get("checked"):
+                target["verification"] = {
+                    "ok": bool(data.get("ok")),
+                    "attempt": data.get("attempt"),
+                    "errors": data.get("errors") or [],
+                    "warnings": data.get("warnings") or [],
+                    "summary": data.get("summary", ""),
+                }
 
         elif kind == "step_end":
             target = by_id.get(str(data.get("id"))) or current
@@ -1117,8 +1236,19 @@ def _summarise(name: str, result: dict) -> str:
     if not isinstance(result, dict):
         return ""
     status = result.get("status")
+    if status == "needs_repair":
+        v = result.get("verification") or {}
+        n = len(v.get("errors") or [])
+        return (f"broken · {n} error{'s' if n != 1 else ''} · "
+                f"repairing ({v.get('attempt', 1)}/{v.get('attempt', 1) + max(0, v.get('attempts_remaining', 0))})")
     if status and status not in {"ok", "success"}:
         return str(status)
+    verification = result.get("verification")
+    if isinstance(verification, dict) and verification.get("ran"):
+        if verification.get("ok"):
+            files = len(result.get("output_files") or [])
+            return "verified · renders clean" + (f" · {files} files" if files > 1 else "")
+        return f"released with {len(verification.get('errors') or [])} known defects"
     if name == "web_search":
         n = len(result.get("results") or [])
         return f"{n} results" if n else ""
