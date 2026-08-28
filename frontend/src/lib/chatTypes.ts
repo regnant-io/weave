@@ -83,6 +83,8 @@ export interface StepBlock {
     attempt?: number;
     errors?: string[];
     warnings?: string[];
+    /** Things that are not broken but not good enough yet. */
+    polish?: string[];
     summary?: string;
   };
 }

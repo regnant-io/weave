@@ -624,6 +624,7 @@ export default function ChatClient({
                 attempt: data.attempt,
                 errors: data.errors ?? [],
                 warnings: data.warnings ?? [],
+                polish: data.polish ?? [],
                 summary: data.summary ?? "",
               },
             }));

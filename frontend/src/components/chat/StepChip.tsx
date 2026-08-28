@@ -194,6 +194,46 @@ function StepChipInner({
         <div className="wv-collapse" data-open={open && hasBody}>
           <div className="wv-collapse-inner">
             <div className="pb-1.5 pt-1">
+              {/* What happened when this step's artifact was opened in a real
+                  browser. Placed above the arguments because it is the answer
+                  to the question a reader actually has — did the thing work —
+                  and because a verification that is only visible in a summary
+                  chip is a claim without its evidence. */}
+              {step.verification && (
+                <div
+                  className={`mb-1.5 border-l-2 pl-2 text-[11.5px] leading-snug ${
+                    step.verification.state === "failed"
+                      ? "border-danger text-danger"
+                      : step.verification.state === "running"
+                        ? "border-accent-line text-fg-muted"
+                        : "border-ok text-fg-muted"
+                  }`}
+                >
+                  <span className="eyebrow block">
+                    {step.verification.state === "running"
+                      ? "opening it in a browser…"
+                      : step.verification.state === "failed"
+                        ? `failed verification (attempt ${step.verification.attempt ?? 1})`
+                        : "opened in a browser · rendered cleanly"}
+                  </span>
+                  {(step.verification.errors ?? []).map((e, i) => (
+                    <div key={`e${i}`} className="mt-0.5">
+                      {e}
+                    </div>
+                  ))}
+                  {(step.verification.warnings ?? []).map((w, i) => (
+                    <div key={`w${i}`} className="mt-0.5 text-warn">
+                      {w}
+                    </div>
+                  ))}
+                  {(step.verification.polish ?? []).map((n, i) => (
+                    <div key={`p${i}`} className="mt-0.5 text-fg-muted">
+                      · {n}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {argEntries.length > 0 && (
                 <dl className="mb-1.5 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11.5px]">
                   {argEntries.map(([k, v]) => (
@@ -262,6 +302,7 @@ const StepChip = memo(StepChipInner, (a, b) => {
     x.title === y.title &&
     x.state === y.state &&
     x.summary === y.summary &&
+    x.verification?.state === y.verification?.state &&
     x.error === y.error &&
     x.detail === y.detail &&
     x.endedAt === y.endedAt &&
