@@ -1,0 +1,22 @@
+# Browsers we support. Low-end Android and old iPads are the real floor for this
+# audience, so the baseline is deliberately far below "modern evergreen".
+#
+# Keep this the ONLY browserslist source. Adding a `browserslist` key to
+# package.json as well makes the build fail outright:
+#   "contains both .browserslistrc and package.json with browsers".
+#
+# IMPORTANT — what this does and does not protect against:
+#   It lowers SYNTAX (optional chaining, class fields, async generators…).
+#   It does NOT lower runtime features baked into a regex literal. Regex
+#   LOOKBEHIND `(?<=…)` is a parse-time SyntaxError on Safari < 16.4 and no
+#   transpiler can rewrite it. That is what crashed the whole app on iOS 15:
+#   react-markdown pulled in `mdast-util-gfm-autolink-literal`, which ships one.
+#   Markdown is now rendered by src/lib/markdown, which is lookbehind-free.
+#   Before adding any browser dependency, grep it for `(?<=` and `(?<!`.
+iOS >= 12
+Safari >= 12
+Chrome >= 80
+Firefox >= 78
+Edge >= 88
+not dead
+not op_mini all

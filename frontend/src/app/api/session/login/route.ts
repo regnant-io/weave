@@ -1,0 +1,27 @@
+import { NextRequest, NextResponse } from "next/server";
+import { LANG_COOKIE, MODE_COOKIE, TOKEN_COOKIE } from "@/lib/session";
+
+const API_BASE = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
+
+// Proxies login to the backend and stores the returned JWT in an httpOnly cookie
+// so it is never exposed to client JS (defence against token theft via XSS).
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return NextResponse.json({ error: data.detail ?? "login failed" }, { status: res.status });
+  }
+  const out = NextResponse.json({ user: data.user });
+  const secure = process.env.NODE_ENV === "production";
+  out.cookies.set(TOKEN_COOKIE, data.access_token, {
+    httpOnly: true, secure, sameSite: "lax", path: "/", maxAge: 60 * 60 * 24 * 7,
+  });
+  out.cookies.set(LANG_COOKIE, data.user.preferred_language ?? "sw", { path: "/", maxAge: 60 * 60 * 24 * 365 });
+  out.cookies.set(MODE_COOKIE, data.user.role === "researcher" ? "researcher" : "student", { path: "/" });
+  return out;
+}

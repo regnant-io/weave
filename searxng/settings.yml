@@ -1,0 +1,67 @@
+# SearXNG config for Weave's deep-research tool.
+# Enables the JSON API, disables the bot-detection limiter, and — based on log
+# analysis — DISABLES the consistently-broken engines (startpage returns malformed
+# JSON; deviantart/unsplash/pexels/google-cse time out or error) while keeping a
+# curated set of reliable web + image engines. Engine timeout raised 3s -> 6s to
+# stop the "ResultContainer after close" races.
+use_default_settings: true
+
+general:
+  instance_name: "Weave Research"
+
+server:
+  secret_key: "weave-dev-secret-change-me-in-production"
+  limiter: false          # allow programmatic API access from the backend
+  image_proxy: false
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json                # required for the /search?format=json API
+
+outgoing:
+  request_timeout: 6.0    # was effectively 3s; too short for slow engines
+  max_request_timeout: 10.0
+  pool_connections: 100
+  pool_maxsize: 20
+
+engines:
+  # --- reliable web engines (keep) ---
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
+  - name: bing
+    disabled: false
+  # --- reliable image engines (keep) ---
+  - name: bing images
+    disabled: false
+  - name: duckduckgo images
+    disabled: false
+  - name: wikicommons.images
+    disabled: false
+
+  # --- BROKEN / flaky engines (disable; they produced ~80% of the log errors) ---
+  - name: startpage
+    disabled: true
+  - name: startpage images
+    disabled: true
+  - name: google
+    disabled: true          # frequent CAPTCHA / AccessDenied
+  - name: google images
+    disabled: true
+  - name: google cse
+    disabled: true          # needs an API key; times out
+  - name: google cse images
+    disabled: true
+  - name: deviantart
+    disabled: true
+  - name: unsplash
+    disabled: true
+  - name: pexels
+    disabled: true
