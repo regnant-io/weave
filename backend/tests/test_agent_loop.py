@@ -220,6 +220,26 @@ def test_artifact_surface_removes_the_workspace_authoring_tools():
     assert "submit_plan" in offered
 
 
+def test_the_dev_server_tools_are_not_offered_on_an_artifact_turn():
+    """`preview_check` reads as "check the preview" and is not.
+
+    On an artifact turn the model called it on a rendered diagram, got 'no dev
+    server is running', could not close the plan step that depended on it, and
+    rebuilt the entire diagram a second time. A tool whose name invites the
+    wrong reading is a trap; the surface filter is where to remove it.
+    """
+    a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
+    a.tools = [{"name": "create_diagram"}, {"name": "preview_check"},
+               {"name": "workspace_serve"}, {"name": "verify_artifact"}]
+    a.plan = ag.Plan(goal="g", surface="artifact", steps=[ag.PlanStep(1, "draw")])
+    offered = {t["name"] for t in a._tools_with_loop_control()}
+    assert "preview_check" not in offered
+    assert "workspace_serve" not in offered
+    # The right instrument for the job stays.
+    assert "verify_artifact" in offered
+    assert "create_diagram" in offered
+
+
 def test_workspace_surface_keeps_its_tools():
     a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
     a.plan = ag.Plan(goal="g", surface="workspace", steps=[ag.PlanStep(1, "build")])

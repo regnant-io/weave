@@ -231,8 +231,15 @@ def _preview_check(ctx: ToolContext, inp: dict) -> dict:
         return _unavailable()
     status = svc.server_status(_project_id(ctx))
     if not status.get("running"):
-        return {"status": "error",
-                "error": "no dev server is running; start one with workspace_serve first"}
+        return {
+            "status": "error",
+            "error": (
+                "no dev server is running. This tool checks a web app you started "
+                "with `workspace_serve` — it is not for artifacts. An artifact you "
+                "rendered has ALREADY been opened in a browser and verified; if you "
+                "want to check one yourself, use `verify_artifact`."
+            ),
+        }
 
     path = str(inp.get("path") or "/")
     if not path.startswith("/"):

@@ -974,6 +974,14 @@ Call `submit_review` once."""
 _WORKSPACE_AUTHORING = {
     "workspace_write", "workspace_edit", "workspace_exec", "workspace_delete",
     "workspace_move", "workspace_package",
+    # The dev-server tools belong to the workspace too. `preview_check` in
+    # particular reads, by name, as "check the preview" — so on an artifact turn
+    # the model called it on a rendered diagram, got "no dev server is running",
+    # could not close the plan step that depended on it, and built the whole
+    # diagram a second time. Offering a tool whose name invites the wrong
+    # reading is a trap, and the surface filter is exactly where to remove it.
+    "workspace_serve", "workspace_stop_server", "workspace_server_log",
+    "preview_check",
 }
 
 
