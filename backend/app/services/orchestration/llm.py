@@ -412,42 +412,6 @@ class OllamaEngine:
                 raise
         raise last_exc if last_exc else RuntimeError("ollama request failed")
 
-    def _await_capacity(self, payload: dict, on_event=None, attempts: int = 4) -> None:
-        """Block until the provider will accept a streaming request.
-
-        Streaming cannot retry mid-flight — once tokens have been emitted to the
-        client, replaying the call would duplicate them on screen. So the rate
-        limit is absorbed here, before anything is streamed, by opening the
-        stream and immediately closing it if the status is 429.
-        """
-        import time as _time
-
-        httpx = self._httpx
-        for i in range(attempts):
-            try:
-                with self._client.stream("POST", "/api/chat",
-                                         json={**payload, "stream": True}) as probe:
-                    if probe.status_code != 429:
-                        return
-                    probe.read()
-                    response = probe
-            except httpx.HTTPStatusError as exc:
-                if exc.response is None or exc.response.status_code != 429:
-                    return
-                response = exc.response
-            except QuotaExhausted:
-                raise
-            except Exception:  # noqa: BLE001 - a connection problem is the caller's to handle
-                return
-
-            quota = self._quota_message(response)
-            if quota:
-                # No amount of waiting fixes this one.
-                raise QuotaExhausted(quota)
-            if i >= attempts - 1:
-                return
-            _time.sleep(self._sleep_for_retry(response, i, on_event))
-
     @staticmethod
     def _to_ollama_tools(tools: list[dict]) -> list[dict]:
         """Convert the Anthropic-style tool schema to Ollama's OpenAI-style one."""
@@ -530,37 +494,54 @@ class OllamaEngine:
             content_parts: list[str] = []
             tool_calls: list[dict] = []
             try:
-                # A rate limit has to be waited out BEFORE the stream opens.
-                # Without this the streaming path had no retry at all: the 429
-                # raised, the except below fell through to the non-streaming
-                # call, that raised 429 too, and the whole turn degraded to the
-                # offline engine with nothing telling the user why the answer
-                # suddenly got worse.
-                self._await_capacity(payload, on_event)
-                with self._client.stream("POST", "/api/chat", json=payload) as resp:
-                    resp.raise_for_status()
-                    for line in resp.iter_lines():
-                        if _cancelled():
-                            break
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        m = obj.get("message", {}) or {}
-                        thinking = m.get("thinking")
-                        if thinking and on_event:
-                            on_event("thinking", {"text": thinking})
-                        delta = m.get("content", "") or ""
-                        if delta:
-                            content_parts.append(delta)
-                            if on_event:
-                                on_event("token", {"text": delta})
-                        if m.get("tool_calls"):
-                            tool_calls.extend(m["tool_calls"])
-                        if obj.get("done"):
-                            break
+                # Rate limits are handled INSIDE the streaming request, by
+                # checking the status before consuming the body.
+                #
+                # httpx exposes the status as soon as the response head arrives,
+                # so a 429 can be retried here with nothing yet on the user's
+                # screen — which is the whole difficulty: once tokens have been
+                # emitted, replaying the call would duplicate them.
+                #
+                # The previous attempt at this sent a separate probe request
+                # first. That doubled every call to a metered endpoint, and the
+                # probe consumed a generation that was then thrown away.
+                for attempt in range(4):
+                    with self._client.stream("POST", "/api/chat", json=payload) as resp:
+                        if resp.status_code == 429:
+                            resp.read()
+                            quota = self._quota_message(resp)
+                            if quota:
+                                raise QuotaExhausted(quota)
+                            if attempt < 3:
+                                import time as _t
+                                _t.sleep(self._sleep_for_retry(resp, attempt, on_event))
+                                continue
+                        resp.raise_for_status()
+                        for line in resp.iter_lines():
+                            if _cancelled():
+                                break
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            m = obj.get("message", {}) or {}
+                            thinking = m.get("thinking")
+                            if thinking and on_event:
+                                on_event("thinking", {"text": thinking})
+                            delta = m.get("content", "") or ""
+                            if delta:
+                                content_parts.append(delta)
+                                if on_event:
+                                    on_event("token", {"text": delta})
+                            if m.get("tool_calls"):
+                                tool_calls.extend(m["tool_calls"])
+                            if obj.get("done"):
+                                break
+                    break
+            except QuotaExhausted:
+                raise
             except Exception:  # noqa: BLE001 - fall back to non-streaming for this step
                 resp2 = self._post_chat({**payload, "stream": False}, on_event=on_event)
                 m = resp2.json().get("message", {}) or {}

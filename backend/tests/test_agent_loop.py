@@ -594,3 +594,42 @@ def test_the_deepest_level_still_gets_room_for_a_long_file():
 
     assert num_predict_for("tapestry", 131072) > 60_000
     assert num_predict_for("tapestry", 131072) < 131072
+
+
+# --------------------------------------------------------------------------- #
+#  Conversation shape                                                          #
+# --------------------------------------------------------------------------- #
+def test_adopting_a_plan_leaves_the_turn_with_the_user():
+    """A conversation must never be handed to the model ending on its own turn.
+
+    The plan is appended as an assistant message so it reads back as a
+    commitment the model made. Left there, the conversation ENDS on an
+    assistant message and a model asked to continue from its own last turn
+    returns empty content and no tool calls — so the supervisor correctly sees
+    no progress and stops. A turn that planned successfully then produced
+    nothing, while a turn whose planning round FAILED went on to do the work.
+    Planning made the product worse.
+    """
+    a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
+    a._adopt_plan({"surface": "artifact", "goal": "g", "steps": ["one", "two"]})
+    assert a.messages[-1]["role"] == "user"
+    assert a.messages[-2]["role"] == "assistant"
+    assert "plan" in a.messages[-2]["content"].lower()
+
+
+def test_every_generation_is_asked_a_question():
+    """The invariant, checked where it actually matters: at the call site."""
+    engine = _Engine([("done", [("create_simulation", {})])])
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=1))
+
+    seen: list[str] = []
+    real = engine.generate
+
+    def spy(*, messages, **kw):
+        seen.append(messages[-1]["role"])
+        return real(messages=messages, **kw)
+
+    engine.generate = spy
+    a._adopt_plan({"surface": "artifact", "goal": "g", "steps": ["one"]})
+    a.run()
+    assert seen and all(r == "user" for r in seen), seen

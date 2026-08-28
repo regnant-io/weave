@@ -460,6 +460,20 @@ class Agent:
             "role": "assistant",
             "content": "Here is my plan:\n" + self.plan.render(),
         })
+        # ...and then hand the turn back.
+        #
+        # Without this the conversation ENDS on an assistant message, and a
+        # model asked to continue from its own last turn has nothing to respond
+        # to: it returns empty content and no tool calls. The supervisor then
+        # correctly observes that no progress was made and stops, so a turn that
+        # planned successfully produced nothing at all — while a turn whose
+        # planning round FAILED went on to do the work. Planning made the
+        # product worse, which is the kind of inversion that is invisible until
+        # you watch a whole run.
+        self.messages.append({
+            "role": "user",
+            "content": "Good. Now carry it out, starting with step 1.",
+        })
 
     # -- phase 2: work -----------------------------------------------------
 
