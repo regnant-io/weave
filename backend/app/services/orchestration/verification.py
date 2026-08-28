@@ -82,18 +82,36 @@ class Verdict:
     screenshot_key: str = ""        # storage key of the captured preview
     summary: str = ""
     duration_ms: int = 0
+    #: Design problems found by LOOKING at the render. Distinct from `errors`:
+    #: the page works, it just is not good enough yet. See `ArtifactGate.polish`.
+    polish_notes: list[str] = field(default_factory=list)
+
+    @property
+    def needs_polish(self) -> bool:
+        return bool(self.polish_notes) and self.ok and not self.exhausted
 
     @property
     def released(self) -> bool:
         """Whether the artifact should reach the user this time round."""
+        if self.needs_polish:
+            return False
         return self.ok or self.exhausted
 
 
 class ArtifactGate:
     """Per-turn verification state. One instance per turn."""
 
-    def __init__(self, project_id: str) -> None:
+    def __init__(self, project_id: str, polish=None) -> None:
+        """`polish(screenshot_b64, title, tool) -> list[str]`, or None.
+
+        Optional because LOOKING at the render costs a vision-model call, which
+        is not worth it on every turn. When supplied, an artifact that renders
+        without errors is still not finished until it also looks right — see
+        `check`. The gate does not know how the critique is produced; that keeps
+        every LLM concern out of this module.
+        """
         self.project_id = str(project_id or "shared")
+        self.polish = polish
         #: attempts keyed by artifact identity, so a model that keeps rewriting
         #: THE SAME broken scene is bounded, while a turn producing five
         #: different artifacts gets a full budget for each.
@@ -157,6 +175,25 @@ class ArtifactGate:
         ok = not errors
         exhausted = (not ok) and attempt >= MAX_REPAIRS
 
+        # LOOK at it, once it is known to work.
+        #
+        # The gate proves a page renders; it cannot tell whether it renders
+        # WELL. The first simulation this loop produced passed every check and
+        # still drew its trajectory off the top of the chart — arithmetically
+        # perfect, visually wrong. Errors and ugliness are different questions,
+        # and only one of them can be answered by counting exceptions.
+        #
+        # Skipped on the last attempt: sending the model back to polish
+        # something it can no longer resubmit is a round trip for nothing.
+        polish_notes: list[str] = []
+        if ok and self.polish and run.screenshot_b64 and attempt < MAX_REPAIRS:
+            try:
+                polish_notes = [n for n in self.polish(
+                    run.screenshot_b64, str(tool_input.get("title") or ""), tool_name,
+                ) if n][:5]
+            except Exception as exc:  # noqa: BLE001 - never block on a critique
+                log.debug("visual critique failed: %s", exc)
+
         return Verdict(
             checked=True,
             ok=ok,
@@ -166,8 +203,9 @@ class ArtifactGate:
             exhausted=exhausted,
             screenshot_key=screenshot_key,
             duration_ms=duration,
+            polish_notes=polish_notes,
             summary=(
-                "renders clean" if ok
+                ("renders clean · polishing" if polish_notes else "renders clean") if ok
                 else f"{len(errors)} problem{'s' if len(errors) != 1 else ''}"
                      f" · attempt {attempt}/{MAX_REPAIRS}"
             ),
@@ -197,6 +235,21 @@ class ArtifactGate:
             "attempt": verdict.attempt,
             "attempts_remaining": max(0, MAX_REPAIRS - verdict.attempt),
         }
+
+        if verdict.needs_polish:
+            # It works. It is not good enough yet.
+            #
+            # Deliberately NOT a hard failure — nothing is broken, so the
+            # language is about improvement rather than repair. But the artifact
+            # is still withheld, because releasing it and asking for a better
+            # one afterwards produces two versions in the transcript and leaves
+            # the reader to work out which is current.
+            out["status"] = "needs_polish"
+            out["verified"] = True
+            out["verification"]["polish"] = verdict.polish_notes
+            out.pop("output_files", None)
+            out["error"] = _polish_brief(tool_name, verdict)
+            return out
 
         if verdict.ok:
             out["status"] = "ok"
@@ -326,6 +379,31 @@ def _repair_brief(tool_name: str, verdict: Verdict) -> str:
             "setup code never ran, or it drew into an element that is not in the "
             "document. Check that a camera and a light exist for a 3D scene."
         )
+    return "\n".join(lines)
+
+
+def _polish_brief(tool_name: str, verdict: Verdict) -> str:
+    """What the model reads when its artifact works but is not good enough.
+
+    The tone matters. A repair brief says "this is broken"; that is true of a
+    scene that throws and false of a chart whose axis is badly chosen, and using
+    the same language for both teaches the model to treat design notes as noise.
+    """
+    lines = [
+        f"This renders correctly, but it is not finished. Someone looked at the "
+        f"actual picture it produces and found these problems "
+        f"(pass {verdict.attempt} of {MAX_REPAIRS}):",
+        "",
+    ]
+    lines += [f"  {i}. {n}" for i, n in enumerate(verdict.polish_notes, start=1)]
+    lines += [
+        "",
+        "It has NOT been shown to the user yet. Improve it and call "
+        f"`{tool_name}` again. Change the SPEC — the layout, the ranges, the "
+        "labels, the amount on screen — not the wording of your description of "
+        "it. If you genuinely disagree with one of these, fix the others and "
+        "say why you left it.",
+    ]
     return "\n".join(lines)
 
 

@@ -163,6 +163,23 @@ class OllamaEngine:
             return "large"
         return "small"
 
+    def vision_model(self) -> str:
+        """The best model here that can actually look at an image, or "".
+
+        Separate from `resolve_model` because the two want different things: the
+        model that writes a Babylon scene should be the strongest reasoner
+        available, while the model that answers "is anything cut off in this
+        picture" only has to have eyes. Asking a text-only model to review a
+        screenshot returns a confident description of an image it never saw,
+        which is worse than not asking.
+        """
+        candidates = [m["name"] for m in self.tags()
+                      if "vision" in self.capabilities(m["name"])]
+        if not candidates:
+            return ""
+        return max(candidates, key=lambda n: (self.supports_tools(n),
+                                              self.parameter_billions(n), n))
+
     def resolve_model(self, requested: str | None = None) -> str:
         """A model that actually EXISTS on this server and can use tools.
 

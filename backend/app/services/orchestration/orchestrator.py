@@ -320,8 +320,13 @@ class Orchestrator:
         # The artifact gate. Nothing a tool renders reaches the transcript until
         # it has been opened in a real browser — see services/orchestration/
         # verification.py for why this cannot be left to the model's discretion.
+        from .design_critic import for_turn as _critic_for_turn
         from .verification import MAX_REPAIRS, ArtifactGate
-        gate = ArtifactGate(str(project.id))
+        # At the deepest effort level, and only when a vision-capable model is
+        # available, an artifact that renders cleanly is still checked by
+        # LOOKING at it. Returns None otherwise, and the gate then does exactly
+        # what it did before.
+        gate = ArtifactGate(str(project.id), polish=_critic_for_turn(engine, effort))
 
         def tool_executor(name: str, tool_input: dict) -> dict:
             # Per-turn caps: a runaway agentic loop must not hammer the sandbox or
@@ -412,6 +417,7 @@ class Orchestrator:
                     "exhausted": verdict.exhausted,
                     "errors": verdict.errors[:4],
                     "warnings": verdict.warnings[:3],
+                    "polish": verdict.polish_notes[:4],
                     "summary": verdict.summary,
                     "ms": verdict.duration_ms,
                 })
