@@ -86,7 +86,25 @@ def thread_messages(project_id: str, thread_id: str, db: Session = Depends(get_d
         db.query(Message).filter(Message.thread_id == thread_id)
         .order_by(Message.created_at).all()
     )
-    return [MessageOut.model_validate(m) for m in rows]
+    # Skip an assistant row that holds nothing at all.
+    #
+    # The assistant placeholder is committed at the START of a turn (so the
+    # write lock is not held for its whole duration), which means a turn killed
+    # mid-flight — a crash, a hard client disconnect — leaves a row with no
+    # content, no steps and no artifacts. There is nothing in it to render, and
+    # a blank bubble in the transcript reads as the assistant having failed to
+    # answer rather than as a turn that never completed.
+    return [MessageOut.model_validate(m) for m in rows if _has_content(m)]
+
+
+def _has_content(m: Message) -> bool:
+    """Whether this row has anything worth showing."""
+    if m.role != "assistant":
+        return True
+    return bool(
+        (m.content_en or "").strip() or (m.content_sw or "").strip()
+        or m.tool_calls or m.artifacts
+    )
 
 
 @router.patch("/projects/{project_id}/threads/{thread_id}", response_model=ThreadOut)
