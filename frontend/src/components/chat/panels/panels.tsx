@@ -5,12 +5,14 @@ import type { Artifact, Citation, Dataset, Language, WebImage } from "@/lib/type
 import PanelFrame, { PanelEmpty } from "./PanelFrame";
 import { ArtifactGrid, ArtifactView, FocusBar } from "./ArtifactViewer";
 import CanvasPanel from "../CanvasPanel";
+import PreviewPanel from "../PreviewPanel";
 import {
   IcoChart,
   IcoCube,
   IcoDataset,
   IcoFile,
   IcoImage,
+  IcoPlay,
   IcoQuote,
 } from "@/components/ui/icons";
 
@@ -24,6 +26,7 @@ import {
  */
 
 export type PanelId =
+  | "preview"
   | "canvas"
   | "charts"
   | "visuals"
@@ -52,6 +55,8 @@ export function categorise(a: Artifact): PanelId {
 }
 
 export interface PanelData {
+  /** URL of the dev server the assistant has running, if any. */
+  previewUrl?: string;
   artifacts: Artifact[];
   images: WebImage[];
   citations: Citation[];
@@ -64,6 +69,7 @@ export const PANEL_META: Record<
   PanelId,
   { icon: any; label: [sw: string, en: string]; width: number }
 > = {
+  preview: { icon: IcoPlay, label: ["Onyesho", "Live app"], width: 620 },
   canvas: { icon: IcoFile, label: ["Ubao", "Canvas"], width: 520 },
   charts: { icon: IcoChart, label: ["Chati", "Charts"], width: 440 },
   visuals: { icon: IcoCube, label: ["Taswira", "Visuals & 3D"], width: 560 },
@@ -74,11 +80,16 @@ export const PANEL_META: Record<
 };
 
 export const PANEL_ORDER: PanelId[] = [
-  "canvas", "charts", "visuals", "docs", "images", "data", "sources",
+  // Preview first: when there IS a running app it is the most important thing
+  // on screen, and when there is not it costs one greyed-out row.
+  "preview", "canvas", "charts", "visuals", "docs", "images", "data", "sources",
 ];
 
 export function panelCounts(d: PanelData): Record<PanelId, number> {
   const c: Record<PanelId, number> = {
+    // 1 when an app is actually running, so the dock badge reads as a live
+    // indicator rather than a tally.
+    preview: d.previewUrl ? 1 : 0,
     // The canvas is a single living document, not a collection, so it has no
     // meaningful count — the dock shows the icon without a badge.
     canvas: 0,
@@ -162,9 +173,11 @@ export function Panel({
       icon={meta.icon}
       onClose={onClose}
       defaultWidth={meta.width}
-      padded={id !== "canvas"}
+      padded={id !== "canvas" && id !== "preview"}
     >
-      {id === "canvas" ? (
+      {id === "preview" ? (
+        <PreviewPanel url={data.previewUrl ?? ""} language={language} />
+      ) : id === "canvas" ? (
         <CanvasPanel projectId={data.projectId} language={language} />
       ) : id === "images" ? (
         <ImagesBody images={data.images} language={language} />

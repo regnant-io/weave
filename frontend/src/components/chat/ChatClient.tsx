@@ -169,6 +169,20 @@ export default function ChatClient({
    * the first second of a turn rather than only once tokens appear.
    */
   const [steerTurn, setSteerTurn] = useState<string | null>(null);
+  /**
+   * The dev server the assistant currently has running, if any.
+   *
+   * Held on the CLIENT rather than on a turn, because a server outlives the
+   * turn that started it — the container keeps running between turns, which is
+   * the whole point of it being persistent.
+   */
+  const [previewUrl, setPreviewUrl] = useState("");
+  //: A transient explanation of why this turn behaved unusually — rate limited,
+  //: answered by the offline fallback. Cleared when the next turn starts.
+  const [notice, setNotice] = useState<string | null>(null);
+  //: Whether an app has ever appeared this session. Used to auto-open the panel
+  //: exactly once, so a user who closes it is not fighting us.
+  const previewSeen = useRef(false);
   /** Transient message from the steering path ("noted for the next turn"). */
   const [steerNote, setSteerNote] = useState<string | null>(null);
   /** Set when history had to be trimmed to fit the model's window. */
@@ -460,6 +474,7 @@ export default function ChatClient({
 
   async function runTurn(content: string, regenerate: boolean) {
     setStreaming(true);
+    setNotice(null);
     activeStep.current = null;
     scroller.pin();
 
@@ -537,6 +552,21 @@ export default function ChatClient({
           case "phase":
             patchLast((m) => ({ ...m, phase: String(data.name ?? "") }));
             break;
+
+          /* ---- a dev server the assistant started ---- */
+          case "preview": {
+            const next = String(data.url ?? "");
+            setPreviewUrl(next);
+            // Open the panel the first time an app actually exists. Building
+            // something runnable and leaving it behind a closed drawer is the
+            // same as not running it, and after that the user's own choice to
+            // close the panel is respected.
+            if (next && !previewSeen.current) {
+              previewSeen.current = true;
+              dock.open.includes("preview") || dock.toggle("preview");
+            }
+            break;
+          }
           case "continuing":
             // The model stopped early and is being sent back to finish. Say so
             // in the timeline: an unexplained second burst of work reads as the
@@ -549,8 +579,7 @@ export default function ChatClient({
                 language === "sw"
                   ? `Bado hakijakamilika — inaendelea (${(data.gaps ?? []).length})`
                   : `Not finished yet — continuing (${(data.gaps ?? []).length} outstanding)`,
-              detail: (data.gaps ?? []).join("
-"),
+              detail: (data.gaps ?? []).join("\n"),
               state: "done",
               substeps: [],
               artifacts: [],
@@ -571,8 +600,7 @@ export default function ChatClient({
                   : language === "sw"
                     ? "Ukaguzi umepita"
                     : "Reviewed — no problems found",
-              detail: (data.defects ?? []).join("
-"),
+              detail: (data.defects ?? []).join("\n"),
               state: data.verdict === "revise" ? "error" : "done",
               substeps: [],
               artifacts: [],
@@ -764,6 +792,14 @@ export default function ChatClient({
             );
             break;
 
+          /* ---- something the user needs to know about this turn ---- */
+          case "notice":
+            // Rate limits and fallbacks. Surfaced in the timeline rather than
+            // as a toast: it explains the shape of THIS answer, so it has to
+            // stay attached to it when the transcript is read back later.
+            setNotice(String(data.text ?? ""));
+            break;
+
           /* ---- context lifecycle ---- */
           case "context_trimmed":
             // Say it out loud. Silently dropping the start of a conversation is
@@ -862,6 +898,7 @@ export default function ChatClient({
 
   const payload = useMemo(
     () => ({
+      previewUrl,
       artifacts: turns.flatMap(turnArtifacts),
       images: turns.flatMap((t) => t.images) as WebImage[],
       citations: turns.flatMap((t) => t.citations) as Citation[],
@@ -870,7 +907,7 @@ export default function ChatClient({
       // turn stream, so it needs the project it belongs to.
       projectId,
     }),
-    [turns, datasets, projectId],
+    [turns, datasets, projectId, previewUrl],
   );
 
   const counts = useMemo(() => panelCounts(payload), [payload]);
@@ -1048,6 +1085,8 @@ export default function ChatClient({
                 />
               ),
             )}
+
+            {notice && <Notice tone="warn" text={notice} />}
 
             {trimmed && !rolled && (
               <Notice

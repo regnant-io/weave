@@ -593,8 +593,28 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 # Remote LLM (Ollama/Anthropic) failed after retries -> degrade to
                 # the offline engine so the turn still completes rather than 500s.
+                #
+                # SAY SO. A silent degrade is the worst of both worlds: the user
+                # gets the deterministic fallback's much thinner answer and has
+                # no way to know it is not what the model would have said, so
+                # they conclude the product is bad rather than that the provider
+                # was unavailable. Rate limiting is the common cause and is
+                # temporary, which makes telling them doubly worth it — the fix
+                # is to wait a minute and ask again.
                 log.warning("LLM engine '%s' failed (%s); falling back to offline",
                             getattr(engine, "name", "?"), exc)
+                rate_limited = "429" in str(exc) or "Too Many Requests" in str(exc)
+                _emit("notice", {
+                    "kind": "degraded",
+                    "text": (
+                        "The model provider is rate-limiting this account, so this "
+                        "answer came from the offline fallback rather than the model. "
+                        "Try again shortly."
+                        if rate_limited else
+                        "The language model could not be reached, so this answer came "
+                        "from the offline fallback rather than the model."
+                    ),
+                })
                 answer, tier_used = self._offline_turn(
                     project, language, route, user_text, passages, integrity,
                     dataset, tool_events, tool_executor, web_enabled="websearch" in services,

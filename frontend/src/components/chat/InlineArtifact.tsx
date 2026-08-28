@@ -2,7 +2,14 @@
 
 import { memo, useEffect, useRef, useState } from "react";
 import type { Artifact, Language } from "@/lib/types";
-import { IcoDownload, IcoExternal, IcoFile, IcoMaximize } from "@/components/ui/icons";
+import {
+  IcoCheck,
+  IcoDownload,
+  IcoExternal,
+  IcoFile,
+  IcoMaximize,
+  IcoWarn,
+} from "@/components/ui/icons";
 
 /**
  * Generated output, rendered WHERE IT WAS PRODUCED.
@@ -75,6 +82,49 @@ function useNearViewport<T extends HTMLElement>(rootMargin = "600px") {
   return { ref, near };
 }
 
+/**
+ * Whether this artifact was opened in a real browser before being shown.
+ *
+ * Only rendered when the answer is INTERESTING. A green tick on every single
+ * output is decoration people stop reading within a day; what has to be
+ * impossible to miss is the other case — an artifact released with known
+ * defects after the repair budget ran out. The user is looking at something
+ * that does not fully work, and they should learn that from the interface
+ * rather than by clicking it.
+ */
+function VerifyBadge({ a, language }: { a: Artifact; language: Language }) {
+  const sw = language === "sw";
+  if (a.verified === undefined) return null;
+
+  if (a.verified) {
+    return (
+      <span
+        className="inline-flex shrink-0 items-center gap-1 text-ok"
+        title={sw ? "Ilifunguliwa kwenye kivinjari halisi bila hitilafu"
+                  : "Opened in a real browser; rendered without errors"}
+      >
+        <IcoCheck size={11} />
+        <span className="text-2xs uppercase tracking-widest">
+          {sw ? "Imehakikiwa" : "Verified"}
+        </span>
+      </span>
+    );
+  }
+
+  const defects = a.defects ?? [];
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-1 text-warn"
+      title={defects.join("\n") || (sw ? "Bado ina matatizo" : "Still has problems")}
+    >
+      <IcoWarn size={11} />
+      <span className="text-2xs uppercase tracking-widest">
+        {sw ? "Ina hitilafu" : "Has known faults"}
+      </span>
+    </span>
+  );
+}
+
 function Chrome({
   a,
   language,
@@ -92,6 +142,7 @@ function Chrome({
       <div className="inline-artifact-body">{children}</div>
       <figcaption className="inline-artifact-bar">
         <span className="min-w-0 flex-1 truncate">{a.name}</span>
+        <VerifyBadge a={a} language={language} />
         {onOpen && (
           <button
             type="button"
@@ -181,6 +232,19 @@ function InlineArtifactInner({
                  puts the page in an opaque origin. */
               sandbox={kind === "pdf" ? undefined : "allow-scripts"}
               className="h-full w-full border-0 bg-white"
+            />
+          ) : a.preview ? (
+            /* The screenshot taken while VERIFYING this page — a real picture of
+               the real thing, so an unmounted embed still shows what it is
+               instead of a line of grey text. It is also the only honest
+               placeholder available: it is what the page actually rendered. */
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={a.preview}
+              alt={a.name}
+              loading="lazy"
+              decoding="async"
+              className="h-full w-full bg-white object-cover object-top opacity-90"
             />
           ) : (
             <div className="flex h-full items-center justify-center text-xs text-fg-faint">
