@@ -373,3 +373,90 @@ def test_cloud_tags_are_classified_large():
     assert e.model_class("gemma4:cloud") == "large"
     assert e.model_class("gpt-oss:120b-cloud") == "large"
     assert e.model_class("smollm:135m") == "small"
+
+
+# --------------------------------------------------------------------------- #
+#  Rate limit vs. quota — the same status code, different remedies             #
+# --------------------------------------------------------------------------- #
+class _Resp:
+    def __init__(self, text):
+        self.text = text
+        self.headers = {}
+
+
+def test_a_session_limit_is_recognised_as_quota_not_backpressure():
+    """Ollama Cloud's real body when a free account runs out.
+
+    A burst limit clears in seconds so backing off is right; a session limit
+    does not clear at all, so backing off spends 45 seconds arriving at the
+    same failure and then silently degrades the answer.
+    """
+    from app.services.orchestration.llm import OllamaEngine
+
+    body = ('{"error":"you (someone) have reached your session usage limit, '
+            'upgrade for higher limits: https://ollama.com/upgrade"}')
+    msg = OllamaEngine._quota_message(_Resp(body))
+    assert "session usage limit" in msg
+    # The provider's own words survive: they name the account and the fix.
+    assert "ollama.com/upgrade" in msg
+
+
+def test_plain_backpressure_is_not_treated_as_quota():
+    from app.services.orchestration.llm import OllamaEngine
+
+    assert OllamaEngine._quota_message(_Resp('{"error":"too many requests"}')) == ""
+    assert OllamaEngine._quota_message(_Resp("")) == ""
+
+
+# --------------------------------------------------------------------------- #
+#  The review verdict                                                          #
+# --------------------------------------------------------------------------- #
+class _ReviewEngine:
+    """An engine whose only behaviour is to submit one review."""
+
+    name = "stub"
+
+    def __init__(self, verdict, defects):
+        self.verdict, self.defects = verdict, defects
+
+    def generate(self, *, tool_executor, tools, **kw):
+        if any(t["name"] == "submit_review" for t in tools):
+            tool_executor("submit_review",
+                          {"verdict": self.verdict, "defects": self.defects})
+        return _Turn("")
+
+
+@pytest.mark.parametrize("verdict", ["revise", "fail", "reject", "needs_work"])
+def test_any_verdict_that_is_not_pass_sends_the_work_back(verdict):
+    """The enum says pass|revise; a model returned "fail".
+
+    Testing `== "revise"` read that as a pass and silently discarded three
+    defects the critic had just raised. With a two-value enum these models still
+    produce a third value, so the default has to be the one that re-examines the
+    work rather than the one that ships it.
+    """
+    a = _agent(_ReviewEngine(verdict, ["the trajectory never redraws"]),
+               ag.LoopPolicy(plan=False, review=True))
+    assert a._review() == ["the trajectory never redraws"]
+
+
+def test_pass_really_does_pass():
+    a = _agent(_ReviewEngine("pass", []), ag.LoopPolicy(plan=False, review=True))
+    assert a._review() == []
+
+
+def test_a_verdict_with_no_defects_does_not_trigger_a_repair_round():
+    """'revise' with nothing to act on would loop for no reason."""
+    a = _agent(_ReviewEngine("revise", []), ag.LoopPolicy(plan=False, review=True))
+    assert a._review() == []
+
+
+def test_the_work_log_states_verification_unmissably():
+    """The critic claimed 'no evidence this was verified' while the log said it was."""
+    a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
+    a.tool_events = [{
+        "name": "create_simulation", "input": {},
+        "result": {"status": "ok", "verification": {"ran": True, "ok": True},
+                   "output_files": [{"name": "sim.html"}]},
+    }]
+    assert "OPENED IN A REAL BROWSER" in a._work_summary()

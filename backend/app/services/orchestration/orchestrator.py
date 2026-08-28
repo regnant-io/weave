@@ -603,18 +603,25 @@ class Orchestrator:
                 # is to wait a minute and ask again.
                 log.warning("LLM engine '%s' failed (%s); falling back to offline",
                             getattr(engine, "name", "?"), exc)
-                rate_limited = "429" in str(exc) or "Too Many Requests" in str(exc)
-                _emit("notice", {
-                    "kind": "degraded",
-                    "text": (
-                        "The model provider is rate-limiting this account, so this "
-                        "answer came from the offline fallback rather than the model. "
-                        "Try again shortly."
-                        if rate_limited else
-                        "The language model could not be reached, so this answer came "
-                        "from the offline fallback rather than the model."
-                    ),
-                })
+                from .llm import QuotaExhausted
+                if isinstance(exc, QuotaExhausted):
+                    # Relay the provider's own words. They name the account and
+                    # the upgrade path; anything we substitute is vaguer, and
+                    # this is the one message the user can actually act on.
+                    text = (
+                        f"The model provider refused this request: {exc}. "
+                        "This answer came from the offline fallback. Wait for the "
+                        "limit to reset, upgrade the plan, or choose a different "
+                        "model in the composer."
+                    )
+                elif "429" in str(exc) or "Too Many Requests" in str(exc):
+                    text = ("The model provider is rate-limiting this account, so this "
+                            "answer came from the offline fallback rather than the "
+                            "model. Try again shortly.")
+                else:
+                    text = ("The language model could not be reached, so this answer "
+                            "came from the offline fallback rather than the model.")
+                _emit("notice", {"kind": "degraded", "text": text})
                 answer, tier_used = self._offline_turn(
                     project, language, route, user_text, passages, integrity,
                     dataset, tool_events, tool_executor, web_enabled="websearch" in services,
