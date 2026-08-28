@@ -208,7 +208,10 @@ class OllamaEngine:
             log.warning(
                 "configured Ollama model %r is not present on %s; using %r instead. "
                 "Pull it, or set WEAVE_OLLAMA_MODEL to one of: %s",
-                requested, self._client.base_url, best, ", ".join(usable[:8]),
+                # Defensive: this is the diagnostic for a misconfiguration, and
+                # it must not itself be able to raise on the way out.
+                requested, getattr(self._client, "base_url", "the configured host"),
+                best, ", ".join(usable[:8]),
             )
         return best
 

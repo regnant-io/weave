@@ -17,6 +17,9 @@ services:
   backend:
     volumes:
       - ./backend/app:/app/app
+      # Tests too, so the suite can be run against the mounted source
+      # rather than whatever was baked into the image.
+      - ./backend/tests:/app/tests
       - backend_var:/app/var
       - /var/run/docker.sock:/var/run/docker.sock
       - workspaces:/app/var/workspaces
