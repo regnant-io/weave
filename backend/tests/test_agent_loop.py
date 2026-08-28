@@ -460,3 +460,104 @@ def test_the_work_log_states_verification_unmissably():
                    "output_files": [{"name": "sim.html"}]},
     }]
     assert "OPENED IN A REAL BROWSER" in a._work_summary()
+
+
+# --------------------------------------------------------------------------- #
+#  The design critic: judging the picture, not the code                        #
+# --------------------------------------------------------------------------- #
+class _VisionEngine:
+    """An engine that records what it was shown and returns a fixed verdict."""
+
+    name = "stub"
+
+    def __init__(self, verdict, problems, vision="gemma4:cloud"):
+        self.verdict, self.problems, self._vision = verdict, problems, vision
+        self.saw_image = False
+        self.model_used = ""
+
+    def vision_model(self):
+        return self._vision
+
+    def generate(self, *, messages, tool_executor, model=None, **kw):
+        self.model_used = model or ""
+        self.saw_image = any(m.get("images") for m in messages)
+        tool_executor("submit_visual_review",
+                      {"verdict": self.verdict, "problems": self.problems})
+        return _Turn("")
+
+
+def test_the_critic_is_only_paid_for_at_the_deepest_effort():
+    """A vision call on every quick answer would make the product slower
+    exactly when people want it fast."""
+    from app.services.orchestration.design_critic import for_turn
+
+    engine = _VisionEngine("good", [])
+    assert for_turn(engine, "weave") is None
+    assert for_turn(engine, "spool") is None
+    assert for_turn(engine, "tapestry") is not None
+
+
+def test_no_vision_model_means_no_critic():
+    """Asking a text-only model to review a screenshot returns a confident
+    description of an image it never saw."""
+    from app.services.orchestration.design_critic import for_turn
+
+    assert for_turn(_VisionEngine("good", [], vision=""), "tapestry") is None
+    assert for_turn(object(), "tapestry") is None
+
+
+def test_the_critic_actually_sends_the_image():
+    from app.services.orchestration.design_critic import for_turn
+
+    engine = _VisionEngine("needs_work", ["the curve is cut off at the top"])
+    critic = for_turn(engine, "tapestry")
+    assert critic("BASE64DATA", "Projectile Motion", "create_simulation") == [
+        "the curve is cut off at the top"
+    ]
+    assert engine.saw_image, "the screenshot never reached the model"
+    assert engine.model_used == "gemma4:cloud"
+
+
+def test_good_is_a_cheap_answer():
+    from app.services.orchestration.design_critic import for_turn
+
+    engine = _VisionEngine("good", [])
+    assert for_turn(engine, "tapestry")("IMG", "t", "create_diagram") == []
+
+
+def test_needs_work_with_nothing_actionable_is_treated_as_good():
+    """'make it better' is not something a model can act on."""
+    from app.services.orchestration.design_critic import for_turn
+
+    engine = _VisionEngine("needs_work", ["", "  ", "short"])
+    assert for_turn(engine, "tapestry")("IMG", "t", "create_diagram") == []
+
+
+def test_a_polish_note_withholds_the_artifact_and_asks_for_better():
+    """It works, so the language is improvement — but it is still not shown yet.
+
+    Releasing it and asking for a better one afterwards puts two versions in
+    the transcript and leaves the reader to work out which is current.
+    """
+    verdict = Verdict(checked=True, ok=True, attempt=1,
+                      polish_notes=["the trajectory is clipped at the top of the chart"])
+    assert verdict.needs_polish and not verdict.released
+    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
+                             verdict, "create_simulation")
+    assert out["status"] == "needs_polish"
+    assert out["verified"] is True, "nothing is broken; it renders"
+    assert "output_files" not in out
+    assert "clipped at the top" in out["error"]
+    assert "Change the SPEC" in out["error"]
+
+
+def test_polish_is_skipped_on_the_final_attempt():
+    """Sending the model back to improve something it can no longer resubmit
+    is a round trip for nothing."""
+    calls = []
+    gate = ArtifactGate("proj", polish=lambda *a: calls.append(a) or ["something"])
+    gate._attempts["proj:create_diagram:t"] = MAX_REPAIRS - 1
+    # No html in the result, so check() returns before probing — enough to show
+    # the budget arithmetic without needing a browser.
+    gate.check("create_diagram", {"title": "t"}, {"status": "ok"})
+    assert calls == []
