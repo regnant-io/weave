@@ -1,0 +1,255 @@
+# Weave — full stack.
+#
+# Default (no profile): backend (SQLite + offline/anthropic LLM + subprocess
+# sandbox) + frontend. Boots with zero external services.
+#
+#   docker compose up --build
+#     frontend -> http://localhost:3000
+#     backend  -> http://localhost:8000  (docs at /docs)
+#
+# Production-shaped services (Postgres + Redis) are behind the "full" profile:
+#   docker compose --profile full up --build
+# and point WEAVE_DATABASE_URL at the postgres service.
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      # Host 8001 -> container 8000 (8000 on the host may be taken by another app).
+      - "8001:8000"
+    environment:
+      WEAVE_ENVIRONMENT: dev
+      WEAVE_CORS_ORIGINS: '["http://localhost:3000"]'
+      # LLM backend: auto | ollama | anthropic | offline
+      WEAVE_LLM_BACKEND: ${WEAVE_LLM_BACKEND:-auto}
+      # Reach an Ollama server running on the host from inside the container.
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-http://host.docker.internal:11434}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-llama3.2:3b}
+      # Optional: use Ollama for retrieval embeddings too (needs the embed model pulled).
+      WEAVE_OLLAMA_USE_EMBEDDINGS: ${WEAVE_OLLAMA_USE_EMBEDDINGS:-false}
+      WEAVE_OLLAMA_EMBED_MODEL: ${WEAVE_OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      # Provide a real key to use Claude instead; omit to run the offline engine.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Deep-capability services (populated when the "deep" profile is up; empty
+      # otherwise, so the tools simply report themselves unavailable).
+      WEAVE_SEARXNG_URL: ${WEAVE_SEARXNG_URL:-}
+      WEAVE_BROWSERLESS_URL: ${WEAVE_BROWSERLESS_URL:-}
+      WEAVE_RENDER_URL: ${WEAVE_RENDER_URL:-}
+      WEAVE_GOTENBERG_URL: ${WEAVE_GOTENBERG_URL:-}
+      WEAVE_CLICKHOUSE_URL: ${WEAVE_CLICKHOUSE_URL:-}
+      # Optional server-side voice. Empty (the default) means the BROWSER does
+      # both recognition and synthesis with the Web Speech API — no models, no
+      # GPU, works on a mid-range Android. Bring these up with --profile voice
+      # for much better Kiswahili at a considerable resource cost.
+      WEAVE_STT_URL: ${WEAVE_STT_URL:-}
+      WEAVE_TTS_URL: ${WEAVE_TTS_URL:-}
+      # Background jobs / cache / observability / channels (all optional).
+      WEAVE_REDIS_URL: ${WEAVE_REDIS_URL:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      WEAVE_SMS_PROVIDER: ${WEAVE_SMS_PROVIDER:-log}
+      WEAVE_AT_USERNAME: ${WEAVE_AT_USERNAME:-}
+      WEAVE_AT_API_KEY: ${WEAVE_AT_API_KEY:-}
+      WEAVE_WA_VERIFY_TOKEN: ${WEAVE_WA_VERIFY_TOKEN:-weave-verify}
+      WEAVE_WA_TOKEN: ${WEAVE_WA_TOKEN:-}
+      WEAVE_WA_PHONE_ID: ${WEAVE_WA_PHONE_ID:-}
+      # Use Postgres+pgvector instead of SQLite (bring up with --profile full):
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-}
+      # --- developer workspace (the SECOND sandbox) ---
+      # Where the assistant builds software: network on, dependencies
+      # installable, results packaged as a tarball. Set to false before exposing
+      # Weave to people you do not trust — every verified user can run commands
+      # in a container on this host.
+      WEAVE_WORKSPACE_ENABLED: ${WEAVE_WORKSPACE_ENABLED:-true}
+      WEAVE_WORKSPACE_IMAGE: ${WEAVE_WORKSPACE_IMAGE:-weave-workspace:latest}
+    extra_hosts:
+      # Lets host.docker.internal resolve to the host on Linux too (already works
+      # on Docker Desktop for Mac/Windows).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - backend_var:/app/var
+      # The workspace service shells out to `docker run`, so the backend needs
+      # the host's Docker socket. This is a real privilege grant — a process
+      # that can talk to this socket can start privileged containers — which is
+      # why workspace execution is gated to verified users and can be turned off
+      # entirely with WEAVE_WORKSPACE_ENABLED=false.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspaces are bind-mounted INTO the exec container by host path, so the
+      # backend and the host must agree on where they live.
+      - ${WEAVE_WORKSPACE_HOST_DIR:-./var/workspaces}:/app/var/workspaces
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      WEAVE_API_BASE: http://backend:8000
+      # Where the BROWSER opens WebSockets (live voice, screen share, the shared
+      # canvas). Next.js route handlers proxy HTTP but not upgrade requests, so
+      # sockets go straight to the API — which means this has to be an address
+      # the browser can reach, not the internal service name. Override it when
+      # deploying behind a domain, e.g. wss://weave.example.tz.
+      WEAVE_PUBLIC_WS_BASE: ${WEAVE_PUBLIC_WS_BASE:-ws://localhost:8001}
+      NODE_ENV: production
+    depends_on:
+      - backend
+
+  postgres:
+    # pgvector image so the vector extension is available (architecture §2).
+    image: pgvector/pgvector:pg16
+    profiles: ["full"]
+    environment:
+      POSTGRES_USER: weave
+      POSTGRES_PASSWORD: weave
+      POSTGRES_DB: weave
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["full"]
+    ports:
+      - "6379:6379"
+
+  worker:
+    # Celery worker for background jobs (ingestion, heavy analysis, re-summarize).
+    build: ./backend
+    profiles: ["full"]
+    command: ["celery", "-A", "app.tasks", "worker", "--loglevel=info"]
+    environment:
+      WEAVE_REDIS_URL: redis://redis:6379/0
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-postgresql+psycopg://weave:weave@postgres:5432/weave}
+      WEAVE_OLLAMA_HOST: ${WEAVE_OLLAMA_HOST:-http://host.docker.internal:11434}
+      WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-llama3.2:3b}
+    depends_on:
+      - redis
+    volumes:
+      - backend_var:/app/var
+
+  # ---- Deep-capability services (profile: deep) --------------------------
+  # Start with:  docker compose --profile deep up -d
+  # then point the backend at them (see .env: WEAVE_SEARXNG_URL=http://searxng:8080 etc.)
+
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["deep"]
+    ports:
+      - "8888:8080"
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8888/
+    volumes:
+      # Bind-mount our settings.yml (enables the JSON API + disables the limiter).
+      - ./searxng:/etc/searxng:ro
+
+  browserless:
+    # Headless-Chrome pool for JS-rendered fetches + screenshots + PDF.
+    image: ghcr.io/browserless/chromium:latest
+    profiles: ["deep"]
+    ports:
+      - "3001:3000"
+    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
+    environment:
+      CONCURRENT: "4"
+      TOKEN: ""
+
+  gotenberg:
+    # Deterministic HTML/Markdown -> PDF for decks and reports.
+    image: gotenberg/gotenberg:8
+    profiles: ["deep"]
+    command:
+      - "gotenberg"
+      - "--chromium-start-timeout=60s"       # Chromium is slow to boot under load
+      - "--api-timeout=120s"
+    ports:
+      - "3002:3000"
+    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
+
+  render:
+    # Node render-sandbox: AI specs -> charts / Three.js / Babylon.js scenes /
+    # decks (see render-service/). Babylon bundles are large, so this image
+    # takes a few minutes to build the first time.
+    build: ./render-service
+    profiles: ["deep"]
+    ports:
+      - "3100:3100"
+
+  # ---- optional server-side voice (profile: voice) ------------------------
+  # The DEFAULT voice path needs none of this: the browser's Web Speech API does
+  # recognition and synthesis on the device, which is why live voice works out of
+  # the box on a phone. These two exist for deployments that want much better
+  # Kiswahili and can afford the models.
+  #
+  #   docker compose --profile deep --profile voice up -d
+  #   WEAVE_STT_URL=http://whisper:8080 WEAVE_TTS_URL=http://piper:5000 ...
+  #
+  # First boot downloads a model, so give it a few minutes before it answers.
+  whisper:
+    image: ghcr.io/ggerganov/whisper.cpp:main
+    profiles: ["voice"]
+    command: ["./server", "-m", "/models/ggml-base.bin", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8090:8080"
+    volumes:
+      - whisper_models:/models
+
+  piper:
+    image: lscr.io/linuxserver/piper:latest
+    profiles: ["voice"]
+    environment:
+      PIPER_VOICE: ${PIPER_VOICE:-en_GB-alba-medium}
+      PIPER_LENGTH: "1.0"
+    ports:
+      - "10200:10200"
+    volumes:
+      - piper_data:/config
+
+  # ---- developer-workspace image (built, never run as a service) ----------
+  # `docker compose --profile build-images build workspace-image` produces the
+  # image the backend starts per command. It is defined here so the build is one
+  # command rather than a README instruction people miss.
+  workspace-image:
+    build: ./workspace-image
+    image: weave-workspace:latest
+    profiles: ["build-images"]
+    command: ["true"]
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["deep"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: weave
+      MINIO_ROOT_PASSWORD: weave-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    profiles: ["deep"]
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    profiles: ["deep"]
+    ports:
+      - "8123:8123"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+volumes:
+  backend_var:
+  pg_data:
+  minio_data:
+  qdrant_data:
+  clickhouse_data:
+  whisper_models:
+  piper_data:

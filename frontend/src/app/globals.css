@@ -1,0 +1,1070 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   WEAVE — Editorial Hybrid design system
+   ----------------------------------------------------------------------------
+   Derived from design.md (Minimalist Monochrome) with two deliberate overrides
+   agreed with the product owner:
+
+     1. ACCENT — design.md forbids accent colour. We use a single burnt-orange
+        ink instead. It is the ONLY hue in the system; everything else is a warm
+        monochrome ramp. Warm neutrals (not cold greys) are what let the orange
+        read as *ink on paper* rather than as a UI highlight.
+
+     2. MOTION — design.md wants instant/binary transitions. We want organic.
+        Motion here is slow-out, never bouncy, and always interruptible. The
+        easing curves below are the whole personality: --ease-out-expo for
+        anything that reveals, --ease-out-soft for anything that responds.
+
+   Everything else is faithful: line-based structure, dramatic negative space,
+   typography as the hero, layered textures instead of flat fills, inversion for
+   emphasis. Corners are sharp on CONTENT (blocks, cards, rules) and softened
+   only on CHROME (controls the thumb touches) — that is the "hybrid".
+
+   Light + dark are full peers. Every token is redefined, none inherited.
+   ========================================================================== */
+
+:root,
+:root[data-theme="light"] {
+  /* -- warm monochrome ramp (paper) -- */
+  --bg: #ffffff;
+  --bg-subtle: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f4f3f0;
+  --surface-3: #edece8;
+  --surface-hover: #e9e7e2;
+  --border: #e4e2dd;          /* hairline — structure without mass */
+  --border-mid: #cfccc5;
+  --border-strong: #12110f;   /* editorial rule — full ink */
+  --fg: #12110f;
+  --fg-muted: #57544e;
+  --fg-faint: #8c887f;
+
+  /* -- the single hue -- */
+  --accent: #d4451d;
+  --accent-strong: #a8320f;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(212, 69, 29, 0.08);
+  --accent-line: rgba(212, 69, 29, 0.3);
+  --accent-glow: rgba(212, 69, 29, 0.22);
+
+  /* -- status (desaturated to sit beside the orange, never compete) -- */
+  --danger: #b3261e;
+  --danger-soft: rgba(179, 38, 30, 0.1);
+  --warn: #8a6100;
+  --warn-soft: rgba(138, 97, 0, 0.1);
+  --ok: #2f6b46;
+  --ok-soft: rgba(47, 107, 70, 0.1);
+
+  /* -- depth: chrome only, and barely -- */
+  --shadow-sm: 0 1px 2px rgba(18, 17, 15, 0.04);
+  --shadow: 0 1px 2px rgba(18, 17, 15, 0.04), 0 8px 24px rgba(18, 17, 15, 0.06);
+  --shadow-lg: 0 2px 8px rgba(18, 17, 15, 0.06), 0 24px 64px rgba(18, 17, 15, 0.12);
+
+  /* -- texture inks -- */
+  --texture-ink: 18, 17, 15;
+  --texture-strength: 0.028;
+  --noise-strength: 0.02;
+
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0c0b0a;
+  --bg-subtle: #121110;
+  --surface: #151412;
+  --surface-2: #1d1b19;
+  --surface-3: #26241f;
+  --surface-hover: #2c2925;
+  --border: #2a2724;
+  --border-mid: #3d3934;
+  --border-strong: #f2f0eb;
+  --fg: #f2f0eb;
+  --fg-muted: #a8a399;
+  --fg-faint: #6e6a62;
+
+  --accent: #ff7043;
+  --accent-strong: #ff8a65;
+  --accent-fg: #1a0a04;
+  --accent-soft: rgba(255, 112, 67, 0.12);
+  --accent-line: rgba(255, 112, 67, 0.34);
+  --accent-glow: rgba(255, 112, 67, 0.3);
+
+  --danger: #ff6b6b;
+  --danger-soft: rgba(255, 107, 107, 0.13);
+  --warn: #e0a740;
+  --warn-soft: rgba(224, 167, 64, 0.13);
+  --ok: #5fbe8a;
+  --ok-soft: rgba(95, 190, 138, 0.13);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 2px 8px rgba(0, 0, 0, 0.5), 0 24px 64px rgba(0, 0, 0, 0.66);
+
+  --texture-ink: 242, 240, 235;
+  --texture-strength: 0.032;
+  --noise-strength: 0.024;
+
+  color-scheme: dark;
+}
+
+/* Follow the OS when the user has expressed no preference. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #0c0b0a;
+    --bg-subtle: #121110;
+    --surface: #151412;
+    --surface-2: #1d1b19;
+    --surface-3: #26241f;
+    --surface-hover: #2c2925;
+    --border: #2a2724;
+    --border-mid: #3d3934;
+    --border-strong: #f2f0eb;
+    --fg: #f2f0eb;
+    --fg-muted: #a8a399;
+    --fg-faint: #6e6a62;
+    --accent: #ff7043;
+    --accent-strong: #ff8a65;
+    --accent-fg: #1a0a04;
+    --accent-soft: rgba(255, 112, 67, 0.12);
+    --accent-line: rgba(255, 112, 67, 0.34);
+    --accent-glow: rgba(255, 112, 67, 0.3);
+    --danger: #ff6b6b;
+    --danger-soft: rgba(255, 107, 107, 0.13);
+    --warn: #e0a740;
+    --warn-soft: rgba(224, 167, 64, 0.13);
+    --ok: #5fbe8a;
+    --ok-soft: rgba(95, 190, 138, 0.13);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 2px 8px rgba(0, 0, 0, 0.5), 0 24px 64px rgba(0, 0, 0, 0.66);
+    --texture-ink: 242, 240, 235;
+    --texture-strength: 0.032;
+    --noise-strength: 0.024;
+    color-scheme: dark;
+  }
+}
+
+/* -- shape: sharp content, soft chrome ------------------------------------ */
+:root {
+  --r-none: 0px;
+  --r-xs: 2px;
+  --r-sm: 4px;
+  --r-md: 7px;
+  --r-lg: 11px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* -- motion: the personality lives here --------------------------------- */
+  --ease-out-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-soft: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-organic: cubic-bezier(0.4, 0.14, 0.3, 1);
+  --dur-instant: 90ms;
+  --dur-fast: 150ms;
+  --dur: 260ms;
+  --dur-slow: 420ms;
+  --dur-panel: 520ms;
+
+  /* type
+     One grotesque carries display, reading and UI; one monospace carries code,
+     figures and every small label. The roles are kept as separate variables
+     even though two now resolve to the same family — they mean different
+     things, and collapsing them would make a future change to just one of them
+     a find-and-replace across the stylesheet. */
+  --font-display: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-read: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-ui: var(--font-ui-src), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-mono-src), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Vertical rhythm for the reading column. One place, so headings, lists,
+     tables and code all sit on the same beat instead of drifting apart. */
+  --read-size: 16.75px;
+  --read-leading: 1.7;
+  --read-rhythm: 1em;
+
+  /* Space the fixed top-left menu button occupies. Every page shell pads by
+     this so content never renders underneath the button. */
+  --chrome-top: 3.75rem;
+}
+
+@media (min-width: 768px) {
+  :root {
+    --chrome-top: 1.5rem;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1;
+  /* A horizontal scrollbar on <body> is always a bug in this app: the layout is
+     column-based and every wide element (code, tables, charts) owns its own
+     scroll container. Clamping here turns "the page slides sideways" into
+     "that one block scrolls", which is the intended behaviour. */
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
+/* ==========================================================================
+   VIEWPORT — the app is a fixed-height shell, not a scrolling document.
+
+   `100dvh` alone is not enough: it only landed in Safari 15.4, and the oldest
+   iPads we support are below that. The three-declaration ladder gives each
+   engine the best unit it understands, last-wins:
+
+     100vh                    — universal, but includes the iOS URL bar
+     -webkit-fill-available   — iOS/Safari's own correct value
+     100dvh                   — modern, correct everywhere it exists
+
+   --kb-inset is written by useViewportInsets() from visualViewport: iOS does
+   NOT shrink the layout viewport when the on-screen keyboard opens, so a
+   bottom-anchored composer sits underneath the keyboard unless we lift it
+   ourselves. That is the "input hides below the screen" bug.
+   ========================================================================== */
+
+:root {
+  --kb-inset: 0px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+
+  /* THE FLOATING TOP RAIL.
+     Three controls hover over the chat: the menu/sidebar button (left), the
+     thread switcher (centre), and the thread options button (right). They were
+     each positioned independently — three different `top` offsets, three
+     different heights, and only two of them safe-area aware — so on a phone they
+     sat on three visibly different lines. These two tokens are the single
+     definition of that rail: same top edge, same control height, so the three
+     centre on one line at every width. Anything added to the rail must use
+     them rather than inventing another offset. */
+  --float-top: calc(0.625rem + var(--safe-top));
+  --float-h: 2.25rem;
+}
+
+.h-app {
+  height: 100vh;
+  height: -webkit-fill-available;
+  height: 100dvh;
+}
+.min-h-app {
+  min-height: 100vh;
+  min-height: -webkit-fill-available;
+  min-height: 100dvh;
+}
+
+/* Content must clear the floating top-left menu/reveal button on every page. */
+.pad-chrome-top {
+  padding-top: calc(var(--chrome-top) + var(--safe-top));
+}
+
+/* Colour-only theme transition. Never transition layout. */
+body,
+.themed {
+  transition: background-color var(--dur) var(--ease-out-soft),
+    color var(--dur) var(--ease-out-soft), border-color var(--dur) var(--ease-out-soft);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+/* -- focus: editorial, never a glow blob ---------------------------------- */
+:where(a, button, [role="button"], input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* The composer is one field made of several elements, so focus is expressed on
+   the CONTAINER. A 1px border-colour change (the previous treatment) is nearly
+   invisible on a bright phone screen; a ring plus a lifted surface reads as
+   "this is where you are typing" without becoming a glow blob. */
+.composer-field {
+  transition: border-color var(--dur-fast) var(--ease-out-soft),
+    box-shadow var(--dur) var(--ease-out-soft), background-color var(--dur-fast) var(--ease-out-soft);
+}
+.composer-field:focus-within {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 3px var(--accent-soft),
+    var(--shadow);
+}
+.composer-field:focus-within textarea:focus-visible,
+.composer-field textarea:focus-visible {
+  outline: none;
+}
+
+/* -- scrollbars: hairline, unobtrusive ------------------------------------ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-mid) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-mid);
+  border-radius: var(--r-full);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-faint);
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.no-js-banner {
+  display: none;
+}
+.no-js .no-js-banner {
+  display: block;
+}
+
+/* ==========================================================================
+   TEXTURES — design.md is emphatic that flat = failure. These are applied via
+   ::before overlays so they never interfere with the element's own background.
+   ========================================================================== */
+
+.tx-lines::before,
+.tx-grid::before,
+.tx-diagonal::before,
+.tx-noise::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.tx-lines::before {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 1px,
+    rgb(var(--texture-ink)) 1px,
+    rgb(var(--texture-ink)) 2px
+  );
+  background-size: 100% 4px;
+  opacity: var(--texture-strength);
+}
+
+.tx-grid::before {
+  background-image: linear-gradient(rgb(var(--texture-ink)) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--texture-ink)) 1px, transparent 1px);
+  background-size: 40px 40px;
+  opacity: calc(var(--texture-strength) * 0.7);
+}
+
+.tx-diagonal::before {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 40px,
+    rgb(var(--texture-ink)) 40px,
+    rgb(var(--texture-ink)) 41px
+  );
+  opacity: calc(var(--texture-strength) * 0.5);
+}
+
+.tx-noise::before {
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: var(--noise-strength);
+  mix-blend-mode: var(--noise-blend, multiply);
+}
+:root[data-theme="dark"] .tx-noise::before {
+  --noise-blend: screen;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .tx-noise::before {
+    --noise-blend: screen;
+  }
+}
+
+/* Editorial rules — structure by line, not by box. */
+.rule-hair {
+  border-top: 1px solid var(--border);
+}
+.rule-thin {
+  border-top: 1px solid var(--border-strong);
+}
+.rule-thick {
+  border-top: 3px solid var(--border-strong);
+}
+.rule-accent {
+  border-top: 2px solid var(--accent);
+}
+
+/* Small-caps editorial label — used for every section eyebrow in the app. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  font-weight: 500;
+}
+
+.display {
+  font-family: var(--font-display);
+  letter-spacing: -0.025em;
+  line-height: 1.02;
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   READING COLUMN — assistant answers, set for sustained reading.
+   ========================================================================== */
+
+.md {
+  color: var(--fg);
+  font-family: var(--font-read);
+  font-size: var(--read-size);
+  line-height: var(--read-leading);
+  font-weight: 400;
+  letter-spacing: -0.003em;
+  /* Lining, tabular figures. Old-style numerals belonged to the serif this
+     column used to be set in; in a grotesque they read as a mistake, and this
+     is a product where a paragraph is as likely to contain a sample size or a
+     year as a sentence. Tabular keeps a column of figures aligned. */
+  font-variant-numeric: lining-nums tabular-nums;
+  /* Break only where a break is unavoidable. `anywhere` used to be set here,
+     which shattered ordinary words mid-syllable on a narrow phone. A long URL
+     or hash still has to break, so `break-word` handles that case alone. */
+  overflow-wrap: break-word;
+  word-break: normal;
+  /* `pretty` avoids orphan/widow reflow, a real source of visible line-rewrap
+     jitter while text streams in. */
+  text-wrap: pretty;
+  /* Nothing in the reading column may push the transcript sideways. */
+  min-width: 0;
+  max-width: 100%;
+}
+.md > *:first-child > *:first-child,
+.md > *:first-child {
+  margin-top: 0;
+}
+.md > *:last-child > *:last-child,
+.md > *:last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 var(--read-rhythm);
+}
+
+/* -- headings: display face, tightened, optically aligned ----------------- */
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-family: var(--font-display);
+  /* A grotesque needs real weight to read as a heading; the serif it replaced
+     got its authority from contrast rather than mass. */
+  font-weight: 600;
+  line-height: 1.16;
+  letter-spacing: -0.02em;
+  margin: 1.7em 0 0.5em;
+  color: var(--fg);
+  text-wrap: balance;
+}
+.md h1 {
+  font-size: 1.85em;
+  letter-spacing: -0.025em;
+}
+.md h2 {
+  font-size: 1.46em;
+  letter-spacing: -0.021em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+}
+.md h3 {
+  font-size: 1.2em;
+}
+/* h4-h6 step down to the mono face: with one grotesque doing display, reading
+   and UI, a small bold heading is otherwise indistinguishable from bold body
+   text. Monospace at a smaller size reads unmistakably as a label. */
+.md h4,
+.md h5,
+.md h6 {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 0.95em;
+  letter-spacing: 0.01em;
+  margin: 1.5em 0 0.45em;
+}
+.md h5,
+.md h6 {
+  font-size: 0.82em;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--fg-muted);
+}
+
+/* -- lists ---------------------------------------------------------------- */
+.md ul,
+.md ol {
+  margin: 0 0 var(--read-rhythm);
+  padding-left: 1.4em;
+}
+.md li {
+  margin: 0.32em 0;
+}
+.md li > .md-li-body > *:last-child {
+  margin-bottom: 0;
+}
+.md li::marker {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  font-variant-numeric: tabular-nums;
+}
+.md li ul,
+.md li ol {
+  margin-top: 0.32em;
+  margin-bottom: 0.32em;
+}
+/* GFM task list: the checkbox replaces the marker rather than sitting beside it. */
+.md li.md-task {
+  list-style: none;
+  margin-left: -1.4em;
+  padding-left: 1.4em;
+  position: relative;
+}
+.md li.md-task > input[type="checkbox"] {
+  position: absolute;
+  left: 0;
+  top: 0.42em;
+  width: 0.85em;
+  height: 0.85em;
+  accent-color: var(--accent);
+  pointer-events: none;
+}
+
+/* -- links ---------------------------------------------------------------- */
+.md a,
+.md button.text-accent {
+  color: var(--fg);
+  text-decoration: none;
+  background-image: linear-gradient(var(--accent), var(--accent));
+  background-size: 100% 1px;
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  transition: background-size var(--dur-fast) var(--ease-out-soft),
+    color var(--dur-fast) var(--ease-out-soft);
+  padding-bottom: 1px;
+}
+.md a:hover {
+  background-size: 100% 2px;
+  color: var(--accent);
+}
+
+.md strong {
+  font-weight: 700;
+  color: var(--fg);
+}
+.md em {
+  font-style: italic;
+}
+.md del {
+  color: var(--fg-faint);
+  text-decoration-thickness: 1px;
+}
+
+.md blockquote {
+  margin: 1.2em 0;
+  padding: 0.15em 0 0.15em 1.15em;
+  border-left: 2px solid var(--accent);
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* -- code ----------------------------------------------------------------- */
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  font-variant-numeric: normal;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 0.1em 0.36em;
+  border-radius: var(--r-xs);
+  overflow-wrap: break-word;
+}
+
+.md-code {
+  margin: 1.2em 0;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent-line);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  /* The block itself must never widen its parent — the <pre> scrolls instead. */
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+.md-code-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-3);
+}
+.md-code-lang {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.md-code-copy {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out-soft),
+    color var(--dur-fast) var(--ease-out-soft);
+}
+.md-code:hover .md-code-copy,
+.md-code-copy:focus-visible {
+  opacity: 1;
+}
+.md-code-copy:hover {
+  color: var(--fg);
+}
+/* Touch devices have no hover, so the affordance must simply be present. */
+@media (hover: none) {
+  .md-code-copy {
+    opacity: 1;
+  }
+}
+.md-code pre {
+  margin: 0;
+  padding: 13px 15px;
+  background: none;
+  border: none;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-code pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12.75px;
+  line-height: 1.68;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+/* -- tables --------------------------------------------------------------- */
+/* The wrapper scrolls; the table stays a table. Making the <table> itself
+   `display:block` (the old approach) breaks column sizing and still let wide
+   content push the column sideways on iOS. */
+.md-table-wrap {
+  margin: 1.2em 0;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+}
+.md-table-wrap table {
+  border-collapse: collapse;
+  width: 100%;
+  font-family: var(--font-ui);
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+}
+.md-table-wrap th,
+.md-table-wrap td {
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  padding: 8px 12px;
+  vertical-align: top;
+}
+.md-table-wrap th:last-child,
+.md-table-wrap td:last-child {
+  border-right: none;
+}
+.md-table-wrap tr:last-child td {
+  border-bottom: none;
+}
+.md-table-wrap th {
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.md hr {
+  border: none;
+  border-top: 1px solid var(--border-strong);
+  margin: 1.9em 0;
+  opacity: 0.3;
+}
+.md img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.1em 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+}
+/* An image sitting alone in a paragraph is a figure, not inline text. */
+.md p > img:only-child {
+  margin: 1.2em auto;
+}
+
+/* ==========================================================================
+   MOTION LIBRARY
+   ========================================================================== */
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes shimmerSweep {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -180% 0;
+  }
+}
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes drawStroke {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes tracePulse {
+  0% {
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.animate-rise {
+  animation: riseIn var(--dur-slow) var(--ease-out-expo) both;
+}
+.animate-fade {
+  animation: fadeIn var(--dur) var(--ease-out-soft) both;
+}
+
+/* Live "working" text — a slow ink sweep, not a blinking cursor. */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--fg-faint) 20%,
+    var(--fg) 42%,
+    var(--accent) 50%,
+    var(--fg) 58%,
+    var(--fg-faint) 80%
+  );
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmerSweep 2.6s var(--ease-in-out-soft) infinite;
+}
+
+/* The pulsing dot that marks an in-flight step. */
+.pulse-dot {
+  animation: breathe 1.7s var(--ease-in-out-soft) infinite;
+}
+
+/* ==========================================================================
+   COLLAPSIBLE — grid-template-rows 0fr -> 1fr animates real auto height with
+   no JS measurement, no scrollHeight thrash, and stays smooth when the content
+   inside is still growing (which is exactly our streaming case).
+
+   NAMING: the `wv-` prefix is load-bearing. This was originally `.collapse`,
+   which silently collided with Tailwind's own `.collapse` utility
+   (`visibility: collapse`). Both rules applied; ours set display and
+   grid-template-rows but never `visibility`, so Tailwind's won for that one
+   property and every panel rendered open-but-invisible — content present in
+   the DOM, nothing on screen. Never name a custom class after a Tailwind
+   utility.
+   ========================================================================== */
+
+.wv-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  /* Explicit, so no utility of the same name can ever hide us again. */
+  visibility: visible;
+  transition: grid-template-rows var(--dur-slow) var(--ease-out-expo),
+    opacity var(--dur) var(--ease-out-soft);
+  opacity: 0;
+}
+.wv-collapse[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.wv-collapse > .wv-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Chevron that rotates with the same curve as the panel it controls. */
+.chev {
+  transition: transform var(--dur-slow) var(--ease-out-expo);
+}
+.chev[data-open="true"] {
+  transform: rotate(90deg);
+}
+
+/* ==========================================================================
+   STREAMING — deliberately NO caret. Newly committed text fades up over one
+   beat so growth reads as ink settling rather than as a jump.
+   ========================================================================== */
+
+.stream-in {
+  animation: fadeIn 240ms var(--ease-out-soft) both;
+}
+
+/* Kill browser scroll-anchoring inside the transcript. The browser tries to
+   "helpfully" preserve visual position when content grows above the viewport,
+   which fights our own bottom-pinning and produces the stutter. We own scroll. */
+.transcript,
+.transcript * {
+  overflow-anchor: none;
+}
+.transcript {
+  scroll-behavior: auto; /* smooth-scroll + per-frame growth = jitter */
+  /* Reserve the scrollbar gutter so the column never shifts sideways the
+     moment content becomes tall enough to overflow. */
+  scrollbar-gutter: stable;
+  /* Contain layout/paint so a growing last block cannot invalidate the whole
+     transcript's layout on every frame. */
+  contain: layout paint style;
+}
+
+/* Committed blocks are inert: isolate them so the growing tail can't trigger
+   their repaint. This is what keeps cost flat over a multi-hour run. */
+.block-settled {
+  contain: content;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 1px;
+}
+
+/* ==========================================================================
+   INLINE ARTIFACTS — generated output rendered in the transcript itself.
+
+   A chart the assistant just drew is the answer, not a footnote to it, so it
+   gets real presence in the reading column rather than a pill you must click.
+   The frame is quiet on purpose: a hairline, a caption bar, and actions that
+   only surface on hover, so a run producing ten artifacts still reads as one
+   document instead of ten cards.
+   ========================================================================== */
+
+.inline-artifact {
+  margin-left: 0;
+  margin-right: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  overflow: hidden;
+  background: var(--surface);
+  max-width: 100%;
+  min-width: 0;
+  transition: border-color var(--dur) var(--ease-out-soft);
+}
+.inline-artifact:hover {
+  border-color: var(--border-mid);
+}
+.inline-artifact-body {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+.inline-artifact-fallback {
+  padding: 2.5rem 1rem;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--fg-faint);
+}
+.inline-artifact-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 6px 5px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--fg-faint);
+}
+.inline-artifact-act {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: var(--fg-faint);
+  border-radius: var(--r-xs);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out-soft),
+    color var(--dur-fast) var(--ease-out-soft),
+    background-color var(--dur-fast) var(--ease-out-soft);
+}
+.inline-artifact:hover .inline-artifact-act,
+.inline-artifact-act:focus-visible {
+  opacity: 1;
+}
+.inline-artifact-act:hover {
+  color: var(--fg);
+  background: var(--surface-hover);
+}
+/* Touch devices have no hover, so the actions must simply be present. */
+@media (hover: none) {
+  .inline-artifact-act {
+    opacity: 1;
+  }
+}
+
+/* ==========================================================================
+   PANEL / RESIZE
+   ========================================================================== */
+
+.panel-enter {
+  animation: panelIn var(--dur-panel) var(--ease-out-expo) both;
+}
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.resize-handle {
+  position: absolute;
+  left: -7px;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  cursor: col-resize;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+.resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease-out-soft);
+}
+.resize-handle:hover::before,
+.resize-handle[data-dragging="true"]::before {
+  opacity: 1;
+}
+
+/* ==========================================================================
+   UTILITIES
+   ========================================================================== */
+
+.hide-scrollbar {
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Inversion for emphasis — design.md's substitute for a second colour. */
+.invert-surface {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .wv-collapse {
+    transition: none;
+  }
+  .shimmer {
+    -webkit-text-fill-color: var(--fg-muted);
+    background: none;
+  }
+}
