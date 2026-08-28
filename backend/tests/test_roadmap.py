@@ -74,8 +74,17 @@ def test_output_budget_scales_with_the_model_window():
     assert num_predict_for("weave", 128_000) > num_predict_for("weave", 8_192)
     # Deeper effort -> at least as much room, at the same window.
     assert num_predict_for("spool", 32_768) < num_predict_for("weave", 32_768)
-    # The deep level is explicitly unbounded (-1 = "run to your natural stop").
-    assert num_predict_for("tapestry", 32_768) == -1
+    # The deep level gets most of the window.
+    #
+    # It used to return -1, which is how a LOCAL Ollama spells "run to your
+    # natural stop". A hosted :cloud model proxies to an OpenAI-shaped API and
+    # rejects it — 400 "max_tokens must be positive, got: -1" — so every
+    # Tapestry turn on a cloud model fell through to the offline engine, making
+    # the deepest setting the worst answer in the product. A large positive
+    # budget gets what -1 was reaching for without the 400.
+    deep = num_predict_for("tapestry", 32_768)
+    assert deep > 0
+    assert deep > num_predict_for("weave", 32_768)
     # Even a tiny window keeps a usable floor rather than collapsing to nothing.
     assert num_predict_for("weave", 1_024) >= 4096
 

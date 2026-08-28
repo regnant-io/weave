@@ -561,3 +561,36 @@ def test_polish_is_skipped_on_the_final_attempt():
     # the budget arithmetic without needing a browser.
     gate.check("create_diagram", {"title": "t"}, {"status": "ok"})
     assert calls == []
+
+
+# --------------------------------------------------------------------------- #
+#  Output budget                                                               #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("effort", ["spool", "weave", "tapestry", None, "nonsense"])
+def test_the_output_budget_is_always_positive(effort):
+    """-1 means 'no limit' to a local Ollama and is a 400 to a cloud model.
+
+        400 {"error": "max_tokens must be positive, got: -1"}
+
+    Every Tapestry turn on a cloud model therefore failed and fell through to
+    the deterministic offline engine: the deepest, slowest setting reliably
+    produced the worst answer in the product.
+    """
+    from app.runtime import num_predict_for
+
+    for ctx in (4096, 8192, 131072, 262144):
+        n = num_predict_for(effort, ctx)
+        assert n > 0, f"{effort} at ctx={ctx} produced {n}"
+        # The floor is deliberately allowed to exceed a very small window — a
+        # model that mis-reports a tiny context still gets usable room, and
+        # Ollama clamps. Only check the ratio where the window is real.
+        if ctx >= 8192:
+            assert n <= ctx
+
+
+def test_the_deepest_level_still_gets_room_for_a_long_file():
+    """The budget exists to stop a fixed ceiling truncating generated files."""
+    from app.runtime import num_predict_for
+
+    assert num_predict_for("tapestry", 131072) > 60_000
+    assert num_predict_for("tapestry", 131072) < 131072

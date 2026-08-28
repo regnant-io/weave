@@ -58,16 +58,37 @@ def effort_spec(effort: str | None) -> dict:
     return EFFORT_SPEC.get((effort or DEFAULT_EFFORT).lower(), EFFORT_SPEC[DEFAULT_EFFORT])
 
 
+#: Share of the window handed to the model's own output at the deepest level.
+#: Generous enough that nothing real is ever truncated, while leaving room for
+#: the prompt and history.
+UNBOUNDED_FRACTION = 0.75
+
+
 def num_predict_for(effort: str | None, context_window: int) -> int:
     """Output-token budget for one step, derived from the model's REAL window.
 
-    Returning -1 tells Ollama "generate until you decide to stop" — correct for
-    the deep level, where an artificial ceiling is the failure mode we are fixing.
+    ALWAYS POSITIVE.
+
+    This used to return -1 at the deepest level, which is how a local Ollama
+    spells "generate until you decide to stop". A hosted `:cloud` model proxies
+    to an OpenAI-shaped API and rejects it outright:
+
+        400 {"error": "max_tokens must be positive, got: -1"}
+
+    So every Tapestry turn on a cloud model 400'd and fell through to the
+    deterministic offline engine — the deepest, slowest, most expensive setting
+    was reliably producing the worst answer in the product, and the only symptom
+    was that thorough mode felt oddly shallow.
+
+    A large positive budget gets what -1 was reaching for. The original bug it
+    was introduced to fix was a FIXED 2048-token ceiling truncating long files;
+    three quarters of a 131k window is 98k tokens, which is not a ceiling anyone
+    will meet.
     """
     spec = effort_spec(effort)
     ctx = max(1, int(context_window or 0))
     if spec["output_fraction"] >= 1.0:
-        return -1  # Ollama: unbounded generation
+        return max(int(spec["floor"]), int(ctx * UNBOUNDED_FRACTION))
     budget = int(ctx * float(spec["output_fraction"]))
     budget = max(int(spec["floor"]), budget)
     cap = int(spec["cap"] or 0)
