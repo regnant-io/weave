@@ -20,6 +20,12 @@ services:
       - backend_var:/app/var
       - /var/run/docker.sock:/var/run/docker.sock
       - workspaces:/app/var/workspaces
+    environment:
+      # Docker Desktop on Windows/macOS does not propagate inotify events across
+      # a bind mount, so the file watcher never fires and --reload silently does
+      # nothing — you edit, nothing happens, and you conclude the change was
+      # wrong rather than unloaded. Polling is the only thing that works here.
+      WATCHFILES_FORCE_POLLING: "true"
     # Seeding is skipped here: the database already exists after the first boot,
     # and re-running the seeder on every reload is noise.
     command: >
@@ -46,6 +52,10 @@ services:
     environment:
       NODE_ENV: development
       NEXT_TELEMETRY_DISABLED: "1"
+      # Same reason as the backend: without polling, webpack never notices an
+      # edit to a bind-mounted file.
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
     command: ["npm", "run", "dev"]
 
   render:

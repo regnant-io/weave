@@ -279,11 +279,43 @@ class OllamaEngine:
         ) or ollama_model()
         return self.resolve_model(configured)
 
-    def _post_chat(self, payload: dict, attempts: int = 3):
-        """POST /api/chat with retries on transient errors. A remote/ngrok-tunnelled
-        Ollama occasionally drops a connection ('Server disconnected without sending
-        a response') or times out on a cold call; one dropped packet should not fail
-        the user's whole turn."""
+    #: How long to wait before retrying a rate-limited request, per attempt.
+    #: Hosted models (`:cloud`) are metered, and an agentic turn makes many calls
+    #: in quick succession — planning, several tool rounds, a review — so 429 is
+    #: a NORMAL condition here, not an error. It used to abort the turn and drop
+    #: silently to the offline engine, which produced a visibly worse answer with
+    #: nothing anywhere saying why.
+    _BACKOFF = (2.0, 5.0, 12.0, 25.0)
+
+    def _sleep_for_retry(self, response, attempt: int, on_event=None) -> float:
+        """Honour Retry-After when the server sends one, else back off."""
+        wait = self._BACKOFF[min(attempt, len(self._BACKOFF) - 1)]
+        try:
+            header = (response.headers or {}).get("retry-after") if response is not None else None
+            if header:
+                wait = max(wait, min(float(header), 60.0))
+        except (TypeError, ValueError):
+            pass
+        if on_event:
+            # Say it out loud. A thirty-second pause with no explanation is
+            # indistinguishable from a hang.
+            on_event("notice", {
+                "kind": "rate_limited",
+                "text": f"The model provider is rate-limiting; retrying in {int(wait)}s.",
+                "seconds": int(wait),
+            })
+        return wait
+
+    def _post_chat(self, payload: dict, attempts: int = 4, on_event=None):
+        """POST /api/chat with retries on transient errors and on rate limits.
+
+        A remote/ngrok-tunnelled Ollama occasionally drops a connection ('Server
+        disconnected without sending a response') or times out on a cold call;
+        one dropped packet should not fail the user's whole turn. A hosted model
+        returns 429 under load, which is a wait, not a failure.
+        """
+        import time as _time
+
         httpx = self._httpx
         transient = (
             httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError,
@@ -299,12 +331,47 @@ class OllamaEngine:
                 last_exc = exc
                 continue
             except httpx.HTTPStatusError as exc:
-                # 5xx from the model server is also worth one retry
-                if exc.response is not None and exc.response.status_code >= 500 and i < attempts - 1:
+                status = exc.response.status_code if exc.response is not None else 0
+                if i >= attempts - 1:
+                    raise
+                if status == 429:
+                    _time.sleep(self._sleep_for_retry(exc.response, i, on_event))
+                    last_exc = exc
+                    continue
+                if status >= 500:
                     last_exc = exc
                     continue
                 raise
         raise last_exc if last_exc else RuntimeError("ollama request failed")
+
+    def _await_capacity(self, payload: dict, on_event=None, attempts: int = 4) -> None:
+        """Block until the provider will accept a streaming request.
+
+        Streaming cannot retry mid-flight — once tokens have been emitted to the
+        client, replaying the call would duplicate them on screen. So the rate
+        limit is absorbed here, before anything is streamed, by opening the
+        stream and immediately closing it if the status is 429.
+        """
+        import time as _time
+
+        httpx = self._httpx
+        for i in range(attempts):
+            try:
+                with self._client.stream("POST", "/api/chat",
+                                         json={**payload, "stream": True}) as probe:
+                    if probe.status_code != 429:
+                        return
+                    response = probe
+                    probe.read()
+            except httpx.HTTPStatusError as exc:
+                if exc.response is None or exc.response.status_code != 429:
+                    return
+                response = exc.response
+            except Exception:  # noqa: BLE001 - a connection problem is the caller's to handle
+                return
+            if i >= attempts - 1:
+                return
+            _time.sleep(self._sleep_for_retry(response, i, on_event))
 
     @staticmethod
     def _to_ollama_tools(tools: list[dict]) -> list[dict]:
@@ -388,6 +455,13 @@ class OllamaEngine:
             content_parts: list[str] = []
             tool_calls: list[dict] = []
             try:
+                # A rate limit has to be waited out BEFORE the stream opens.
+                # Without this the streaming path had no retry at all: the 429
+                # raised, the except below fell through to the non-streaming
+                # call, that raised 429 too, and the whole turn degraded to the
+                # offline engine with nothing telling the user why the answer
+                # suddenly got worse.
+                self._await_capacity(payload, on_event)
                 with self._client.stream("POST", "/api/chat", json=payload) as resp:
                     resp.raise_for_status()
                     for line in resp.iter_lines():
@@ -413,7 +487,7 @@ class OllamaEngine:
                         if obj.get("done"):
                             break
             except Exception:  # noqa: BLE001 - fall back to non-streaming for this step
-                resp2 = self._post_chat({**payload, "stream": False})
+                resp2 = self._post_chat({**payload, "stream": False}, on_event=on_event)
                 m = resp2.json().get("message", {}) or {}
                 text = m.get("content", "") or ""
                 if text and on_event:
