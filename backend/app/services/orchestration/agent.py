@@ -428,6 +428,12 @@ class Agent:
                 max_iters=3,
             )
         except Exception as exc:  # noqa: BLE001 - planning is an aid, never a gate
+            from .llm import QuotaExhausted
+            if isinstance(exc, QuotaExhausted):
+                # Out of quota is not a planning problem: the work pass will hit
+                # the same wall. Fail now so the user gets the real explanation
+                # instead of watching an unplanned turn grind to the same halt.
+                raise
             log.warning("planning pass failed (%s); continuing unplanned", exc)
             return
 
@@ -641,13 +647,28 @@ class Agent:
                 max_iters=2,
             )
         except Exception as exc:  # noqa: BLE001 - a failed critic never blocks delivery
+            from .llm import QuotaExhausted
+            if isinstance(exc, QuotaExhausted):
+                # The work is already done and delivered by this point; losing
+                # the review is a real but acceptable degradation, so this one
+                # is swallowed rather than raised.
+                log.warning("review skipped: %s", exc)
+                return []
             log.warning("review pass failed (%s); accepting the work as-is", exc)
             return []
 
         verdict = str(found.get("verdict") or "pass").lower()
         defects = [d for d in _string_list(found.get("defects")) if len(d) > 8][:6]
         self.emit("review", {"verdict": verdict, "defects": defects})
-        return defects if verdict == "revise" else []
+        # Anything that is not an explicit "pass" counts as needing work.
+        #
+        # The enum says pass|revise and the model returned "fail" — which the
+        # old `== "revise"` test read as a pass, silently discarding three
+        # defects it had just raised. Given a two-value enum these models will
+        # still produce a third value; the safe default is the one that makes us
+        # look at the work again, not the one that ships it.
+        needs_work = verdict != "pass"
+        return defects if (needs_work and defects) else []
 
     def _work_summary(self) -> str:
         """What the critic gets to look at.
@@ -667,8 +688,12 @@ class Agent:
             bits = [f"- {event.get('name')} -> {status}"]
             verification = result.get("verification")
             if isinstance(verification, dict):
-                bits.append("verified: yes" if verification.get("ok")
-                            else f"VERIFICATION FAILED: {'; '.join(verification.get('errors') or [])[:300]}")
+                bits.append(
+                    "OPENED IN A REAL BROWSER AND RENDERED CLEANLY"
+                    if verification.get("ok") else
+                    "VERIFICATION FAILED: "
+                    + "; ".join(verification.get("errors") or [])[:300]
+                )
             if result.get("error"):
                 bits.append(f"error: {str(result['error'])[:240]}")
             if result.get("stderr"):
@@ -898,19 +923,28 @@ did not do this work and you have no stake in it being good.
 Judge it against ONE question: if this were handed over now, would the person
 who asked get what they asked for?
 
+WHAT YOU CAN AND CANNOT SEE. You are reading a WORK LOG and the answer text.
+Artifacts are rendered directly into the conversation, so the user sees them
+even though you do not. The log tells you what was produced and whether it was
+opened in a real browser. Judge from the log — never from the fact that the
+answer text does not contain the code, a link or a preview, because none of
+those belong in it.
+
 Look for, in this order:
 1. Things claimed but not done. Code described but never run. A file said to be
    complete that was never opened. An artifact reported as working whose
-   verification actually failed. This is the most common and the most damaging
-   defect — treat any gap between what the work log shows and what the answer
-   claims as a defect.
+   verification actually FAILED in the log. This is the most common and the most
+   damaging defect — treat any gap between what the log shows and what the
+   answer claims as a defect.
 2. Parts of the request that were quietly dropped or narrowed.
-3. Output that is broken, truncated, or would not run.
-4. Claims that are stated as fact without support.
+3. Output the log shows to be broken, truncated, or not runnable.
+4. Claims stated as fact without support.
 
 Do NOT raise: style preferences, things that could hypothetically be extended,
-or "consider adding" suggestions. A defect is something WRONG, not something
-absent from your imagination.
+"consider adding" suggestions, or the absence of code/links/screenshots from the
+answer. And never raise "there is no evidence this was verified" when the log
+says it was verified — the log is the evidence. A defect is something WRONG, not
+something absent from your imagination.
 
 If the work genuinely answers the request, say `pass`. Saying `pass` when it does
 is as important as catching a real defect — a critic that always finds something

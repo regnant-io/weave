@@ -24,6 +24,16 @@ log = logging.getLogger("weave.llm")
 ToolExecutor = Callable[[str, dict], dict]
 
 
+class QuotaExhausted(RuntimeError):
+    """The provider will not serve this account until something changes.
+
+    Distinct from a transport failure because the remedy is different and the
+    user can act on it: upgrade the plan, wait for the window to reset, or pick
+    a different model. Carrying the provider's own message means the answer they
+    get names the account and the upgrade link rather than saying "unavailable".
+    """
+
+
 @dataclass
 class TurnResult:
     text: str
@@ -290,6 +300,41 @@ class OllamaEngine:
     #: nothing anywhere saying why.
     _BACKOFF = (2.0, 5.0, 12.0, 25.0)
 
+    @staticmethod
+    def _quota_message(response) -> str:
+        """The provider's own words when a 429 means 'you are out', not 'slow down'.
+
+        These are different conditions wearing the same status code, and telling
+        them apart is worth real effort:
+
+          * a BURST limit clears in seconds, so backing off is exactly right;
+          * a SESSION or plan limit does not clear at all within the session, so
+            backing off spends forty-five seconds to arrive at the same failure,
+            and then degrades the answer without explaining why.
+
+        Ollama Cloud says which it is in the body:
+            "you (someone) have reached your session usage limit, upgrade for
+             higher limits: https://ollama.com/upgrade"
+
+        Returned verbatim when matched, because the provider's message names the
+        account and the upgrade path, and anything we substitute would be vaguer.
+        """
+        try:
+            body = response.text if response is not None else ""
+        except Exception:  # noqa: BLE001
+            return ""
+        low = body.lower()
+        if not any(marker in low for marker in
+                   ("usage limit", "upgrade for higher", "quota", "insufficient credit",
+                    "out of credits", "billing")):
+            return ""
+        try:
+            import json as _json
+            detail = str(_json.loads(body).get("error") or "").strip()
+        except Exception:  # noqa: BLE001 - not JSON; use the raw text
+            detail = body.strip()
+        return detail[:400] or "the model provider reports the account is out of quota"
+
     def _sleep_for_retry(self, response, attempt: int, on_event=None) -> float:
         """Honour Retry-After when the server sends one, else back off."""
         wait = self._BACKOFF[min(attempt, len(self._BACKOFF) - 1)]
@@ -338,6 +383,9 @@ class OllamaEngine:
                 if i >= attempts - 1:
                     raise
                 if status == 429:
+                    quota = self._quota_message(exc.response)
+                    if quota:
+                        raise QuotaExhausted(quota) from exc
                     _time.sleep(self._sleep_for_retry(exc.response, i, on_event))
                     last_exc = exc
                     continue
@@ -364,14 +412,21 @@ class OllamaEngine:
                                          json={**payload, "stream": True}) as probe:
                     if probe.status_code != 429:
                         return
-                    response = probe
                     probe.read()
+                    response = probe
             except httpx.HTTPStatusError as exc:
                 if exc.response is None or exc.response.status_code != 429:
                     return
                 response = exc.response
+            except QuotaExhausted:
+                raise
             except Exception:  # noqa: BLE001 - a connection problem is the caller's to handle
                 return
+
+            quota = self._quota_message(response)
+            if quota:
+                # No amount of waiting fixes this one.
+                raise QuotaExhausted(quota)
             if i >= attempts - 1:
                 return
             _time.sleep(self._sleep_for_retry(response, i, on_event))
