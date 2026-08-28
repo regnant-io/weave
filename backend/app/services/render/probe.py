@@ -59,6 +59,9 @@ _IGNORABLE = (
     "was preloaded using link preload",
     "sandboxed and the 'allow-scripts' permission is not set",
     "third-party cookie",
+    # Duplicated by `failedResources`, which knows the URL. The bare console
+    # form names nothing, so it cannot be acted on and cannot be filtered.
+    "failed to load resource",
 )
 
 #: The in-page script. Kept as one string rather than assembled, because a
@@ -68,6 +71,7 @@ export default async function ({ page, context }) {
   const consoleErrors = [];
   const pageErrors = [];
   const networkAttempts = [];
+  const failedResources = [];
 
   page.on('console', (m) => {
     const t = m.type();
@@ -86,17 +90,36 @@ export default async function ({ page, context }) {
     const u = r.url();
     if (/^https?:/i.test(u)) networkAttempts.push(u.slice(0, 300));
   });
+  // Chromium logs "Failed to load resource: ... 404" to the console with no URL
+  // attached, which is unactionable and — for a favicon nobody asked for —
+  // simply wrong. Watching responses gives us the URL, so the caller can tell a
+  // missing script from a missing favicon.
+  page.on('response', (r) => {
+    try {
+      if (r.status() >= 400) {
+        failedResources.push({ url: String(r.url()).slice(0, 300), status: r.status() });
+      }
+    } catch (e) {}
+  });
 
   await page.setViewport({ width: context.width || 1100, height: context.height || 720 });
 
   try {
-    await page.setContent(context.html, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    // Two entry points, one set of checks: `html` for an artifact (a single
+    // self-contained document) and `url` for a dev server the workspace is
+    // running. Everything after this line is identical, because "did it throw"
+    // and "did anything paint" mean the same thing either way.
+    if (context.url) {
+      await page.goto(context.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } else {
+      await page.setContent(context.html, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    }
   } catch (e) {
     return {
       data: {
         loaded: false,
         loadError: String((e && e.message) || e).slice(0, 400),
-        consoleErrors, pageErrors, networkAttempts,
+        consoleErrors, pageErrors, networkAttempts, failedResources,
       },
       type: 'application/json',
     };
@@ -137,10 +160,19 @@ export default async function ({ page, context }) {
   const paint = await page.evaluate(() => {
     const out = {
       textLen: 0, canvases: 0, paintedCanvases: 0, svgs: 0,
+      elements: 0, bodyHeight: 0,
       visibleError: '', title: document.title || '',
     };
     try { out.textLen = ((document.body && document.body.innerText) || '').trim().length; } catch (e) {}
     try { out.svgs = document.querySelectorAll('svg').length; } catch (e) {}
+    // Text length alone is a bad blankness test: a working counter app renders
+    // "0" and "+1", which is four characters. What distinguishes a blank page is
+    // that it has no laid-out content at all.
+    try {
+      out.elements = document.body ? document.body.querySelectorAll('*').length : 0;
+      out.bodyHeight = document.body
+        ? Math.round(document.body.getBoundingClientRect().height) : 0;
+    } catch (e) {}
 
     // Every Weave renderer surfaces a setup failure into #err and reveals it.
     //
@@ -187,7 +219,8 @@ export default async function ({ page, context }) {
   } catch (e) { /* a screenshot failure is not an artifact failure */ }
 
   return {
-    data: { loaded: true, consoleErrors, pageErrors, networkAttempts, paint, screenshot },
+    data: { loaded: true, consoleErrors, pageErrors, networkAttempts,
+            failedResources, paint, screenshot },
     type: 'application/json',
   };
 }
@@ -299,10 +332,56 @@ class ArtifactProbe:
         result.duration_ms = int((time.monotonic() - started) * 1000)
         return result
 
+    def run_url(self, url: str, *, heavy: bool = False,
+                settle_ms: int | None = None) -> ProbeResult:
+        """Same checks, against a URL the browser navigates to.
+
+        For dev servers rather than artifacts. The two differ in exactly one
+        respect that matters here: a served app is ALLOWED to make network
+        requests, so the caller filters that finding out. Everything else — an
+        exception, a console error, a page that painted nothing — means the same
+        thing whether the HTML arrived inline or over HTTP.
+        """
+        import time
+
+        if not self.enabled:
+            return ProbeResult(available=False, ok=True, note="Browserless is not configured")
+        if not (url or "").strip():
+            return ProbeResult(ok=False, errors=["no URL to open"])
+
+        settle = int(settle_ms or (HEAVY_SETTLE_MS if heavy else DEFAULT_SETTLE_MS))
+        base = (settings.browserless_url or "").rstrip("/")
+        started = time.monotonic()
+        try:
+            resp = self._httpx.post(
+                f"{base}/function",
+                json={"code": _PROBE_JS,
+                      "context": {"url": url, "settleMs": settle,
+                                  "width": 1280, "height": 800}},
+                timeout=(settle / 1000.0) + 45.0,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("preview probe could not run (%s): %s", type(exc).__name__, exc)
+            return ProbeResult(available=False, ok=True,
+                               duration_ms=int((time.monotonic() - started) * 1000),
+                               note=f"could not reach the browser pool ({type(exc).__name__})")
+
+        data = payload.get("data") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                data = {}
+        result = self._interpret(data, heavy=heavy, allow_network=True)
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        return result
+
     # -- judgement ---------------------------------------------------------
 
     @staticmethod
-    def _interpret(data: dict, *, heavy: bool) -> ProbeResult:
+    def _interpret(data: dict, *, heavy: bool, allow_network: bool = False) -> ProbeResult:
         errors: list[str] = []
         warnings: list[str] = []
 
@@ -338,11 +417,27 @@ class ArtifactProbe:
 
         # 4. The artifact sandbox has no network. A request proves the page
         #    depends on something it will never get.
+        # 4. An ARTIFACT has no network, so a request proves it depends on
+        #    something it will never get. A dev server obviously does have one,
+        #    and the same finding there is just traffic.
         network = list(dict.fromkeys(data.get("networkAttempts") or []))
-        if network:
+        if network and not allow_network:
             errors.append(
                 "this page requests external URLs, which are blocked in the artifact "
                 "sandbox — inline them instead: " + ", ".join(network[:4])
+            )
+
+        # 4b. Resources the page asked for and did not get. Reported with the
+        #     URL, which is the difference between "something 404'd" and "your
+        #     app.js is missing". A favicon nobody requested is not a defect and
+        #     is the single most common false positive here.
+        for res in data.get("failedResources") or []:
+            url = str(res.get("url") or "")
+            if not url or "favicon" in url.lower():
+                continue
+            errors.append(
+                f"the page requested {url.rsplit('/', 1)[-1] or url} and got "
+                f"HTTP {res.get('status')} — that file is missing or the path is wrong"
             )
 
         # 5. Nothing thrown, nothing drawn. A silently blank page is still a
@@ -351,7 +446,17 @@ class ArtifactProbe:
         canvases = int(paint.get("canvases") or 0)
         painted = int(paint.get("paintedCanvases") or 0)
         svgs = int(paint.get("svgs") or 0)
-        drew_something = text_len > 12 or svgs > 0 or painted > 0
+        elements = int(paint.get("elements") or 0)
+        body_height = int(paint.get("bodyHeight") or 0)
+        # A minimal page is not a blank one. A working counter renders "0" and
+        # "+1" — four characters — and an earlier `text_len > 12` threshold
+        # called that "rendered nothing at all", which would send the model off
+        # to repair something that was already correct. Laid-out content is the
+        # signal that actually distinguishes the two.
+        drew_something = (
+            text_len > 0 or svgs > 0 or painted > 0
+            or (elements >= 3 and body_height > 8)
+        )
 
         if not drew_something:
             if canvases and not painted:

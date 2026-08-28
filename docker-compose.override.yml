@@ -19,7 +19,7 @@ services:
       - ./backend/app:/app/app
       - backend_var:/app/var
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${WEAVE_WORKSPACE_HOST_DIR:-./var/workspaces}:/app/var/workspaces
+      - workspaces:/app/var/workspaces
     # Seeding is skipped here: the database already exists after the first boot,
     # and re-running the seeder on every reload is noise.
     command: >
@@ -57,3 +57,6 @@ services:
       - ./render-service/server.js:/app/server.js
       - ./render-service/lib:/app/lib
       - ./render-service/package.json:/app/package.json
+
+volumes:
+  workspaces:

@@ -217,7 +217,20 @@ class Orchestrator:
             tool_calls=[], citations=[],
         )
         db.add(assistant_msg)
-        db.flush()
+        # COMMIT, not flush.
+        #
+        # A flush opens SQLite's single write transaction and holds it until the
+        # commit at the end of the turn — which, for a supervised run with tool
+        # calls, is minutes. Every other write in the process then queues behind
+        # it and dies on the 30s busy timeout: a second chat, a second tab, or
+        # even the background translation of the previous answer fails with
+        # "database is locked". Committing here closes the transaction, and the
+        # row is filled in and committed again at the end.
+        #
+        # The cost is that a turn which dies mid-flight leaves an empty
+        # assistant row. `history_for` and the thread endpoint skip those, and
+        # they carry no content, so nothing is lost.
+        db.commit()
 
         # -- capability bus: registry + per-turn context ----------------------
         trust = getattr(getattr(project, "user", None), "trust_tier", "verified") or "verified"
@@ -990,7 +1003,10 @@ class Orchestrator:
             content_sw=content_sw, content_en=content_en, tool_calls=[], citations=[],
         )
         db.add(msg)
-        db.flush()
+        # Committed rather than flushed, for the same reason as the assistant
+        # placeholder above: holding SQLite's write lock across a whole turn
+        # locks out every other writer in the process.
+        db.commit()
         return msg
 
     def _update_summary(self, project: Project, user_text: str, answer: str) -> None:

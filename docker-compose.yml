@@ -75,9 +75,17 @@ services:
       # why workspace execution is gated to verified users and can be turned off
       # entirely with WEAVE_WORKSPACE_ENABLED=false.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Workspaces are bind-mounted INTO the exec container by host path, so the
-      # backend and the host must agree on where they live.
-      - ${WEAVE_WORKSPACE_HOST_DIR:-./var/workspaces}:/app/var/workspaces
+      # A NAMED VOLUME, not a host bind.
+      #
+      # The workspace container runs as uid 1000 and has to write into this
+      # directory — that is what `npm install`, a build and a test run all do.
+      # On a Docker Desktop (Windows/macOS) host bind, ownership is synthesised:
+      # everything appears as root:root 0755 and chown is silently a no-op, so
+      # every write from inside the container fails with EACCES. A named volume
+      # is real ext4 inside the VM, so ownership works and the container can stay
+      # non-root. The service mounts the per-project subdirectory of this same
+      # volume into each workspace container.
+      - workspaces:/app/var/workspaces
 
   frontend:
     build: ./frontend
@@ -251,6 +259,10 @@ services:
 
 volumes:
   backend_var:
+  # Per-project developer workspaces. Shared by name into each
+  # workspace container via volume-subpath, so the model's files and
+  # the commands it runs see the same directory with real ownership.
+  workspaces:
   pg_data:
   minio_data:
   qdrant_data:
