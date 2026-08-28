@@ -1,4 +1,4 @@
-import type { Artifact, Citation, WebImage } from "./types";
+import type { Artifact, Citation, Plan, WebImage } from "./types";
 
 /**
  * The chat message model is a BLOCK TIMELINE, not a message with a steps-box.
@@ -73,6 +73,18 @@ export interface StepBlock {
   /** One-line outcome shown on the collapsed chip ("3 charts", "12 pages"). */
   summary?: string;
   error?: string;
+  /**
+   * What happened when this step's artifact was opened in a real browser.
+   * `running` while the check is in flight, so a 13-second 3D verification
+   * reads as work being done rather than as the run having hung.
+   */
+  verification?: {
+    state: "running" | "ok" | "failed";
+    attempt?: number;
+    errors?: string[];
+    warnings?: string[];
+    summary?: string;
+  };
 }
 
 export interface TextBlock {
@@ -129,6 +141,14 @@ export interface ChatTurn {
   artifacts: Artifact[];
   pending: boolean;
   error?: boolean;
+  /** The plan this turn is working to, when it made one. */
+  plan?: Plan;
+  /**
+   * What the supervisor is doing right now: planning, working, reviewing,
+   * repairing. Shown as a quiet status line — without it the pauses between
+   * passes look like the run has stalled.
+   */
+  phase?: string;
   createdAt: number;
 }
 

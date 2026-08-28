@@ -53,6 +53,14 @@ export interface ToolCall {
   error?: string;
   substeps?: Array<{ text: string; url?: string; detail?: string; state?: string }>;
   artifacts?: Artifact[];
+  /** Outcome of opening this step's artifact in a real browser. */
+  verification?: {
+    ok: boolean;
+    attempt?: number;
+    errors?: string[];
+    warnings?: string[];
+    summary?: string;
+  };
 }
 
 export interface Artifact {
@@ -61,6 +69,42 @@ export interface Artifact {
   bytes: number;
   tool?: string;
   url: string;
+  /**
+   * Whether the page was opened in a real browser and rendered without errors.
+   * `false` means it was released with known defects after the repair budget ran
+   * out — the user is being shown something that does not fully work, and the UI
+   * has to say so rather than presenting it like everything else.
+   * `undefined` means it was never gated (a chart rendered server-side to SVG).
+   */
+  verified?: boolean;
+  /** What still fails, when `verified` is false. */
+  defects?: string[];
+  /**
+   * JPEG screenshot captured during verification. Used as the poster frame for
+   * heavy embeds so a transcript with a dozen 3D scenes does not need a dozen
+   * live WebGL contexts — browsers cap those, and the early ones get killed.
+   */
+  preview?: string;
+}
+
+/** One step of the plan the assistant committed to at the start of a turn. */
+export interface PlanStep {
+  n: number;
+  title: string;
+  status: "pending" | "active" | "done" | "failed" | "skipped";
+  note?: string;
+}
+
+/**
+ * The ledger the supervised loop works to.
+ *
+ * Present only on turns that were planned — a greeting is not planned, and
+ * showing an empty plan rail on every reply would train people to ignore it.
+ */
+export interface Plan {
+  goal?: string;
+  steps: PlanStep[];
+  checks?: string[];
 }
 
 export interface WebImage {
@@ -126,6 +170,8 @@ export interface Message {
   citations: Citation[];
   artifacts?: Artifact[];
   images?: WebImage[];
+  /** The plan this turn worked to; `{}` for turns that did not need one. */
+  plan?: Plan | Record<string, never>;
   created_at: string;
 }
 

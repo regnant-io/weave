@@ -26,3 +26,34 @@ services:
       sh -c "python -m app.seed.seed &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000
              --reload --reload-dir /app/app"
+
+  frontend:
+    # `next dev` against the mounted source, for the same reason as the backend:
+    # the production image bakes a compiled .next, so every UI change otherwise
+    # costs a full rebuild before it can be looked at. node_modules is kept as an
+    # anonymous volume so the image's installed dependencies are not shadowed by
+    # the (absent) host directory.
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/tsconfig.json:/app/tsconfig.json
+      - ./frontend/next.config.mjs:/app/next.config.mjs
+      - ./frontend/tailwind.config.ts:/app/tailwind.config.ts
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs
+      - ./frontend/next-env.d.ts:/app/next-env.d.ts
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+      NEXT_TELEMETRY_DISABLED: "1"
+    command: ["npm", "run", "dev"]
+
+  render:
+    # Same reasoning as the backend: lib/*.js is the code most often adjusted
+    # while tuning what the model is allowed to emit, and rebuilding an image
+    # that inlines 6MB of Babylon to change a lint rule is not a dev loop.
+    # node_modules stays in the image; only the service source is mounted.
+    volumes:
+      - ./render-service/server.js:/app/server.js
+      - ./render-service/lib:/app/lib
+      - ./render-service/package.json:/app/package.json

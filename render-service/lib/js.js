@@ -202,8 +202,24 @@ export function lintHtml(html) {
     const attrs = m[1] || "";
     const body = m[2] || "";
     if (/\bsrc\s*=/i.test(attrs)) {
-      if (/src\s*=\s*["']?https?:/i.test(attrs)) {
+      // ANY src is wrong here, not just an http one.
+      //
+      // An artifact is a single file with no origin and no network, so
+      // `<script src="babylon.js">` fails exactly as completely as
+      // `<script src="https://cdn...">` — it just fails silently, leaving a
+      // blank page and no console error worth the name. Only a data: URI can
+      // actually resolve.
+      if (/src\s*=\s*["']?data:/i.test(attrs)) {
+        continue;
+      }
+      if (/src\s*=\s*["']?https?:|src\s*=\s*["']?\/\//i.test(attrs)) {
         add("error", `script #${idx} loads an external URL; artifacts have no network`);
+      } else {
+        add(
+          "error",
+          `script #${idx} loads a separate file; an artifact is ONE self-contained ` +
+            `document with no origin to resolve it against. Paste the code inline.`,
+        );
       }
       continue;
     }

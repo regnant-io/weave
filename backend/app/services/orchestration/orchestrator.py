@@ -26,7 +26,7 @@ from ..warehouse import get_warehouse
 from ..websearch import get_web_search
 from ..workspace import get_workspace_service
 from . import guardrails, prompts
-from .llm import OfflineEngine, TurnResult, get_engine
+from .llm import OfflineEngine, get_engine
 from .router import classify
 
 log = logging.getLogger("weave.orchestrator")
@@ -458,6 +458,10 @@ class Orchestrator:
         translate_fn = engine.translate
         engine_streamed = False
         history_trimmed = False
+        # The plan this turn worked to, when it had one. Persisted on the
+        # message so a reloaded conversation still shows what was attempted
+        # and what was ticked off, not just the prose that came out.
+        turn_plan: dict | None = None
         if getattr(engine, "available", False):
             system = self._system_prompt(project, language, passages, dataset_profile, integrity,
                                          effort, thread=thread, db=db,
@@ -496,30 +500,47 @@ class Orchestrator:
             )
             try:
                 _emit("answer_start", {})
-                while True:
-                    result: TurnResult = engine.generate(
-                        system=system, messages=messages, tools=tool_schemas,
-                        tool_executor=tool_executor, tier=route.tier,
-                        on_event=_emit, effort=effort, model=model,
-                        cancel=steer_cancel,
-                    )
-                    answer = result.text
-                    tool_events = result.tool_events
-                    tier_used = result.tier_used
-                    engine_streamed = getattr(engine, "name", "") == "ollama"
+                # --- the supervised loop ---------------------------------
+                # Not a single generate() call any more. See agent.py: the
+                # model no longer decides on its own that the work is done by
+                # going quiet, because "it stopped emitting tool calls" is not
+                # a definition of finished.
+                from .agent import Agent, LoopPolicy, looks_like_work
 
+                policy = LoopPolicy.for_effort(
+                    effort, complex_request=looks_like_work(user_text),
+                )
+                agent = Agent(
+                    engine=engine, system=system, messages=messages,
+                    tools=tool_schemas, tool_executor=tool_executor,
+                    emit=_emit, policy=policy, tier=route.tier, effort=effort,
+                    model=model, cancel=steer_cancel, user_text=user_text,
+                    capabilities=set(services.keys()),
+                )
+
+                def _after_pass(_result) -> str | None:
+                    """Steering, checked at the pass boundary.
+
+                    A redirect must be applied between passes rather than inside
+                    one: mid-pass the model may be halfway through a tool call,
+                    and splicing an instruction there produces a conversation
+                    that does not typecheck as a dialogue. See services/
+                    steering.py for why restarting beats splicing.
+                    """
                     if _steer_turn is None:
-                        break
+                        return None
                     redirects = steering.drain(assistant_msg.id)
-                    if not redirects or steer_cancel.cancelled:
-                        break
+                    if not redirects:
+                        return None
+                    if steer_cancel.cancelled:
+                        return "stop"
                     if steering.restarts_left(assistant_msg.id) <= 0:
                         # Out of budget: still deliver the redirect so it is not
                         # silently swallowed, but stop restarting so the turn
                         # terminates. It becomes context for the next turn.
                         for r in redirects:
                             _emit("steer_deferred", {"text": r["text"]})
-                        break
+                        return None
 
                     steering.note_restart(assistant_msg.id)
                     for r in redirects:
@@ -527,7 +548,7 @@ class Orchestrator:
                         # conversation as one. Marking it as mid-stream is what
                         # tells the model this supersedes the direction it was
                         # taking rather than being a fresh, separate request.
-                        messages.append({
+                        agent.messages.append({
                             "role": "user",
                             "content": (
                                 "[REDIRECT — sent while you were still working, and it "
@@ -542,6 +563,20 @@ class Orchestrator:
                     # overridden. Tell the client to clear it, so what is on
                     # screen matches what the model actually reasoned about.
                     _emit("answer_restart", {"reason": "steered"})
+                    return "restart"
+
+                agent.on_pass_end = _after_pass
+                run = agent.run()
+                answer = run.text
+                tool_events = run.tool_events
+                tier_used = run.tier_used
+                turn_plan = run.plan.to_json() if run.plan else None
+                engine_streamed = getattr(engine, "name", "") == "ollama"
+                log.info(
+                    "turn %s: %s after %d pass(es), %d review round(s), %d tool call(s)",
+                    assistant_msg.id, run.stopped_because, run.passes,
+                    run.review_rounds, len(tool_events),
+                )
             except Exception as exc:  # noqa: BLE001
                 # Remote LLM (Ollama/Anthropic) failed after retries -> degrade to
                 # the offline engine so the turn still completes rather than 500s.
@@ -590,6 +625,7 @@ class Orchestrator:
         # from the events the client actually received, which keeps the replayed
         # transcript identical to the live one by construction.
         assistant_msg.tool_calls = _step_timeline(progress_events)
+        assistant_msg.plan = turn_plan or {}
         # persist artifacts + images on the message so history re-renders them
         assistant_msg.artifacts = artifacts
         assistant_msg.images = images
@@ -642,6 +678,7 @@ class Orchestrator:
             "grounding_note": grounding_note if not grounded else "",
             "tool_events": tool_events, "progress": progress_events,
             "artifacts": artifacts, "images": images,
+            "plan": turn_plan,
             "thread_id": thread.id, "next_thread_id": next_thread_id,
             "context_window": context_window,
             "context_used": thread.token_estimate,
