@@ -242,21 +242,36 @@ class LoopPolicy:
     review: bool = True
     max_continuations: int = 3       # gap-driven "keep going" passes
     max_review_rounds: int = 1       # critic -> repair cycles
+    #: Hard ceiling on GENERATION passes for the whole turn, across every phase.
+    #:
+    #: The two limits above are per-phase, and they compose multiplicatively:
+    #: the working loop may run `max_continuations + 1` passes, and then EACH
+    #: review round calls the same loop again with a repair brief. At Tapestry
+    #: that is 6 + 2x6 = eighteen generations, each of which may make up to
+    #: forty tool calls. Nobody chose eighteen; it is what two independently
+    #: reasonable numbers multiply out to, and the first time anyone notices is
+    #: when a single question has been running for twenty minutes and the
+    #: session quota is gone. A ceiling on the total is the only bound that
+    #: cannot be defeated by a new phase being added later.
+    max_total_passes: int = 8
 
     @classmethod
     def for_effort(cls, effort: str | None, *, complex_request: bool) -> "LoopPolicy":
         level = (effort or "weave").lower()
         if level == "spool":
             # Quick answers stay quick. One pass, no ceremony.
-            return cls(plan=False, review=False, max_continuations=1, max_review_rounds=0)
+            return cls(plan=False, review=False, max_continuations=1,
+                       max_review_rounds=0, max_total_passes=2)
         if level == "tapestry":
-            return cls(plan=True, review=True, max_continuations=5, max_review_rounds=2)
+            return cls(plan=True, review=True, max_continuations=5,
+                       max_review_rounds=2, max_total_passes=10)
         # weave (default): supervise real work, stay out of the way of chat.
         return cls(
             plan=complex_request,
             review=complex_request,
             max_continuations=3 if complex_request else 1,
             max_review_rounds=1 if complex_request else 0,
+            max_total_passes=6 if complex_request else 2,
         )
 
 
@@ -325,6 +340,7 @@ class Agent:
         cancel=None,
         user_text: str = "",
         capabilities: set[str] | None = None,
+        parallel_safe: set[str] | None = None,
         on_pass_end: Callable[[Any], str | None] | None = None,
     ) -> None:
         self.engine = engine
@@ -340,6 +356,10 @@ class Agent:
         self.cancel = cancel
         self.user_text = user_text
         self.capabilities = capabilities or set()
+        #: Names of tools the registry says may run concurrently with each
+        #: other. Passed straight through to the engine, which is where a
+        #: model turn's tool calls are actually dispatched.
+        self.parallel_safe = parallel_safe or set()
         #: Called after each generation pass. Returns "restart" when the turn was
         #: steered and the conversation was rewritten underneath us, in which
         #: case gap-checking this pass would be judging superseded work.
@@ -367,7 +387,7 @@ class Agent:
             stopped = self._review_and_repair() or stopped
 
         return AgentResult(
-            text="\n\n".join(t for t in self._texts if t.strip()).strip(),
+            text=_compose(self._texts),
             tool_events=self.tool_events,
             tier_used=self.tier,
             plan=self.plan if self.plan.exists else None,
@@ -485,6 +505,10 @@ class Agent:
         for _ in range(max(1, self.policy.max_continuations + 1)):
             if self._cancelled():
                 return "cancelled"
+            if self._passes >= self.policy.max_total_passes:
+                log.info("agent hit the whole-turn pass budget (%d)",
+                         self.policy.max_total_passes)
+                return "budget"
 
             self._passes += 1
             before = self._progress_marker
@@ -500,6 +524,7 @@ class Agent:
                 effort=self.effort,
                 model=self.model,
                 cancel=self.cancel,
+                parallel_safe=self.parallel_safe,
             )
             text = (result.text or "").strip()
             if text:
@@ -1056,6 +1081,60 @@ def _repair_brief(defects: list[str]) -> str:
         "review; they only care about the outcome.",
     ]
     return "\n".join(lines)
+
+
+def _compose(parts: list[str]) -> str:
+    """Join what the model said across every pass into ONE answer.
+
+    THE PROBLEM THIS SOLVES, AND WHY IT GOT WORSE THE DEEPER YOU SET THE DIAL
+
+    A supervised turn generates several times: once per continuation pass, once
+    more per repair round. Each pass produces prose, and the delivered answer
+    was every pass concatenated. That is right in principle -- continuation
+    passes are instructed to do the REMAINING work, so their text is
+    incremental -- and wrong in practice, because models re-orient themselves
+    when handed a conversation. A continuation pass reliably restates the
+    problem, and a repair pass restates the parts that were already fine before
+    describing what it changed.
+
+    With one continuation the duplication is a paragraph. At Tapestry -- five
+    continuations and two review-and-repair rounds -- it is the same material
+    up to eight times over, often with the later statement contradicting the
+    earlier one because the work changed underneath it. Which is exactly the
+    shape of "the deep setting produces a worse answer than the quick one":
+    more passes meant more repetition, and the mode that was supposed to be the
+    most rigorous read as the most confused.
+
+    Deduplicating by paragraph fixes it without discarding anything real. When
+    a later pass repeats a paragraph, the LATER copy goes: the earlier one is
+    where the reader first met the idea, and the reading order stays intact.
+    Comparison is on normalised text -- case, whitespace and punctuation
+    removed -- because models rarely repeat themselves byte for byte. Short
+    paragraphs are exempt: "Done." and "Here is the code:" are legitimately
+    repeated, and suppressing those removes signposts rather than duplication.
+    """
+    seen: set[str] = set()
+    kept: list[str] = []
+    for part in parts:
+        if not part or not part.strip():
+            continue
+        for para in part.split("\n\n"):
+            body = para.strip()
+            if not body:
+                continue
+            key = _normalise(body)
+            if len(key) >= 60:
+                if key in seen:
+                    continue
+                seen.add(key)
+            kept.append(body)
+    return "\n\n".join(kept).strip()
+
+
+def _normalise(text: str) -> str:
+    """Case-, space- and punctuation-insensitive form, for repetition checks."""
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 def _string_list(raw: Any) -> list[str]:

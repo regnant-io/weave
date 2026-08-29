@@ -528,6 +528,7 @@ def register_visual_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="list_visuals",
+        parallel_safe=True,
         description=(
             "List every visual already generated in this project, with its visual_id, "
             "title and type. Call this before revising or deleting so you edit the right "

@@ -56,6 +56,23 @@ class Tool:
     # Router intents this tool is offered for (empty = all). Keeps the model from
     # e.g. web-searching a concept explanation.
     intents: tuple[str, ...] = ()
+    #: May this tool run CONCURRENTLY with other calls in the same model turn?
+    #:
+    #: Models routinely ask for several independent reads at once -- three web
+    #: searches, four files -- and running them one after another makes a turn
+    #: take as long as the sum of its slowest parts for no reason. Concurrency is
+    #: opt-in per tool rather than global because two things make it unsafe:
+    #:
+    #:   * TOUCHING THE DATABASE. `ctx.db` is one SQLAlchemy Session, and a
+    #:     Session is explicitly not thread-safe. Anything reading or writing
+    #:     through it (analysis, library search, canvas, memory) stays serial.
+    #:   * CHANGING THE WORLD. Two writes to the same workspace path, or two
+    #:     renders of the same artifact, have an order that matters and a result
+    #:     that depends on it. Only reads are marked safe.
+    #:
+    #: The default is False: a new tool is serial until someone has thought
+    #: about it, which is the right way round for a correctness property.
+    parallel_safe: bool = False
 
     #: Present-tense label the model writes for the UI step chip. Declared on
     #: every tool so the model can narrate its own work; stripped by the
@@ -120,6 +137,10 @@ class ToolRegistry:
                 continue
             out.append(t)
         return out
+
+    def parallel_safe_names(self) -> set[str]:
+        """Names of tools that may run concurrently with each other."""
+        return {t.name for t in self._tools.values() if t.parallel_safe}
 
     def schemas(self, *, mode: str, trust: str, services: dict[str, Any],
                 intent: str | None = None, force: set[str] | None = None) -> list[dict]:

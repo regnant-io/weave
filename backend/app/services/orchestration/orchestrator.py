@@ -10,7 +10,9 @@ Exposes `stream_turn` — a generator of Server-Sent-Event payloads (architectur
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
+import threading as _threading
 from collections.abc import Iterator
 from typing import Any
 
@@ -316,6 +318,12 @@ class Orchestrator:
         _web_tools = {"web_search", "deep_research"}
 
         _step_seq = {"n": 0}
+        # Tool calls from one model turn can now run concurrently (see
+        # Tool.parallel_safe), so the per-turn bookkeeping below is shared
+        # mutable state reached from several threads. The counters guard real
+        # limits -- sandbox runs, web calls, container starts -- and a lost
+        # increment is a limit that silently does not hold.
+        _turn_lock = _threading.Lock()
 
         # The artifact gate. Nothing a tool renders reaches the transcript until
         # it has been opened in a real browser — see services/orchestration/
@@ -331,21 +339,24 @@ class Orchestrator:
         def tool_executor(name: str, tool_input: dict) -> dict:
             # Per-turn caps: a runaway agentic loop must not hammer the sandbox or
             # crawl the web unboundedly (defence-in-depth atop the iter limit).
-            if name == "run_analysis":
-                _counts["sandbox"] += 1
-                if _counts["sandbox"] > _s.max_sandbox_runs_per_turn:
-                    return {"status": "rejected", "error": "sandbox run limit reached for this turn"}
-            if name in _web_tools:
-                _counts["web"] += 1
-                if _counts["web"] > _s.max_web_calls_per_turn:
-                    return {"status": "rejected", "error": "web call limit reached for this turn"}
-            if name == "workspace_exec":
-                # Each exec starts a container; a looping agent would otherwise
-                # spawn hundreds in a single turn.
-                _counts["exec"] += 1
-                if _counts["exec"] > _s.max_workspace_execs_per_turn:
-                    return {"status": "rejected",
-                            "error": "workspace command limit reached for this turn"}
+            with _turn_lock:
+                if name == "run_analysis":
+                    _counts["sandbox"] += 1
+                    if _counts["sandbox"] > _s.max_sandbox_runs_per_turn:
+                        return {"status": "rejected",
+                                "error": "sandbox run limit reached for this turn"}
+                if name in _web_tools:
+                    _counts["web"] += 1
+                    if _counts["web"] > _s.max_web_calls_per_turn:
+                        return {"status": "rejected",
+                                "error": "web call limit reached for this turn"}
+                if name == "workspace_exec":
+                    # Each exec starts a container; a looping agent would
+                    # otherwise spawn hundreds in a single turn.
+                    _counts["exec"] += 1
+                    if _counts["exec"] > _s.max_workspace_execs_per_turn:
+                        return {"status": "rejected",
+                                "error": "workspace command limit reached for this turn"}
 
             tool_input = dict(tool_input or {})
             # `note` is the model-authored step title. It is a UI concern, never a
@@ -355,8 +366,9 @@ class Orchestrator:
             # step chip is never blank and never waits on the model.
             note = tool_input.pop("note", None)
 
-            _step_seq["n"] += 1
-            step_id = f"st{_step_seq['n']}"
+            with _turn_lock:
+                _step_seq["n"] += 1
+                step_id = f"st{_step_seq['n']}"
             _emit("step_start", {
                 "id": step_id,
                 "tool": name,
@@ -387,21 +399,39 @@ class Orchestrator:
             # every tool implementation untouched.
             gated = gate.gates(name)
             buffered: list[dict] = []
-            saved_emit = ctx.emit
-            if gated:
-                def _capture(event: str, data: dict) -> None:
-                    if event == "artifact":
-                        buffered.append(dict(data))
-                        return
-                    saved_emit(event, data)
+            saved_emit = _emit
 
-                ctx.emit = _capture
+            def _scoped(event: str, data: dict) -> None:
+                """Everything a tool emits belongs to THIS step.
 
-            try:
-                result = registry.execute(name, ctx, tool_input)
-            finally:
-                if gated:
-                    ctx.emit = saved_emit
+                Substeps used to arrive unlabelled and the client attached them
+                to whatever step it had most recently seen start. With one tool
+                running at a time that is the same thing; with several running
+                concurrently it is not, and the progress of one search would
+                appear underneath another. Stamping the id at the boundary means
+                no tool has to know its own step number, and the client can stop
+                guessing from ordering.
+                """
+                if event == "artifact" and gated:
+                    # Held back until the artifact has been proven to render --
+                    # see the comment above and services/orchestration/
+                    # verification.py.
+                    buffered.append(dict(data))
+                    return
+                payload = data if "id" in data else {**data, "id": step_id}
+                saved_emit(event, payload)
+
+            # A COPY, not a mutation.
+            #
+            # `ctx` is one object shared by every tool in the turn. Swapping its
+            # `emit` for the duration of a call was fine while calls were
+            # strictly sequential and is a race the moment two of them overlap:
+            # the second call's assignment wins, the first call's events are
+            # stamped with the wrong step, and on a gated tool its artifacts are
+            # buffered into the wrong list. Giving each call its own context
+            # object costs one shallow copy and removes the whole class of bug.
+            call_ctx = dataclasses.replace(ctx, emit=_scoped)
+            result = registry.execute(name, call_ctx, tool_input)
 
             verdict = None
             if gated:
@@ -535,6 +565,11 @@ class Orchestrator:
                     emit=_emit, policy=policy, tier=route.tier, effort=effort,
                     model=model, cancel=steer_cancel, user_text=user_text,
                     capabilities=set(services.keys()),
+                    # Which of this turn's tools may run concurrently. Decided by
+                    # the registry (see Tool.parallel_safe), not here: whether a
+                    # tool touches the database or changes the world is a
+                    # property of the tool.
+                    parallel_safe=registry.parallel_safe_names(),
                 )
 
                 def _after_pass(_result) -> str | None:
@@ -590,7 +625,7 @@ class Orchestrator:
                 tool_events = run.tool_events
                 tier_used = run.tier_used
                 turn_plan = run.plan.to_json() if run.plan else None
-                engine_streamed = getattr(engine, "name", "") == "ollama"
+                engine_streamed = bool(getattr(engine, "streams", False))
                 log.info(
                     "turn %s: %s after %d pass(es), %d review round(s), %d tool call(s)",
                     assistant_msg.id, run.stopped_because, run.passes,

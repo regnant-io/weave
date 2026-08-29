@@ -41,6 +41,77 @@ class TurnResult:
     tier_used: str = "offline"
 
 
+#: How many tool calls from one model turn may be in flight at once.
+#:
+#: Small on purpose. The point is to stop three web searches taking three times
+#: as long as one, not to saturate the machine: every one of these holds a
+#: worker thread, and with a thousand students on one instance the thread count
+#: is the scarce resource, not the latency of any single call.
+MAX_PARALLEL_TOOLS = 4
+
+
+def _run_tool_calls(
+    calls: list[tuple[str, dict]],
+    tool_executor: ToolExecutor,
+    parallel_safe: set[str] | None,
+    *,
+    cancel=None,
+) -> list[tuple[str, dict, dict]]:
+    """Execute one model turn's tool calls, concurrently when that is safe.
+
+    Returns `(name, args, result)` IN THE ORDER THE MODEL ASKED FOR THEM,
+    whatever order they actually completed in. That matters: the results go back
+    into the conversation as messages, and a model that asked A-then-B and is
+    answered B-then-A has been handed a transcript of a turn that did not
+    happen.
+
+    Concurrency is all-or-nothing per batch. A mixed batch runs serially rather
+    than being split, because the interesting mixed case -- read a file, then
+    write it -- is precisely the one where reordering is wrong, and the
+    valuable case (several independent lookups at once) is homogeneous anyway.
+    """
+    if not calls:
+        return []
+
+    safe = parallel_safe or set()
+    if len(calls) < 2 or not all(name in safe for name, _ in calls):
+        out = []
+        for name, args in calls:
+            if cancel is not None and cancel.is_set():
+                out.append((name, args, {
+                    "status": "cancelled",
+                    "error": "the user stopped this turn before this ran",
+                }))
+                continue
+            out.append((name, args, tool_executor(name, args)))
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: list[dict | None] = [None] * len(calls)
+
+    def run(i: int) -> None:
+        name, args = calls[i]
+        if cancel is not None and cancel.is_set():
+            results[i] = {"status": "cancelled",
+                          "error": "the user stopped this turn before this ran"}
+            return
+        try:
+            results[i] = tool_executor(name, args)
+        except Exception as exc:  # noqa: BLE001 - a thread must not die silently
+            log.warning("parallel tool %s failed: %s", name, exc)
+            results[i] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_PARALLEL_TOOLS, len(calls)),
+        thread_name_prefix="weave-tool",
+    ) as pool:
+        list(pool.map(run, range(len(calls))))
+
+    return [(calls[i][0], calls[i][1], results[i] or {"status": "error", "error": "no result"})
+            for i in range(len(calls))]
+
+
 # --------------------------------------------------------------------------- #
 #  Ollama engine (fully-local LLM — no API key)                               #
 # --------------------------------------------------------------------------- #
@@ -55,6 +126,11 @@ class OllamaEngine:
 
     available = True
     name = "ollama"
+    #: Whether `generate` emits `token` events as the answer is produced.
+    #: The orchestrator asks the ENGINE rather than comparing `name` against a
+    #: hard-coded string -- which is how the Anthropic path kept re-emitting an
+    #: answer it had already streamed for months after it learned to stream.
+    streams = True
 
     def __init__(self, client=None) -> None:
         import httpx  # dependency already present
@@ -440,6 +516,7 @@ class OllamaEngine:
         model: str | None = None,
         effort: str | None = None,
         cancel=None,            # threading.Event: stop promptly on client disconnect
+        parallel_safe: set[str] | None = None,
     ) -> TurnResult:
         """Agentic tool loop with TRUE token streaming.
 
@@ -465,7 +542,17 @@ class OllamaEngine:
         ollama_tools = self._to_ollama_tools(tools)
         convo: list[dict[str, Any]] = [{"role": "system", "content": system}, *messages]
         tool_events: list[dict] = []
-        final_text = ""
+        #: Every non-empty thing the model SAID this turn, in order.
+        #:
+        #: This used to be a single `final_text` assigned only on the step that
+        #: emitted no tool calls. Models routinely write a paragraph and then
+        #: call a tool -- "Here is what the survey found; let me chart it" --
+        #: and that paragraph was streamed to the screen and then thrown away,
+        #: because the turn's stored text was whatever the LAST step happened to
+        #: say. The transcript was right until the page was reloaded, at which
+        #: point half the answer had never been saved. Keeping every part means
+        #: what is persisted is what the reader actually saw.
+        said: list[str] = []
 
         def _cancelled() -> bool:
             return cancel is not None and cancel.is_set()
@@ -493,6 +580,19 @@ class OllamaEngine:
 
             content_parts: list[str] = []
             tool_calls: list[dict] = []
+            #: Characters actually pushed to the client for THIS step. Distinct
+            #: from `content_parts`, which is what we will keep -- the two
+            #: diverge exactly when a stream dies part-way and has to be
+            #: re-issued, which is the case handled below.
+            emitted = ""
+
+            def _emit_token(text: str) -> None:
+                nonlocal emitted
+                if not text or on_event is None:
+                    return
+                emitted += text
+                on_event("token", {"text": text})
+
             try:
                 # Rate limits are handled INSIDE the streaming request, by
                 # checking the status before consuming the body.
@@ -533,8 +633,7 @@ class OllamaEngine:
                             delta = m.get("content", "") or ""
                             if delta:
                                 content_parts.append(delta)
-                                if on_event:
-                                    on_event("token", {"text": delta})
+                                _emit_token(delta)
                             if m.get("tool_calls"):
                                 tool_calls.extend(m["tool_calls"])
                             if obj.get("done"):
@@ -546,10 +645,31 @@ class OllamaEngine:
                 resp2 = self._post_chat({**payload, "stream": False}, on_event=on_event)
                 m = resp2.json().get("message", {}) or {}
                 text = m.get("content", "") or ""
-                if text and on_event:
-                    on_event("token", {"text": text})
-                content_parts = [text]
                 tool_calls = m.get("tool_calls") or []
+                content_parts = [text]
+                if emitted:
+                    # The stream died PART-WAY THROUGH. Whatever it managed to
+                    # send is already on the user's screen, and the retry above
+                    # generated the answer again from the beginning -- so
+                    # emitting it wholesale printed the opening of the answer
+                    # twice, interleaved with itself. That is the "overlapping
+                    # tokens" fault, and it is invisible in the logs because
+                    # both halves are individually correct.
+                    if text.startswith(emitted):
+                        # The regeneration agrees with what was shown. Send only
+                        # what the reader has not seen.
+                        _emit_token(text[len(emitted):])
+                    else:
+                        # It diverged. There is no way to splice two different
+                        # continuations into one honest answer, so retract what
+                        # was shown and replay the whole thing. `answer_restart`
+                        # is the same event steering uses for exactly this.
+                        if on_event:
+                            on_event("answer_restart", {"reason": "stream_recovered"})
+                        emitted = ""
+                        _emit_token(text)
+                else:
+                    _emit_token(text)
 
             step_text = "".join(content_parts)
             convo.append({
@@ -557,10 +677,14 @@ class OllamaEngine:
                 **({"tool_calls": tool_calls} if tool_calls else {}),
             })
 
-            if not tool_calls:
-                final_text = step_text
-                return TurnResult(text=final_text.strip(), tool_events=tool_events, tier_used=tier)
+            if step_text.strip():
+                said.append(step_text.strip())
 
+            if not tool_calls:
+                return TurnResult(text="\n\n".join(said).strip(),
+                                  tool_events=tool_events, tier_used=tier)
+
+            calls = []
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
@@ -570,12 +694,21 @@ class OllamaEngine:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
-                result = tool_executor(name, args)
-                tool_events.append({"name": name, "input": args, "result": result})
-                convo.append({"role": "tool", "tool_name": name, "content": _stringify_tool_result(result)})
+                calls.append((name, args))
 
+            for name, args, result in _run_tool_calls(
+                calls, tool_executor, parallel_safe, cancel=cancel,
+            ):
+                tool_events.append({"name": name, "input": args, "result": result})
+                convo.append({"role": "tool", "tool_name": name,
+                              "content": _stringify_tool_result(result)})
+
+        said.append(
+            "(I reached the limit on how many tool calls one turn may make, so this "
+            "is as far as I got.)"
+        )
         return TurnResult(
-            text=final_text or "(reached the tool-iteration limit).",
+            text="\n\n".join(said).strip(),
             tool_events=tool_events, tier_used=tier,
         )
 
@@ -600,6 +733,7 @@ class OllamaEngine:
 class AnthropicEngine:
     available = True
     name = "anthropic"
+    streams = True
 
     def __init__(self) -> None:
         from anthropic import Anthropic  # imported lazily; may raise ImportError
@@ -647,35 +781,77 @@ class AnthropicEngine:
         tier: str,
         max_iters: int | None = None,
         on_event=None, model: str | None = None, effort: str | None = None, cancel=None,
+        parallel_safe: set[str] | None = None,
     ) -> TurnResult:
+        """Agentic tool loop, STREAMED.
+
+        This path used to call `messages.create` and hand back the finished
+        answer. Everything above it — the SSE route, the smoother, the whole
+        transcript — is built to render text as it is produced, so on the
+        Anthropic engine the user watched a blank turn for however long the
+        model took and then received the entire answer in one frame. Worse, the
+        orchestrator's `engine_streamed` flag is only set for Ollama, so the
+        finished text was then re-emitted through a fake token generator: the
+        product's own fallback for "this engine cannot stream" was hiding the
+        fact that this engine can.
+
+        It also ignored `cancel`, so pressing Stop released the client while the
+        model kept generating and the tools kept running.
+        """
         max_iters = max_iters or settings.llm_max_tool_iters
         model = model or self.model_for_tier(tier)
         convo = [self._with_images(m) for m in messages]
         tool_events: list[dict] = []
+        said: list[str] = []
+
+        def _cancelled() -> bool:
+            return cancel is not None and cancel.is_set()
 
         for _ in range(max_iters):
-            resp = self._client.messages.create(
+            if _cancelled():
+                break
+
+            assistant_content: list[dict] = []
+            step_text = ""
+            stop_reason = "end_turn"
+
+            with self._client.messages.stream(
                 model=model,
                 max_tokens=settings.llm_max_tokens,
                 system=system,
                 tools=tools or [],
                 messages=convo,
-            )
-            # collect assistant content
-            assistant_content = [self._block_to_dict(b) for b in resp.content]
+            ) as stream:
+                for chunk in stream.text_stream:
+                    if _cancelled():
+                        break
+                    if chunk:
+                        step_text += chunk
+                        if on_event:
+                            on_event("token", {"text": chunk})
+                if _cancelled():
+                    # Leave the socket rather than draining a response nobody
+                    # is waiting for.
+                    break
+                final = stream.get_final_message()
+                stop_reason = final.stop_reason
+                assistant_content = [self._block_to_dict(b) for b in final.content]
+                tool_uses = [b for b in final.content if b.type == "tool_use"]
+
             convo.append({"role": "assistant", "content": assistant_content})
+            if step_text.strip():
+                said.append(step_text.strip())
 
-            if resp.stop_reason != "tool_use":
-                text = "".join(b.text for b in resp.content if b.type == "text")
-                return TurnResult(text=text.strip(), tool_events=tool_events, tier_used=tier)
+            if stop_reason != "tool_use":
+                return TurnResult(text="\n\n".join(said).strip(),
+                                  tool_events=tool_events, tier_used=tier)
 
-            # execute each requested tool, feed results back
+            calls = [(b.name, dict(b.input)) for b in tool_uses]
+            outcomes = _run_tool_calls(calls, tool_executor, parallel_safe, cancel=cancel)
+
             tool_results = []
-            for block in resp.content:
-                if block.type != "tool_use":
-                    continue
-                result = tool_executor(block.name, dict(block.input))
-                tool_events.append({"name": block.name, "input": dict(block.input), "result": result})
+            for block, (name, args, result) in zip(tool_uses, outcomes):
+                tool_events.append({"name": name, "input": args, "result": result})
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -683,8 +859,15 @@ class AnthropicEngine:
                 })
             convo.append({"role": "user", "content": tool_results})
 
+        if _cancelled():
+            return TurnResult(text="\n\n".join(said).strip(),
+                              tool_events=tool_events, tier_used=tier)
+        said.append(
+            "(I reached the limit on how many tool calls one turn may make, so this "
+            "is as far as I got.)"
+        )
         return TurnResult(
-            text="(The assistant reached the tool-iteration limit before finishing.)",
+            text="\n\n".join(said).strip(),
             tool_events=tool_events, tier_used=tier,
         )
 
@@ -718,6 +901,7 @@ def _stringify_tool_result(result: dict) -> str:
 class OfflineEngine:
     available = False
     name = "offline"
+    streams = False
 
     def model_for_tier(self, tier: str) -> str:
         return "offline-deterministic"
