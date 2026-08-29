@@ -25,13 +25,24 @@ discretion entirely. Every artifact-producing tool call is intercepted:
      where it sits, the tool failed.
   4. Only a clean artifact is released to the user.
 
-REPAIR BUDGET
--------------
-Three attempts per artifact, then it is released with its defects recorded and
-the model is told to say plainly what still does not work. The budget exists
-because an unbounded repair loop against a model that cannot fix the problem is
-just a slower way to fail, and because a broken artifact plus an honest
-description of how it is broken is far more useful than silence.
+REPAIR BUDGET, AND WHY REPAIR MEANS EDIT
+----------------------------------------
+Three attempts per artifact -- the first render plus two repairs -- then it is
+released with its defects recorded and the model is told to say plainly what
+still does not work. The budget exists because an unbounded repair loop against
+a model that cannot fix the problem is just a slower way to fail, and because a
+broken artifact plus an honest description of how it is broken is far more
+useful than silence.
+
+Those two repairs are only worth having if they CONVERGE, and a repair brief
+that says "call the tool again with the corrected version" does not. Asked to
+re-emit four hundred lines of scene code to fix a missing `return`, a model
+writes four hundred different lines with a different fault in them; the budget
+is spent moving sideways and the user watches the same thing break three times
+in three new ways. So the brief names the stored artifact's id and asks for the
+smallest edit that fixes the fault, against a source the system still holds
+(see render/visuals.py). Everything that already worked stays byte-identical,
+which is what makes two attempts enough.
 
 WHAT IS DELIBERATELY NOT DONE HERE
 ----------------------------------
@@ -85,6 +96,10 @@ class Verdict:
     #: Design problems found by LOOKING at the render. Distinct from `errors`:
     #: the page works, it just is not good enough yet. See `ArtifactGate.polish`.
     polish_notes: list[str] = field(default_factory=list)
+    #: The stored id of the artifact that failed, when it has one. Present means
+    #: the thing can be EDITED rather than rebuilt, which changes what the model
+    #: is told to do about it -- see `_repair_brief`.
+    visual_id: str = ""
 
     @property
     def needs_polish(self) -> bool:
@@ -197,6 +212,7 @@ class ArtifactGate:
         return Verdict(
             checked=True,
             ok=ok,
+            visual_id=str(result.get("visual_id") or tool_input.get("visual_id") or ""),
             errors=errors,
             warnings=warnings,
             attempt=attempt,
@@ -350,6 +366,21 @@ def _repair_brief(tool_name: str, verdict: Verdict) -> str:
     Written as an instruction, not a description. A model handed a list of
     symptoms will sometimes acknowledge them and carry on; a model handed
     "fix these and call the tool again" repairs.
+
+    AND IT MUST ASK FOR AN EDIT, NOT A REBUILD.
+
+    This used to end with "call `create_3d_experience` again with the corrected
+    version", which is an instruction to regenerate the whole artifact. For a
+    four-hundred-line scene that is a request to write four hundred new lines,
+    and the new ones have a new fault in them roughly as often as the old ones
+    did -- so the repair budget gets spent going sideways, and the user watches
+    the same thing break three times in different ways.
+
+    When the artifact was stored it has an id, and `update_visual` can now edit
+    any kind of visual in place against its saved source. So the brief names the
+    id and asks for the smallest change that fixes the fault. Only when there is
+    no id -- the render was rejected before anything was saved -- does it fall
+    back to asking for the tool again.
     """
     lines = [
         f"This artifact does NOT work. It was opened in a real browser and it failed. "
@@ -362,22 +393,49 @@ def _repair_brief(tool_name: str, verdict: Verdict) -> str:
         lines.append("")
         lines.append("Also worth fixing:")
         lines += [f"  - {w}" for w in verdict.warnings[:4]]
-    lines += [
-        "",
-        "It has NOT been shown to the user. Fix the cause and call "
-        f"`{tool_name}` again with the corrected version.",
-    ]
-    if any("did not return" in e.lower() for e in verdict.errors):
+
+    lines.append("")
+    lines.append("It has NOT been shown to the user.")
+    if verdict.visual_id:
+        lines += [
+            "",
+            f"FIX IT BY EDITING IT. Call `update_visual` with "
+            f'visual_id="{verdict.visual_id}" and only the part that changes.',
+            "",
+            "Change the smallest thing that fixes the fault above and leave every "
+            "other line exactly as it is. Do NOT write the artifact again from "
+            "scratch: everything that already worked is currently correct, and "
+            "regenerating it replaces one fault with a different one. If you cannot "
+            "remember what you wrote, that is the strongest possible reason to edit "
+            "rather than rewrite — the stored version is the one that is real.",
+        ]
+    else:
+        lines += [
+            "",
+            f"Nothing was stored, so there is nothing to edit. Fix the cause and call "
+            f"`{tool_name}` again with the corrected version.",
+        ]
+
+    if any("did not return" in e.lower() or "without returning" in e.lower()
+           for e in verdict.errors):
         lines.append(
             "Hint: the scene function must END with `return scene;` — creating the "
             "scene is not enough."
         )
-    if any("no visible content" in e.lower() or "rendered nothing" in e.lower()
+    if any("does not parse" in e.lower() or "syntaxerror" in e.lower()
            for e in verdict.errors):
+        lines.append(
+            "Hint: a parse error is almost always an unclosed bracket, brace or "
+            "string, or a stray comma. Read the line named above and the two around "
+            "it; the rest of the file is fine."
+        )
+    if any("no visible content" in e.lower() or "rendered nothing" in e.lower()
+           or "no marks" in e.lower() for e in verdict.errors):
         lines.append(
             "Hint: a page that throws nothing and draws nothing usually means the "
             "setup code never ran, or it drew into an element that is not in the "
-            "document. Check that a camera and a light exist for a 3D scene."
+            "document. Check that a camera and a light exist for a 3D scene, and "
+            "that field names in a chart spec match the data exactly."
         )
     return "\n".join(lines)
 
