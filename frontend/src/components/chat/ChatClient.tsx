@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type {
   Artifact,
   Citation,
@@ -190,6 +199,9 @@ export default function ChatClient({
 
   // right-hand panels (independent surfaces, several may be open)
   const dock = usePanelDock();
+  // Pulled out so the callbacks below depend on a stable function rather than
+  // on the dock object, which is a prop-identity dependency of every turn.
+  const { openPanel } = dock;
   const [menuOpen, setMenuOpen] = useState(false);
 
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
@@ -282,9 +294,10 @@ export default function ChatClient({
   // paint. `useEffect` runs after the browser has already painted the taller
   // content, so at the exact bottom every token produced a one-frame up-jump
   // followed by a catch-up. `useLayoutEffect` closes that gap entirely.
+  const keepPinned = scroller.keep;
   useLayoutEffect(() => {
-    scroller.keep();
-  }, [turns, scroller]);
+    keepPinned();
+  }, [turns, keepPinned]);
 
   /** Land a block at the end of the timeline, flushing buffered prose first. */
   const appendBlock = useCallback(
@@ -405,8 +418,8 @@ export default function ChatClient({
   // Clicking generated content in the transcript opens the panel that owns
   // that kind of artifact, rather than a generic viewer.
   const openArtifact = useCallback(
-    (a: Artifact) => dock.openPanel(categorise(a)),
-    [dock],
+    (a: Artifact) => openPanel(categorise(a)),
+    [openPanel],
   );
 
   async function regenerate() {
@@ -897,18 +910,36 @@ export default function ChatClient({
 
   /* ------------------------------------------------------------ derived UI */
 
+  /*
+    EVERYTHING BELOW IS DERIVED FROM THE WHOLE TRANSCRIPT, AND NONE OF IT IS
+    URGENT.
+
+    `payload`, `counts`, `railTurns` and `contextUsed` each walk every turn in
+    the conversation. Computed from `turns` directly they ran on every streamed
+    chunk — sixty times a second, over a transcript that only grows — to update
+    a panel badge, a rail label and a context gauge, none of which anyone reads
+    while text is arriving. On a long chat that is the single largest per-token
+    cost in this component, and it is spent on the least important pixels.
+
+    `useDeferredValue` lets React render the growing text at normal priority and
+    recompute these once the burst settles. The numbers lag by a frame or two
+    during a stream and are exact the moment it stops, which is the correct
+    trade for a badge.
+  */
+  const settledTurns = useDeferredValue(turns);
+
   const payload = useMemo(
     () => ({
       previewUrl,
-      artifacts: turns.flatMap(turnArtifacts),
-      images: turns.flatMap((t) => t.images) as WebImage[],
-      citations: turns.flatMap((t) => t.citations) as Citation[],
+      artifacts: settledTurns.flatMap(turnArtifacts),
+      images: settledTurns.flatMap((t) => t.images) as WebImage[],
+      citations: settledTurns.flatMap((t) => t.citations) as Citation[],
       datasets,
       // The canvas panel loads its own document rather than reading from the
       // turn stream, so it needs the project it belongs to.
       projectId,
     }),
-    [turns, datasets, projectId, previewUrl],
+    [settledTurns, datasets, projectId, previewUrl],
   );
 
   const counts = useMemo(() => panelCounts(payload), [payload]);
@@ -917,9 +948,9 @@ export default function ChatClient({
   // Same chars/token ratio the server budgets with, so the gauge and the actual
   // trimming decision never disagree.
   const contextUsed = useMemo(() => {
-    const chars = turns.reduce((n, t) => n + turnText(t).length, 0);
+    const chars = settledTurns.reduce((n, t) => n + turnText(t).length, 0);
     return Math.ceil(chars / 3.6);
-  }, [turns]);
+  }, [settledTurns]);
 
   const markAnswered = useCallback((id: string) => {
     setTurns((prev) =>
@@ -936,12 +967,12 @@ export default function ChatClient({
 
   const railTurns = useMemo(
     () =>
-      turns.map((t) => ({
+      settledTurns.map((t) => ({
         id: t.id,
         role: t.role,
         label: (turnText(t) || "…").slice(0, 90),
       })),
-    [turns],
+    [settledTurns],
   );
 
   // Track which turn is in view for the rail.
@@ -1057,7 +1088,16 @@ export default function ChatClient({
           */}
           <div
             className="pad-chrome-top mx-auto w-full min-w-0 max-w-chat px-4"
-            style={{ paddingBottom: "calc(11rem + var(--safe-bottom) + var(--kb-inset))" }}
+            /*
+              Cleared against the composer's MEASURED height (published as
+              --composer-h, which already includes the safe area and any bar
+              stacked above the input), not a constant. The constant was 11rem,
+              correct only for a one-line input.
+            */
+            style={{
+              paddingBottom:
+                "calc(var(--composer-h, 9.5rem) + 1.75rem + var(--kb-inset))",
+            }}
           >
             {empty && <EmptyState language={language} mode={mode} />}
             {turns.map((turn, i) =>
@@ -1132,8 +1172,9 @@ export default function ChatClient({
         <button
           onClick={() => scroller.pin("smooth")}
           aria-label={language === "sw" ? "Nenda chini" : "Scroll to bottom"}
-          /* Rides above the composer, so it tracks the keyboard too. */
-          style={{ bottom: "calc(8rem + var(--safe-bottom) + var(--kb-inset))" }}
+          /* Rides above the composer, so it tracks both the keyboard and a
+             composer that has grown (a long draft, the steering bar). */
+          style={{ bottom: "calc(var(--composer-h, 9.5rem) + 0.6rem + var(--kb-inset))" }}
           className={`absolute left-1/2 z-30 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-border bg-surface text-fg-muted shadow-soft transition-all duration-slow ease-expo hover:border-accent-line hover:text-fg ${
             scroller.pinned
               ? "pointer-events-none translate-y-3 scale-90 opacity-0"
@@ -1143,20 +1184,24 @@ export default function ChatClient({
           <IcoArrowDown size={16} />
         </button>
 
-        {/* Redirect the model while it is still working. Only while a turn is
-            live, and directly above the composer — where the user's hands
-            already are when they see it going the wrong way. */}
-        {streaming && steerTurn && (
-          <SteerBar language={language} note={steerNote} onSteer={sendSteer} />
-        )}
-
-        {/* Live voice, ambient listening and screen sharing. Collapsed to a
-            single button until started — a chat that permanently shows
-            microphone controls implies the microphone is already doing
-            something. */}
-        {!streaming && <LiveBar projectId={projectId} language={language} />}
-
         <Composer
+          /*
+            Both of these are handed to the composer rather than rendered beside
+            it. As siblings they sat in normal flow at the bottom of this
+            column, underneath an absolutely-positioned composer at the same
+            coordinates — so the bar for redirecting a running turn and the
+            entry point to voice and screen sharing were both painted over and
+            unreachable. Inside the overlay they are visible, they sit exactly
+            where the user's hands already are, and their height is included in
+            the measurement the transcript pads against.
+          */
+          above={
+            streaming && steerTurn ? (
+              <SteerBar language={language} note={steerNote} onSteer={sendSteer} />
+            ) : !streaming ? (
+              <LiveBar projectId={projectId} language={language} />
+            ) : null
+          }
           input={input}
           setInput={setInput}
           onSend={() => send()}
@@ -1192,7 +1237,22 @@ export default function ChatClient({
 
 /* -------------------------------------------------------------------- turns */
 
-function UserTurn({
+/*
+  MEMOISED, AND THE REASON MATTERS.
+
+  `patchLast` copies the turns array but replaces only the last element, so
+  every earlier turn keeps its object identity across a streamed chunk. With
+  these components memoised, a token therefore re-renders exactly one turn
+  instead of the entire conversation — which is what makes the text arrive
+  smoothly in a chat that has been going for an hour rather than progressively
+  more slowly.
+
+  This only holds while the props are stable. `onOpenArtifact`, `onAnswered`
+  and `register` are all `useCallback`s over stable dependencies; if you add a
+  prop here, give it the same treatment or you have quietly turned memoisation
+  off for the whole transcript.
+*/
+const UserTurn = memo(function UserTurn({
   turn,
   language,
   onEdit,
@@ -1262,9 +1322,9 @@ function UserTurn({
       )}
     </div>
   );
-}
+});
 
-function AssistantTurn({
+const AssistantTurn = memo(function AssistantTurn({
   turn,
   language,
   streaming,
@@ -1354,7 +1414,7 @@ function AssistantTurn({
       )}
     </div>
   );
-}
+});
 
 /**
  * What the supervisor is doing between bursts of visible work.

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Artifact, Language } from "@/lib/types";
 import { Panel, categorise, type PanelData, type PanelId } from "./panels";
 
@@ -77,7 +77,19 @@ export function usePanelDock() {
     });
   }, []);
 
-  return { open, openPanel, closePanel, closeAll, toggle, isNarrow };
+  /*
+    Memoised, because this object is a dependency.
+
+    Returning a fresh literal every render meant any `useCallback` that closed
+    over the dock — `openArtifact` in ChatClient, for one — got a new identity
+    on every render too. That callback is a prop on every turn in the
+    transcript, so it silently defeated memoisation for the entire conversation
+    and made each streamed token re-render every turn ever sent.
+  */
+  return useMemo(
+    () => ({ open, openPanel, closePanel, closeAll, toggle, isNarrow }),
+    [open, openPanel, closePanel, closeAll, toggle, isNarrow],
+  );
 }
 
 export default function PanelDock({

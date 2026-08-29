@@ -65,6 +65,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   // Display and read are the same face as UI now, so one variable feeds all
   // three roles in globals.css rather than three families feeding four.
   const fontVars = `${geist.variable} ${jetbrains.variable}`;
+  const isProduction = process.env.NODE_ENV === "production";
 
   return (
     <html
@@ -134,7 +135,17 @@ export default async function RootLayout({ children }: { children: React.ReactNo
               // immediately instead of leaving a stale shell serving old chunks
               // until every tab closes. `controllerchange` reloads once so the
               // page and the worker agree on which build is live.
-              "if('serviceWorker' in navigator){" +
+              //
+              // PRODUCTION ONLY. The worker serves /_next/static/ cache-first,
+              // which is correct in production because those filenames are
+              // content-hashed. In development they are NOT — the same path is
+              // re-served with new contents on every edit — so the worker
+              // pinned the first build of the session and every subsequent
+              // change was invisible until someone thought to clear site data.
+              // A dev server that silently serves yesterday's bundle is a
+              // spectacular way to lose an afternoon.
+              (isProduction
+                ? "if('serviceWorker' in navigator){" +
               "window.addEventListener('load',function(){" +
               "navigator.serviceWorker.register('/sw.js').then(function(reg){" +
               "if(reg.waiting){reg.waiting.postMessage('weave-skip-waiting');}" +
@@ -149,7 +160,17 @@ export default async function RootLayout({ children }: { children: React.ReactNo
               "navigator.serviceWorker.addEventListener('controllerchange',function(){" +
               "if(reloaded)return;reloaded=true;window.location.reload();" +
               "});});" +
-              "}",
+              "}"
+                : // Development: actively tear down a worker left behind by a
+                  // previous production build on the same origin, or the stale
+                  // cache outlives the decision above.
+                  "if('serviceWorker' in navigator&&navigator.serviceWorker.getRegistrations){" +
+                  "navigator.serviceWorker.getRegistrations().then(function(rs){" +
+                  "rs.forEach(function(r){r.unregister();});}).catch(function(){});" +
+                  "if(window.caches&&caches.keys){caches.keys().then(function(ks){" +
+                  "ks.forEach(function(k){if(k.indexOf('weave-')===0)caches.delete(k);});" +
+                  "}).catch(function(){});}" +
+                  "}"),
           }}
         />
       </head>
