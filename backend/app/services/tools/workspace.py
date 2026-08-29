@@ -405,6 +405,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_grep",
+        parallel_safe=True,
         description=(
             "Search the project workspace for a regular expression and get back the "
             "matching lines with their file and line number. This is how you find "
@@ -427,6 +428,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_glob",
+        parallel_safe=True,
         description=(
             "List workspace files matching a glob pattern ('**/*.py', 'src/*.ts'), "
             "with their sizes. Returns paths only. Use it to orient yourself in a "
@@ -477,6 +479,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_read",
+        parallel_safe=True,
         description=(
             "Read a workspace file, optionally a line range. Read before editing so "
             "your `find` string matches the file exactly."
@@ -491,6 +494,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_list",
+        parallel_safe=True,
         description=(
             "List the workspace file tree. Call this first when returning to an "
             "existing project so you build on what is already there instead of "

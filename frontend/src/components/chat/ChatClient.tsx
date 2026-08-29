@@ -371,8 +371,16 @@ export default function ChatClient({
   );
 
   const addSub = useCallback(
-    (text: string, extra?: { url?: string; detail?: string }) => {
-      const id = ensureStep(text);
+    (text: string, extra?: { url?: string; detail?: string; stepId?: string }) => {
+      // Address the step EXPLICITLY when the server named one.
+      //
+      // Substeps used to attach to whichever step started most recently. That
+      // is the same step while tools run one at a time, and the wrong one the
+      // moment two run concurrently — the progress lines of one search would
+      // appear underneath another. The server now stamps every tool event with
+      // its own step id (see the orchestrator's `_scoped` emitter); falling
+      // back to the most recent step keeps older servers working.
+      const id = extra?.stepId ?? ensureStep(text);
       mutateStep(id, (s) => ({
         ...s,
         substeps: [
@@ -388,8 +396,14 @@ export default function ChatClient({
   );
 
   const endStep = useCallback(
-    (status: string, summary?: string, error?: string, detail?: string) => {
-      const id = activeStep.current;
+    (
+      status: string,
+      summary?: string,
+      error?: string,
+      detail?: string,
+      stepId?: string,
+    ) => {
+      const id = stepId ?? activeStep.current;
       if (!id) return;
       const rest = stream.flushNow();
       if (rest) appendText(rest);
@@ -404,7 +418,11 @@ export default function ChatClient({
           x.state === "running" ? { ...x, state: "done" as const } : x,
         ),
       }));
-      activeStep.current = null;
+      // Only clear the "most recent step" pointer if it is the step that just
+      // ended. With concurrent tools an older step can finish last, and
+      // blanking the pointer then would orphan the substeps of the one still
+      // running.
+      if (activeStep.current === id) activeStep.current = null;
     },
     [appendText, mutateStep, stream],
   );
@@ -528,10 +546,14 @@ export default function ChatClient({
             mutateStep(data.id ?? activeStep.current, (s) => ({ ...s, title: data.title || s.title }));
             break;
           case "step_sub":
-            addSub(data.text ?? "", { url: data.url, detail: data.detail });
+            addSub(data.text ?? "", {
+              url: data.url,
+              detail: data.detail,
+              stepId: data.id,
+            });
             break;
           case "step_end":
-            endStep(data.status ?? "ok", data.summary, data.error, data.detail);
+            endStep(data.status ?? "ok", data.summary, data.error, data.detail, data.id);
             break;
 
           /* ---- the supervised loop ---- */
@@ -677,22 +699,26 @@ export default function ChatClient({
             );
             break;
           case "searching":
-            addSub(
-              (language === "sw" ? "Inatafuta: " : "Searching ") + (data.query ?? ""),
-            );
+            addSub((language === "sw" ? "Inatafuta: " : "Searching ") + (data.query ?? ""), {
+              stepId: data.id,
+            });
             break;
           case "search_results":
             addSub(
               language === "sw"
                 ? `Matokeo ${data.count ?? 0}`
                 : `Found ${data.count ?? 0} results`,
+              { stepId: data.id },
             );
             break;
           case "fetching":
-            addSub(readingLine(data.title ?? "", data.url ?? "", language), { url: data.url });
+            addSub(readingLine(data.title ?? "", data.url ?? "", language), {
+              url: data.url,
+              stepId: data.id,
+            });
             break;
           case "extracted":
-            mutateStep(activeStep.current, (s) => ({
+            mutateStep(data.id ?? activeStep.current, (s) => ({
               ...s,
               substeps: s.substeps.map((x, i) =>
                 i === s.substeps.length - 1 ? { ...x, state: "done" as const } : x,
@@ -713,7 +739,25 @@ export default function ChatClient({
             break;
           case "answer_start":
             // Any tool still open belongs to the phase before the answer.
-            if (activeStep.current) endStep("ok");
+            // Close every one of them, not just the most recent: with
+            // concurrent tools there can legitimately be several running, and
+            // leaving one spinning forever is how a finished turn keeps
+            // pretending it is still working.
+            patchBlocks((blocks) =>
+              blocks.map((b) =>
+                isStep(b) && b.state === "running"
+                  ? {
+                      ...b,
+                      state: "done" as const,
+                      endedAt: Date.now(),
+                      substeps: b.substeps.map((x) =>
+                        x.state === "running" ? { ...x, state: "done" as const } : x,
+                      ),
+                    }
+                  : b,
+              ),
+            );
+            activeStep.current = null;
             break;
           case "images":
             patchLast((m) => ({ ...m, images: data.images ?? [] }));
@@ -722,8 +766,9 @@ export default function ChatClient({
             const a = data as Artifact;
             // Rendered inline in the timeline AND recorded on the step, so the
             // panel's grouped view still lists it.
-            if (activeStep.current) {
-              mutateStep(activeStep.current, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
+            const owner = (data as { id?: string }).id ?? activeStep.current;
+            if (owner) {
+              mutateStep(owner, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
             }
             addArtifact(a);
             break;
@@ -860,7 +905,25 @@ export default function ChatClient({
         appendText(`\n\n⚠ ${(err as Error).message}`);
       }
     } finally {
-      if (activeStep.current) endStep("ok");
+      // Close every step still marked running, not only the most recent one:
+      // a turn can end with several concurrent tools open (or with one left
+      // open by an aborted stream), and a chip that spins forever is the
+      // clearest possible way to tell the user a finished turn is still going.
+      patchBlocks((blocks) =>
+        blocks.map((b) =>
+          isStep(b) && b.state === "running"
+            ? {
+                ...b,
+                state: "done" as const,
+                endedAt: Date.now(),
+                substeps: b.substeps.map((x) =>
+                  x.state === "running" ? { ...x, state: "done" as const } : x,
+                ),
+              }
+            : b,
+        ),
+      );
+      activeStep.current = null;
       const rest = stream.flushNow();
       if (rest) appendText(rest);
       patchLast((m) => ({ ...m, pending: false, phase: undefined }));
