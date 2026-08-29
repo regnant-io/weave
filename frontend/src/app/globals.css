@@ -331,12 +331,6 @@ body,
   background: transparent;
 }
 
-.no-js-banner {
-  display: none;
-}
-.no-js .no-js-banner {
-  display: block;
-}
 
 /* ==========================================================================
    TEXTURES — design.md is emphatic that flat = failure. These are applied via
@@ -900,17 +894,51 @@ body,
   /* Reserve the scrollbar gutter so the column never shifts sideways the
      moment content becomes tall enough to overflow. */
   scrollbar-gutter: stable;
-  /* Contain layout/paint so a growing last block cannot invalidate the whole
-     transcript's layout on every frame. */
-  contain: layout paint style;
+  /* Contain paint so a growing last block cannot repaint the whole transcript
+     every frame. NOT `layout` — layout containment on the scroll container
+     makes the browser resolve its own size independently of the content it is
+     scrolling, which is the wrong relationship for a scroller. */
+  contain: paint;
 }
 
-/* Committed blocks are inert: isolate them so the growing tail can't trigger
-   their repaint. This is what keeps cost flat over a multi-hour run. */
+/* ==========================================================================
+   SETTLED BLOCKS — and the overlapping-text bug this used to cause.
+
+   This rule was:
+
+       .block-settled {
+         contain: content;
+         content-visibility: auto;
+         contain-intrinsic-size: auto 1px;
+       }
+
+   `content-visibility: auto` tells the browser to skip rendering a subtree
+   while it is outside the viewport, and to substitute `contain-intrinsic-size`
+   for its real height in the meantime. With `auto 1px`, a paragraph that has
+   never been on screen is measured as ONE PIXEL TALL.
+
+   In a transcript that is pinned to the bottom while text streams in, that is
+   catastrophic and it produces exactly the symptom reported: glyphs printed on
+   top of each other. Every settled segment above the fold collapses toward 1px,
+   so the whole document's height is wrong; we then assign
+   `scrollTop = scrollHeight` against that wrong height; the browser
+   re-renders the skipped subtrees, discovers their real heights, and reflows
+   mid-paint. Between those two states, lines from different blocks occupy the
+   same pixels — text visibly stacked on text, resolving a frame later.
+
+   `contain: content` made it worse by adding layout containment on top, so a
+   block whose measured height was stale could not be corrected by its own
+   contents.
+
+   The performance goal was real, but it was already solved a layer up: each
+   markdown segment is a memoised component that never re-parses once settled
+   (see Markdown.tsx), so a settled block costs nothing per token whether or not
+   the browser is allowed to skip it. What remains here is paint isolation,
+   which is free of the sizing hazard because it never changes an element's
+   measured height.
+   ========================================================================== */
 .block-settled {
-  contain: content;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 1px;
+  contain: paint;
 }
 
 /* ==========================================================================
