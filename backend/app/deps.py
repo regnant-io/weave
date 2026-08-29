@@ -9,14 +9,20 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import get_db
 from .models import User
-from .ratelimit import TokenBucketLimiter
+from .ratelimit import build_limiter
 from .security import decode_access_token
 
 # Chat/analysis and sandbox executions are rate-limited on separate buckets;
 # sandbox is stricter because it is the most expensive/dangerous call (8 / 5.3).
-chat_limiter = TokenBucketLimiter(settings.rate_limit_chat_per_min)
-sandbox_limiter = TokenBucketLimiter(settings.rate_limit_sandbox_per_min)
-anon_limiter = TokenBucketLimiter(settings.rate_limit_anon_per_min)
+#
+# `build_limiter` returns a Redis-backed bucket when WEAVE_REDIS_URL is set and
+# a per-process one otherwise. That distinction matters as soon as the API runs
+# with more than one worker: per-process buckets multiply the configured limit
+# by the worker count, silently. See ratelimit.py.
+chat_limiter = build_limiter(settings.rate_limit_chat_per_min, namespace="weave:rl:chat")
+sandbox_limiter = build_limiter(settings.rate_limit_sandbox_per_min,
+                                namespace="weave:rl:sandbox")
+anon_limiter = build_limiter(settings.rate_limit_anon_per_min, namespace="weave:rl:anon")
 
 
 def get_current_user(

@@ -1,15 +1,30 @@
 # Weave — full stack.
 #
-# Default (no profile): backend (SQLite + offline/anthropic LLM + subprocess
-# sandbox) + frontend. Boots with zero external services.
-#
 #   docker compose up --build
 #     frontend -> http://localhost:3000
-#     backend  -> http://localhost:8000  (docs at /docs)
+#     backend  -> http://localhost:8001  (docs at /docs)
 #
-# Production-shaped services (Postgres + Redis) are behind the "full" profile:
-#   docker compose --profile full up --build
-# and point WEAVE_DATABASE_URL at the postgres service.
+# DEFAULT NOW INCLUDES POSTGRES AND REDIS.
+#
+# They used to be behind the "full" profile, so the default `docker compose up`
+# ran on SQLite with per-process rate limits — a configuration that is fine for
+# one person and quietly wrong for a class. SQLite has exactly one writer, so two
+# students sending a message at the same moment serialise and a third waits
+# behind both; per-process rate limits multiply by the worker count, so the
+# limit in the settings is not the limit in effect. Neither of those announces
+# itself. They present as "Weave is slow today".
+#
+# A deployment default should be the shape you actually deploy. The zero-service
+# boot still exists and is still one command — it is just no longer what you get
+# by accident:
+#
+#   WEAVE_DATABASE_URL=sqlite:///./var/weave.db WEAVE_REDIS_URL= #     docker compose up backend frontend --build
+#
+# Optional capability tiers stay behind their profiles:
+#   --profile deep         search, headless Chrome, rendering, PDF, storage
+#   --profile voice        server-side speech
+#   --profile full         the Celery worker for background jobs
+#   --profile build-images build the workspace sandbox image
 
 services:
   backend:
@@ -45,8 +60,10 @@ services:
       # for much better Kiswahili at a considerable resource cost.
       WEAVE_STT_URL: ${WEAVE_STT_URL:-}
       WEAVE_TTS_URL: ${WEAVE_TTS_URL:-}
-      # Background jobs / cache / observability / channels (all optional).
-      WEAVE_REDIS_URL: ${WEAVE_REDIS_URL:-}
+      # Background jobs, shared rate-limit buckets, cache. Defaults to the redis
+      # service below; set WEAVE_REDIS_URL= (empty) to run without it, at the
+      # cost of rate limits that only bind within one worker process.
+      WEAVE_REDIS_URL: ${WEAVE_REDIS_URL-redis://redis:6379/0}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       WEAVE_SMS_PROVIDER: ${WEAVE_SMS_PROVIDER:-log}
       WEAVE_AT_USERNAME: ${WEAVE_AT_USERNAME:-}
@@ -54,8 +71,13 @@ services:
       WEAVE_WA_VERIFY_TOKEN: ${WEAVE_WA_VERIFY_TOKEN:-weave-verify}
       WEAVE_WA_TOKEN: ${WEAVE_WA_TOKEN:-}
       WEAVE_WA_PHONE_ID: ${WEAVE_WA_PHONE_ID:-}
-      # Use Postgres+pgvector instead of SQLite (bring up with --profile full):
-      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-}
+      # Postgres + pgvector, the deployment database. Set this to a sqlite:///
+      # URL to fall back to the single-file, single-writer development database.
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL-postgresql+psycopg://weave:weave@postgres:5432/weave}
+      # Pool sizing is per WORKER, and Postgres' own default max_connections is
+      # 100 — so workers x (pool + overflow) has to stay under it.
+      WEAVE_DB_POOL_SIZE: ${WEAVE_DB_POOL_SIZE:-10}
+      WEAVE_DB_MAX_OVERFLOW: ${WEAVE_DB_MAX_OVERFLOW:-20}
       # --- developer workspace (the SECOND sandbox) ---
       # Where the assistant builds software: network on, dependencies
       # installable, results packaged as a tarball. Set to false before exposing
@@ -63,6 +85,15 @@ services:
       # in a container on this host.
       WEAVE_WORKSPACE_ENABLED: ${WEAVE_WORKSPACE_ENABLED:-true}
       WEAVE_WORKSPACE_IMAGE: ${WEAVE_WORKSPACE_IMAGE:-weave-workspace:latest}
+    depends_on:
+      # `service_healthy`, not just `service_started`. Postgres accepts a TCP
+      # connection several seconds before it will answer a query, so starting the
+      # backend on "started" means the first boot reliably fails and the
+      # container restarts — which reads as a broken image rather than a race.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     extra_hosts:
       # Lets host.docker.internal resolve to the host on Linux too (already works
       # on Docker Desktop for Mac/Windows).
@@ -106,21 +137,37 @@ services:
   postgres:
     # pgvector image so the vector extension is available (architecture §2).
     image: pgvector/pgvector:pg16
-    profiles: ["full"]
     environment:
       POSTGRES_USER: weave
-      POSTGRES_PASSWORD: weave
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weave}
       POSTGRES_DB: weave
+    # Bound to loopback. The previous "5432:5432" published the database on every
+    # interface of the host with the password `weave` — on a VPS that is an open
+    # database, and nothing about the line said so. Compose services reach it by
+    # service name and need no published port at all; this keeps psql from the
+    # host working without exposing it to the internet.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weave -d weave"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
     volumes:
       - pg_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
-    profiles: ["full"]
+    # Same reasoning as Postgres above: Redis has no password here, so it must
+    # not be reachable from outside the host.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   worker:
     # Celery worker for background jobs (ingestion, heavy analysis, re-summarize).
