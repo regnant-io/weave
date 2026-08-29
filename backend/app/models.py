@@ -68,6 +68,10 @@ class OtpCode(Base):
     code_hash: Mapped[str] = mapped_column(String(128))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Wrong guesses against THIS code. A six-digit code with an unlimited
+    #: number of attempts is not a secret; it is a formality that takes a script
+    #: about a minute to walk through.
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

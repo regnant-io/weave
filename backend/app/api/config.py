@@ -125,5 +125,10 @@ def get_artifact(key: str, sig: str = "") -> Response:
     data = storage.get_bytes(key)
     ext = "." + key.rsplit(".", 1)[-1].lower() if "." in key else ""
     mime = _MIME_BY_EXT.get(ext, "application/octet-stream")
+    # `private`, not `public`. The signature in the URL is the capability, so a
+    # shared proxy caching the response would be storing one user's generated
+    # work under a key anyone holding that URL can replay. Browser caching --
+    # which is what actually matters for an iframe reloading a 3D scene -- is
+    # unaffected.
     return Response(content=data, media_type=mime,
-                    headers={"Cache-Control": "public, max-age=86400"})
+                    headers={"Cache-Control": "private, max-age=86400"})

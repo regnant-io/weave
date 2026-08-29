@@ -112,21 +112,38 @@ def _signed_token(claims: dict[str, Any], ttl_seconds: int) -> str:
 
 
 def decode_access_token(token: str) -> dict[str, Any] | None:
+    """Verify and decode a token, or return None.
+
+    NONE, NEVER AN EXCEPTION. Everything in here runs on attacker-controlled
+    input -- an Authorization header, a cookie, a query string -- and the
+    previous version only guarded the `split(".")`. Base64 decoding a malformed
+    signature raises `binascii.Error`, which propagated out of the dependency
+    and turned every request carrying a corrupt token into a 500 rather than a
+    401. That is a wrong status code, an exception in the logs for an entirely
+    routine event, and a trivially triggerable way to fill the log with noise.
+
+    Note that the `alg` header is deliberately ignored rather than checked. The
+    signature is always recomputed with HMAC-SHA256, so a token claiming
+    `alg: none` or `alg: RS256` fails the comparison like any other forgery;
+    reading the header to decide how to verify is what makes that class of
+    attack possible in the first place.
+    """
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")
-    except ValueError:
-        return None
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    expected_sig = hmac.new(settings.secret_key.encode(), signing_input, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected_sig, _b64d(sig_b64)):
-        return None
-    try:
+        signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+        expected_sig = hmac.new(
+            settings.secret_key.encode(), signing_input, hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(expected_sig, _b64d(sig_b64)):
+            return None
         payload = json.loads(_b64d(payload_b64))
-    except (ValueError, json.JSONDecodeError):
+        if not isinstance(payload, dict):
+            return None
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:  # noqa: BLE001 - any malformed token is simply not a token
         return None
-    if int(payload.get("exp", 0)) < int(time.time()):
-        return None
-    return payload
 
 
 # --- OTP --------------------------------------------------------------------
