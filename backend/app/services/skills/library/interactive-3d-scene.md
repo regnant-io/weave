@@ -1,7 +1,7 @@
 ---
 name: interactive-3d-scene
 title: Building an interactive Babylon.js scene
-description: How to write a Babylon scene that actually runs offline in the artifact sandbox — engine setup, controls, assets, performance and verification.
+description: How to write a Babylon scene that actually runs offline in the artifact sandbox — engine setup, controls, assets, performance, and what to do when it comes back broken.
 tags: babylon, 3d, game, simulation, walkthrough, webgl
 ---
 
@@ -31,12 +31,20 @@ new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
 return scene;
 ```
 
+The `canvas` argument is the canvas. You do not need `getElementById`, and
+reaching for it is how tutorial habits leak in. (If you do, the canvas is
+`renderCanvas`, and the common alternatives are aliased, so it will still work —
+but the argument is right there.)
+
+**Your function may be `async`.** Awaiting `BABYLON.SceneLoader.ImportMeshAsync`
+and returning the scene afterwards is correct and supported. Returning a Promise
+that resolves to a scene is also fine.
+
 ## Hard constraints
 
 - **No network.** No `fetch`, no URL textures, no CDN. Meshes, textures and
   audio travel inline through the `assets` argument as data URLs.
-- **No `import`.** `BABYLON` is a global. An import statement is a syntax error
-  inside a function body and the scene will not run.
+- **No `import`.** `BABYLON` is a global.
 - Set `libs: ["loaders"]` if you import a `.glb`/`.obj`, `libs: ["gui"]` if you
   use `BABYLON.GUI`. They are heavy; do not request them otherwise.
 
@@ -51,6 +59,10 @@ return scene;
 
 Always `camera.attachControl(canvas, true)`, and pass a `controls` string
 ("Drag to orbit · Scroll to zoom") so the hint line tells the user what to do.
+
+A scene with **no camera at all** draws nothing and throws nothing — the most
+confusing failure available. One is added automatically if you forget, but an
+automatic camera almost never frames the subject well, so place your own.
 
 ## Make it teach
 
@@ -69,7 +81,27 @@ controls when you need them.
   is worse than a simpler one that does.
 - Reuse materials. One material shared across 200 instances, not 200 materials.
 
-## Verify
+## When it comes back broken
 
-`verify_artifact` after generating. Then say in prose what the scene shows, what
-the user should try, and what they should notice when they do.
+Every scene is opened in a real browser before the user sees it, so a failure
+comes back to you as a failed tool call with the specific error. Three of them
+have a specific cause worth knowing:
+
+| What you are told | What it actually means |
+|---|---|
+| "does not parse … around line N" | An unclosed bracket, brace or string. The rest of the file is fine — go to that line. |
+| "finished without returning a BABYLON.Scene" | You built the scene and never returned it. Add `return scene;`. |
+| "no active camera" | You created a camera but never attached it to this scene, or created none. |
+
+**Fix it by editing, not by writing it again.** Call `update_visual` with the
+`visual_id` and the corrected `code`, changing the smallest thing that fixes the
+fault. Regenerating four hundred lines to fix one missing `return` produces four
+hundred *different* lines, with a new fault in them about as often as not — and
+you only get two repair attempts. Everything that already worked is currently
+correct; keep it.
+
+## Finish
+
+Say in prose what the scene shows, what the user should try, and what they
+should notice when they do. A scene handed over without that is a toy; with it,
+it is a demonstration.

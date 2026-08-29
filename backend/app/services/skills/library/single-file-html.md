@@ -76,7 +76,10 @@ a calculator. Use `<details>`/`<summary>` before writing JavaScript. Respect
 
 ## Then verify
 
-Call `verify_artifact` on the page before you tell the user it is ready. It
+The page is opened in a real browser before the user sees it, and a failure
+comes back to you as a failed tool call naming the problem — including a script
+that does not parse, which is what a truncated generation produces. Fix it with
+`update_visual` and the corrected `html`, not by writing the page again. It
 catches ESM syntax in a classic script, external resources, and truncation — the
 three failures that look fine in the source and blank in the browser. If it
 fails, fix and re-check. Do not hand over a page you have not verified.

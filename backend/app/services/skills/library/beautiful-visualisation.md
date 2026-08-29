@@ -66,5 +66,8 @@ should notice. An uninterpreted chart makes the reader do your work.
 
 ## 6. Verify
 
-Charts are artifacts. After generating, `verify_artifact` — a page that renders
-blank looks exactly like one that renders perfectly until someone opens it.
+Charts are opened in a real browser for you before the user sees them, so you
+do not have to ask — but read what comes back. A chart that renders blank looks
+exactly like one that renders perfectly until someone opens it, and the usual
+cause is a field name in `encoding` that is not in the data. Check the spelling
+AND the case.
