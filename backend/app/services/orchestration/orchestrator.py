@@ -589,6 +589,40 @@ class Orchestrator:
             tool_events.append({"name": name, "input": tool_input, "result": result})
             return result
 
+        # -- delegation ------------------------------------------------------
+        #
+        # Installed here rather than with the other services because it needs the
+        # turn's own toolset and executor, which are built above. A delegate runs
+        # against exactly the same tool plumbing as the turn that spawned it --
+        # same per-turn limits, same artifact gate, same step events -- so there
+        # is no second, weaker path into the capabilities.
+        def _run_delegate(*, task: str, context: str = "", expect: str = "") -> dict:
+            from .subagent import run_delegate
+
+            return run_delegate(
+                engine=engine,
+                tools=tool_schemas,
+                tool_executor=tool_executor,
+                emit=_emit,
+                task=task,
+                context=context,
+                expect=expect,
+                model=model,
+                cancel=cancel,
+                parallel_safe=registry.parallel_safe_names(),
+            )
+
+        # Only worth offering when there is something to look things up WITH.
+        # A delegate with no research tools is a model call that returns the
+        # model's own recollection dressed up as a finding, which is worse than
+        # not having the tool at all.
+        if {"websearch", "workspace", "skills"} & set(services.keys()):
+            services["delegate"] = _run_delegate
+            tool_schemas = registry.schemas(
+                mode=project.mode, trust=trust, services=services,
+                intent=route.intent, force=forced,
+            )
+
         # 6b. Retrieval-before-generation, extended to the web (Principle 3): only
         # for LITERATURE intent ("what does the research/web say"). Concept
         # explanations answer from the model's knowledge (+ grounding guard) rather

@@ -442,6 +442,11 @@ def register_all(reg: ToolRegistry) -> None:
     from .canvas import register_canvas_tools
     register_canvas_tools(reg)
 
+    # Delegation: hand one self-contained lookup to a scoped, read-only worker
+    # so the sources it reads never enter this conversation.
+    from .delegate import register_all as register_delegate_tools
+    register_delegate_tools(reg)
+
     reg.register(Tool(
         name="query_warehouse",
         description=("Run a read-only SQL query over the user's datasets via the "
