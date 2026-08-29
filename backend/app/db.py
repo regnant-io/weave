@@ -156,6 +156,14 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE users ADD COLUMN allow_source_crawl BOOLEAN DEFAULT 1"
                 ))
+            # Per-code attempt budget. Without it an existing database keeps the
+            # unlimited-guesses behaviour after an upgrade, which is the whole
+            # thing the column exists to stop.
+            ocols = {r[1] for r in conn.execute(text("PRAGMA table_info(otp_codes)"))}
+            if "attempts" not in ocols:
+                conn.execute(text(
+                    "ALTER TABLE otp_codes ADD COLUMN attempts INTEGER DEFAULT 0"
+                ))
 
     else:
         _init_postgres()
@@ -194,6 +202,7 @@ def _init_postgres() -> None:
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_id VARCHAR(32)",
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS notes JSON DEFAULT '[]'",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_source_crawl BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
         # The keyword half of hybrid retrieval. A STORED generated column plus a
         # GIN index, which is the Postgres equivalent of the FTS5 virtual table
         # the SQLite branch creates -- and the thing that makes the query in

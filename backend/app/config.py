@@ -200,6 +200,17 @@ class Settings(BaseSettings):
     rate_limit_chat_per_min: int = 20
     rate_limit_sandbox_per_min: int = 6
     rate_limit_anon_per_min: int = 10
+    #: Credential endpoints -- login, register, OTP request, OTP verify.
+    #:
+    #: Much stricter than the rest, because these are the only routes where an
+    #: attacker gains something by calling them thousands of times. A person
+    #: signing in mistypes their password twice, not twenty times a minute.
+    rate_limit_auth_per_min: int = 8
+    #: How many wrong codes one OTP may absorb before it is burned.
+    #:
+    #: A six-digit code has a million values and a ten-minute life. Without a
+    #: cap, guessing it is arithmetic rather than luck.
+    otp_max_attempts: int = 5
 
     # --- cors ---
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]

@@ -19,7 +19,10 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ key: string
     status: 200,
     headers: {
       "Content-Type": upstream.headers.get("Content-Type") ?? "application/octet-stream",
-      "Cache-Control": "public, max-age=86400",
+      // `private`: the signature in the URL is the capability that authorises
+      // this artifact, so a shared cache holding the response would be storing
+      // one user's generated work under a key anyone with the URL can replay.
+      "Cache-Control": "private, max-age=86400",
     },
   });
 }

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import enforce_auth_limit, get_current_user
 from ..models import OtpCode, User
 from ..schemas import (
     LoginRequest, OtpRequestBody, OtpVerifyBody, RegisterRequest, TokenResponse,
@@ -49,7 +49,8 @@ def _send_sms(phone: str, message: str) -> None:
     log.info("SMS to %s: %s", phone, message)
 
 
-@router.post("/register", response_model=TokenResponse, status_code=201)
+@router.post("/register", response_model=TokenResponse, status_code=201,
+             dependencies=[Depends(enforce_auth_limit)])
 def register(body: RegisterRequest, db: Session = Depends(get_db)) -> TokenResponse:
     if db.query(User).filter(User.phone == body.phone).first():
         raise HTTPException(status.HTTP_409_CONFLICT, "phone already registered")
@@ -69,7 +70,8 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> TokenRespo
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse,
+             dependencies=[Depends(enforce_auth_limit)])
 def login(body: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
     user = db.query(User).filter(User.phone == body.phone).first()
     if not user or not verify_password(body.password, user.password_hash):
@@ -78,7 +80,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
-@router.post("/otp/request")
+@router.post("/otp/request", dependencies=[Depends(enforce_auth_limit)])
 def request_otp(body: OtpRequestBody, db: Session = Depends(get_db)) -> dict:
     code = generate_otp()
     otp = OtpCode(
@@ -94,15 +96,51 @@ def request_otp(body: OtpRequestBody, db: Session = Depends(get_db)) -> dict:
     return resp
 
 
-@router.post("/otp/verify", response_model=TokenResponse)
+@router.post("/otp/verify", response_model=TokenResponse,
+             dependencies=[Depends(enforce_auth_limit)])
 def verify_otp(body: OtpVerifyBody, db: Session = Depends(get_db)) -> TokenResponse:
+    """Exchange a one-time code for a session.
+
+    TWO INDEPENDENT LIMITS, BECAUSE ONE IS NOT ENOUGH.
+
+    A six-digit code has a million values and lives for ten minutes. With
+    unlimited attempts, guessing it is arithmetic: a script walks the space and
+    takes over the account. Neither limit here would be sufficient alone.
+
+      * The rate limit above is keyed on the CLIENT ADDRESS, and slows any one
+        caller. It does nothing about a distributed attempt.
+      * The attempt budget below is attached to THE CODE, so a code that has
+        absorbed five wrong guesses is burned no matter how many addresses the
+        guesses arrived from. That is the limit that actually bounds the search.
+
+    The budget is deliberately on the code and not on the phone number: burning
+    a number would let anyone lock a real person out of their own account by
+    guessing badly on their behalf, which turns a brute-force defence into a
+    denial-of-service tool. Burning a code only costs the legitimate user a
+    fresh "send me another one".
+    """
     otp = (
         db.query(OtpCode)
         .filter(OtpCode.phone == body.phone, OtpCode.consumed == False)  # noqa: E712
         .order_by(OtpCode.created_at.desc())
         .first()
     )
-    if not otp or otp.code_hash != hash_otp(body.code):
+    if not otp:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
+
+    if (otp.attempts or 0) >= settings.otp_max_attempts:
+        otp.consumed = True
+        db.add(otp)
+        db.commit()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "too many incorrect attempts for that code — request a new one",
+        )
+
+    if otp.code_hash != hash_otp(body.code):
+        otp.attempts = (otp.attempts or 0) + 1
+        db.add(otp)
+        db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
     # SQLite returns tz-naive datetimes; normalise to UTC before comparing so the
     # comparison never mixes naive and aware datetimes (a TypeError otherwise).
