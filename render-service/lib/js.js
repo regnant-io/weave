@@ -261,3 +261,97 @@ export function lintHtml(html) {
 
   return problems;
 }
+
+/**
+ * Compile model-authored code WITHOUT running it, to find syntax errors here
+ * rather than in the user's browser.
+ *
+ * WHY THIS IS WORTH A SEPARATE PASS
+ *
+ * A syntax error is not like a runtime error. A runtime error is thrown from
+ * inside a script that has already parsed, so an installed `window.onerror`
+ * handler catches it and the artifact can say what went wrong. A SyntaxError
+ * happens at PARSE time, before a single statement in that script executes —
+ * so if the error-reporting harness lives in the same <script> as the model's
+ * code, the harness never runs either. The result is the failure that is
+ * hardest to act on: a completely blank page, no console output worth the
+ * name, and a tool result that said "ok".
+ *
+ * `new Function` compiles its body and throws on a syntax error without
+ * executing anything, which is exactly the check needed and costs microseconds.
+ * It is not a sandbox escape: nothing is called.
+ *
+ * @param {string} code    the source to compile
+ * @param {object} opts
+ * @param {string[]} opts.params  parameter names, when the code is a function body
+ * @param {boolean} opts.async    compile as an async function body
+ * @returns {{ ok: boolean, error?: string, line?: number }}
+ */
+export function checkSyntax(code, { params = [], async = false } = {}) {
+  const src = String(code || "");
+  if (!src.trim()) return { ok: true };
+  try {
+    if (async) {
+      // There is no AsyncFunction constructor in scope by default; get it from
+      // an async function's own constructor.
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      new AsyncFunction(...params, src);
+    } else {
+      new Function(...params, src);
+    }
+    return { ok: true };
+  } catch (e) {
+    const message = String((e && e.message) || e);
+    // V8 puts the offending line in the stack for compile errors; pull the
+    // line number out when it is there, because "line 214" turns an
+    // unactionable message into a pointer.
+    let line;
+    const m = /<anonymous>:(\d+):(\d+)/.exec(String((e && e.stack) || ""));
+    if (m) line = Number(m[1]) - 2; // the wrapper contributes two lines
+    return { ok: false, error: message, line: line && line > 0 ? line : undefined };
+  }
+}
+
+/**
+ * Whether an SVG string actually draws anything.
+ *
+ * The failure this exists for: a chart or diagram that renders to a
+ * syntactically perfect `<svg>` element containing nothing but a background
+ * rectangle, or nothing at all. Every layer reports success — the spec
+ * compiled, the view rendered, the file was written, the tool returned "ok" —
+ * and the user is shown an empty box. Nothing in the pipeline was ever asked
+ * the only question that matters, which is whether there is ink on the page.
+ *
+ * Counted as ink: any path, shape, text, image or use element with actual
+ * geometry. Deliberately NOT counted: the root element, `<defs>` and its
+ * contents (gradients and markers are definitions, not marks), `<style>`,
+ * `<title>`/`<desc>`, and a single full-bleed background `<rect>`, which every
+ * renderer emits whether or not it drew anything on top of it.
+ */
+export function svgHasContent(svg) {
+  const src = String(svg || "");
+  if (!src.trim()) return false;
+
+  // Strip the parts that are definitions rather than marks, so a spec whose
+  // only output is a gradient definition is correctly seen as empty.
+  const body = src
+    .replace(/<defs[\s\S]*?<\/defs>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<title[\s\S]*?<\/title>/gi, "")
+    .replace(/<desc[\s\S]*?<\/desc>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
+
+  // Text counts only when it has a non-empty body: an axis renders empty
+  // <text> elements for absent labels.
+  if (/<text[^>]*>\s*[^<\s][\s\S]*?<\/text>/i.test(body)) return true;
+  if (/<(image|use|foreignObject)\b/i.test(body)) return true;
+  if (/<path[^>]*\sd\s*=\s*["'][^"']*[\d.]/i.test(body)) return true;
+  if (/<(circle|ellipse|line|polyline|polygon)\b/i.test(body)) return true;
+
+  // Rects last, and only past the first one: renderers emit exactly one
+  // full-bleed background rect for an otherwise empty chart.
+  const rects = body.match(/<rect\b/gi);
+  if (rects && rects.length > 1) return true;
+
+  return false;
+}

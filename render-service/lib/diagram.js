@@ -9,6 +9,7 @@
 // saying "A leads to B and C", and bad at picking non-overlapping coordinates.
 
 import { esc, page, palette, TOKENS } from "./theme.js";
+import { svgHasContent } from "./js.js";
 
 const PAD = 28;
 
@@ -302,6 +303,27 @@ export function renderDiagram({ spec = {}, title = "Diagram", theme = "light" })
   <rect width="100%" height="100%" fill="${t.bg}"/>
   ${svg}
 </svg>`;
+
+  /*
+    A diagram whose only content is its own background is not a diagram.
+
+    The `!svg` check above catches an empty node list, which is the obvious
+    case. It does not catch a spec whose nodes all fail to lay out -- edges
+    referencing ids that do not exist, a timeline whose entries have no dates, a
+    hierarchy with no root -- where the generator returns markup that is
+    structurally fine and visually empty. Those reach the user as a blank framed
+    box that took thirty seconds to produce and says nothing.
+  */
+  if (!svgHasContent(inner)) {
+    return {
+      status: "error",
+      error:
+        `the ${kind} diagram rendered with nothing in it. The nodes were accepted ` +
+        `but none of them produced anything to draw -- usually edges pointing at ` +
+        `ids that do not exist in \`nodes\`, or nodes with no label. Check that ` +
+        `every edge's \`from\` and \`to\` matches a node id exactly.`,
+    };
+  }
 
   const html = page({
     title,

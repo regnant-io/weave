@@ -18,7 +18,7 @@
 // control that makes this safe.
 
 import { esc, baseCss } from "./theme.js";
-import { prepareScript } from "./js.js";
+import { checkSyntax, prepareScript } from "./js.js";
 
 /** Patterns that indicate the page is trying to leave its box. */
 const FORBIDDEN = [
@@ -75,6 +75,21 @@ export function renderCustom({
   const prepared = prepareScript(code);
   if (!prepared.ok) return { status: "error", error: prepared.error };
   code = prepared.code;
+
+  // Compile without running, so a syntax error is an actionable message here
+  // rather than a blank page there. See checkSyntax in js.js for why a parse
+  // failure is categorically worse than a runtime one: the error handler
+  // installed above cannot fire for a script that never parsed.
+  const syntax = checkSyntax(code, { async: prepared.scriptType === "module" });
+  if (!syntax.ok) {
+    return {
+      status: "error",
+      error:
+        `the generated JavaScript does not parse: ${syntax.error}` +
+        (syntax.line ? ` (around line ${syntax.line})` : "") +
+        `. Nothing was rendered.`,
+    };
+  }
 
   const violations = screenCode(source);
   if (violations.length) {
