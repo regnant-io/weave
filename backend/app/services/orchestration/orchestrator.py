@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import uuid
 import threading as _threading
 from collections.abc import Iterator
 from typing import Any
@@ -84,37 +85,50 @@ class Orchestrator:
         thread_id: str | None = None, channel: str = "chat",
         frames: list[str] | None = None,
     ) -> Iterator[dict]:
-        """Yield SSE events LIVE. The turn runs in a worker thread; _process emits
-        every event onto a queue which this generator drains in real time. If the
-        client disconnects (Stop), a GeneratorExit fires here and we set a cancel
-        Event that _process / the Ollama stream loop check to abort promptly."""
-        import queue
+        """Start a turn and stream it. The turn OUTLIVES this connection.
+
+        The work runs in a worker thread that writes into a `LiveTurn` (see
+        live.py); this generator is one reader of that buffer, and losing it is
+        not the same as losing the turn. A dropped connection detaches, the work
+        continues, and `resume_turn` picks it back up from the last event the
+        client actually received.
+
+        That distinction did not exist before: the generator owned the queue, so
+        `GeneratorExit` -- fired by a refresh, a tunnel restart, or a phone
+        moving from wifi to mobile data -- cancelled the run. Losing twenty
+        minutes of a build to a network handover is bad on its own and worse
+        than it looks, because everything the turn had already done was gone
+        with no record of it and no way to ask for it back.
+
+        A turn nobody comes back to is still cancelled, by the reaper in
+        live.py, after a grace period. Stopping is something the user does, not
+        something the network does to them.
+        """
         import threading
 
-        q: "queue.Queue" = queue.Queue()
-        holder: dict = {}
-        cancel = threading.Event()
-        project_id = str(project.id)
+        from .live import get_turns
 
-        def emit(event: str, data: dict) -> None:
-            # The turn id is learned by watching the stream rather than being
-            # returned by _process, because it has to be known on the FAILURE
-            # paths too — a turn that raised halfway still holds a steering
-            # registration, and only the finally below can release it.
-            if event == "meta" and data.get("message_id"):
-                holder["turn_id"] = data["message_id"]
-            q.put({"event": event, "data": data})
+        # The turn id is decided HERE rather than learned from the stream.
+        # Resume needs an address before the first event exists, and a turn that
+        # fails during setup still has to be addressable to be cleaned up.
+        turn_id = uuid.uuid4().hex
+        project_id = str(project.id)
+        user_id = str(getattr(getattr(project, "user", None), "id", "") or "")
+
+        live = get_turns().create(turn_id, project_id, user_id)
+        holder: dict = {}
 
         def worker() -> None:
             """Run the turn on its OWN database session.
 
             The request's session used to be handed straight to this thread
             while the generator kept it as well. A SQLAlchemy Session is
-            explicitly not thread-safe: it owns identity-map state and, in "commit
-            as you go" mode, a transaction. Two threads sharing one is a data
-            race that mostly does not fire, which is the worst kind — under load
-            it surfaces as an object appearing with another request's values, or
-            a transaction committed from underneath the thread that opened it.
+            explicitly not thread-safe: it owns identity-map state and, in
+            "commit as you go" mode, a transaction. Two threads sharing one is a
+            data race that mostly does not fire, which is the worst kind --
+            under load it surfaces as an object appearing with another request's
+            values, or a transaction committed from underneath the thread that
+            opened it.
 
             The thread that does the work owns the session, opens it, and closes
             it. `_process` re-reads the project through it, so nothing crosses
@@ -123,63 +137,105 @@ class Orchestrator:
             from ...db import SessionLocal
 
             worker_db = SessionLocal()
+            error = ""
             try:
                 own_project = worker_db.query(Project).filter(
                     Project.id == project_id
                 ).first()
                 if own_project is None:
-                    holder["error"] = "project not found"
+                    error = "project not found"
                     return
                 msg, meta = self._process(worker_db, own_project, user_text, language,
                                           dataset_id,
-                                          emit=emit, effort=effort, model=model,
-                                          cancel=cancel, regenerate=regenerate,
+                                          emit=live.emit, effort=effort, model=model,
+                                          cancel=live.cancel, regenerate=regenerate,
                                           services_pref=services_pref, thread_id=thread_id,
-                                          channel=channel, frames=frames)
+                                          channel=channel, frames=frames,
+                                          assistant_message_id=turn_id)
                 holder["msg"] = msg
                 holder["meta"] = meta
             except Exception as exc:  # noqa: BLE001
-                holder["error"] = str(exc)
+                error = str(exc)
+                log.exception("turn %s failed", turn_id)
             finally:
-                if holder.get("turn_id"):
-                    from ..steering import get_steering
-                    get_steering().finish(holder["turn_id"])
+                from ..steering import get_steering
+                get_steering().finish(turn_id)
                 worker_db.close()
-                q.put(None)
+                meta = holder.get("meta") or {}
+                msg = holder.get("msg")
+                # The closing event goes into the BUFFER, so a client that
+                # reconnects after the turn has already finished still receives
+                # the ending it missed instead of an empty stream.
+                if error:
+                    live.emit("error", {"message": error})
+                else:
+                    live.emit("done", {
+                        "message_id": msg.id if msg else turn_id,
+                        "thread_id": meta.get("thread_id"),
+                        # Set when this turn filled the window and a successor
+                        # thread was opened. The client switches to it rather
+                        # than silently writing the next turn into a thread the
+                        # model can no longer read in full.
+                        "next_thread_id": meta.get("next_thread_id"),
+                        "context_used": meta.get("context_used"),
+                        "context_window": meta.get("context_window"),
+                    })
+                live.finish(error=error, result=meta)
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        threading.Thread(target=worker, daemon=True,
+                         name="weave-turn-" + turn_id[:8]).start()
 
-        try:
-            yield {"event": "status", "data": {"phase": "thinking"}}
-            while True:
-                try:
-                    item = q.get(timeout=10)
-                except queue.Empty:
-                    yield {"event": "ping", "data": {}}
-                    continue
-                if item is None:
-                    break
-                yield item
-            t.join()
-            if "error" in holder:
-                yield {"event": "error", "data": {"message": holder["error"]}}
-                return
-            meta = holder.get("meta") or {}
-            yield {"event": "done", "data": {
-                "message_id": holder.get("msg").id if holder.get("msg") else None,
-                "thread_id": meta.get("thread_id"),
-                # Set when this turn filled the window and a successor thread was
-                # opened. The client switches to it rather than silently writing
-                # the next turn into a thread the model can no longer read.
-                "next_thread_id": meta.get("next_thread_id"),
-                "context_used": meta.get("context_used"),
-                "context_window": meta.get("context_window"),
+        yield from self._follow(live, from_seq=0, first_event={
+            "event": "turn",
+            # Sent before anything else so the client has the address it would
+            # need to resume, even if the connection dies on the next byte.
+            "data": {"turn_id": turn_id, "resumable": True},
+        })
+
+    def resume_turn(self, turn_id: str, user_id: str, from_seq: int = 0) -> Iterator[dict]:
+        """Reattach to a turn that is already running, or has just finished.
+
+        Raises LookupError when there is no such turn IN THIS PROCESS. That is a
+        real limitation of an in-process registry and a survivable one: a
+        finished turn is in the database, so the client's fallback is to reload
+        the thread and read the answer there. See live.py.
+        """
+        from .live import get_turns
+
+        live = get_turns().for_user(turn_id, user_id)
+        if live is None:
+            raise LookupError(turn_id)
+        if not live.has(from_seq):
+            # The client is asking for events that have been trimmed out of the
+            # buffer. Sending the events that ARE there would leave an unmarked
+            # hole in the middle of an answer, so say plainly that the
+            # transcript has to be reloaded instead.
+            yield {"event": "resume_gap", "data": {
+                "turn_id": turn_id,
+                "message": "too much was missed to continue this stream",
             }}
-        except GeneratorExit:
-            # client disconnected (Stop) — signal the worker to abort promptly
-            cancel.set()
-            raise
+            return
+        yield from self._follow(live, from_seq=from_seq, first_event={
+            "event": "turn",
+            "data": {"turn_id": turn_id, "resumed": True, "from": from_seq},
+        })
+
+    def _follow(self, live, *, from_seq: int, first_event: dict) -> Iterator[dict]:
+        """Drain one live turn into SSE events for one connection."""
+        yield first_event
+        yield {"event": "status", "data": {"phase": "thinking"}}
+        for item in live.follow(from_seq):
+            if item is None:
+                # Keepalive. A silent connection is closed by proxies and by
+                # mobile networks long before a long turn finishes, which would
+                # defeat the point of all of this.
+                yield {"event": "ping", "data": {}}
+                continue
+            # `seq` rides on every event so a client that reconnects can say
+            # exactly where it got to. Without it, resume could only ever replay
+            # from the beginning -- which for a half-written answer means
+            # printing the first half twice.
+            yield {"event": item.event, "data": {**item.data, "seq": item.seq}}
 
     # -- core ----------------------------------------------------------------
 
@@ -188,7 +244,7 @@ class Orchestrator:
         dataset_id: str | None, emit=None, effort: str | None = None, model: str | None = None,
         cancel=None, regenerate: bool = False, services_pref: dict | None = None,
         thread_id: str | None = None, channel: str = "chat",
-        frames: list[str] | None = None,
+        frames: list[str] | None = None, assistant_message_id: str | None = None,
     ) -> tuple[Message, dict]:
         engine = get_engine()
 
@@ -241,10 +297,16 @@ class Orchestrator:
         integrity = guardrails.triggers_integrity_guard(user_text, project.mode)
 
         # 6. assistant placeholder so tool executions can link to it
+        # The id can be assigned by the CALLER. A streamed turn is addressable
+        # for resume before it has emitted anything (see stream_turn), and the
+        # address has to be the same one the finished message carries -- so the
+        # id is chosen first and the row is built around it, rather than the
+        # other way round.
         assistant_msg = Message(
             project_id=project.id, thread_id=thread.id, role="assistant",
             content_sw="", content_en="", original_language=language,
             tool_calls=[], citations=[],
+            **({"id": assistant_message_id} if assistant_message_id else {}),
         )
         db.add(assistant_msg)
         # COMMIT, not flush.

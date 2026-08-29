@@ -136,6 +136,50 @@ function fromHistory(messages: Message[], language: Language): ChatTurn[] {
 let uid = 0;
 const nextId = (p: string) => `${p}-${Date.now().toString(36)}-${uid++}`;
 
+/**
+ * Where a running turn is remembered across a page load.
+ *
+ * A refresh mid-turn used to lose the answer even though the server was still
+ * writing it: the transcript came back from the database without the turn that
+ * had not finished yet, and the work continued invisibly until it was
+ * cancelled. Recording the turn against its thread means the reloaded page can
+ * ask for it back.
+ *
+ * sessionStorage, not localStorage: this is about one tab's view of one turn.
+ * A second tab has its own connection, and a value surviving the browser being
+ * closed would only ever point at a turn that is long gone.
+ */
+const liveKey = (projectId: string, threadId?: string) =>
+  `weave:live:${projectId}:${threadId ?? "default"}`;
+
+function rememberLiveTurn(projectId: string, threadId: string | undefined, id: string, seq: number) {
+  try {
+    sessionStorage.setItem(liveKey(projectId, threadId), JSON.stringify({ id, seq }));
+  } catch {
+    /* private mode / storage disabled — resume is an optimisation, not a requirement */
+  }
+}
+
+function forgetLiveTurn(projectId: string, threadId?: string) {
+  try {
+    sessionStorage.removeItem(liveKey(projectId, threadId));
+  } catch {
+    /* as above */
+  }
+}
+
+function recallLiveTurn(projectId: string, threadId?: string): { id: string; seq: number } | null {
+  try {
+    const raw = sessionStorage.getItem(liveKey(projectId, threadId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.id === "string" && typeof parsed?.seq === "number") return parsed;
+  } catch {
+    /* corrupt value: treat as absent */
+  }
+  return null;
+}
+
 /* --------------------------------------------------------------------- main */
 
 export default function ChatClient({
@@ -207,6 +251,9 @@ export default function ChatClient({
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  /** `streaming` as a ref, for effects that must read it without re-running. */
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
   const lastUserText = useRef("");
   /** Id of the step currently receiving substeps. */
   const activeStep = useRef<string | null>(null);
@@ -222,6 +269,26 @@ export default function ChatClient({
   const seenArtifacts = useRef(new Set<string>());
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+  /**
+   * The turn currently running ON THE SERVER, and how far into it we have read.
+   *
+   * The server no longer ties a turn's life to the connection watching it, so a
+   * dropped stream is a lost view rather than lost work. Keeping the turn's id
+   * and the sequence number of the last event we actually received is what lets
+   * us ask for the rest of it: `?after=<seq>` replays from the next event, so
+   * nothing is printed twice and nothing is missed.
+   */
+  const liveTurn = useRef<{ id: string; seq: number } | null>(null);
+  /**
+   * Set when a `done` or `error` event arrives.
+   *
+   * The transport closing is NOT the same as the turn ending, and this is the
+   * only thing that tells them apart. Without it, a stream cut by a proxy looks
+   * exactly like a stream the server closed because it had finished, so the
+   * client would either reconnect forever to a completed turn or give up on a
+   * running one.
+   */
+  const turnDone = useRef(false);
 
   const scroller = useStickToBottom<HTMLDivElement>();
 
@@ -252,6 +319,92 @@ export default function ChatClient({
     setRolled(null);
     setTrimmed(false);
   }, [threadId]);
+
+  /*
+    PICK UP A TURN THAT WAS RUNNING WHEN THE PAGE RELOADED.
+
+    Refreshing mid-turn used to lose the answer even though the server was still
+    writing it. The transcript came back from the database, which by definition
+    does not contain a turn that has not finished, so the page looked idle while
+    work continued invisibly until the server gave up on it. Anyone who has hit
+    that once learns not to refresh, and then not to start anything long.
+
+    The turn's id and read position survive in sessionStorage, so the reloaded
+    page can ask for the rest of it. Two things make this safe to attempt
+    optimistically: a turn this server no longer has returns 404, and a
+    resume that has fallen off the back of the event buffer returns
+    `resume_gap` — both of which land the user exactly where they already were.
+  */
+  useEffect(() => {
+    if (streamingRef.current) return;
+    const pending = recallLiveTurn(projectId, threadId);
+    if (!pending) return;
+
+    let cancelled = false;
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    (async () => {
+      // Probe before showing anything. A stale entry — the turn finished while
+      // the page was gone, or it was running on a different worker — must not
+      // leave an empty assistant bubble on screen.
+      let res: Response;
+      try {
+        res = await fetch(
+          `/api/chat/resume/${encodeURIComponent(pending.id)}?after=${pending.seq}`,
+          { signal: ac.signal },
+        );
+      } catch {
+        forgetLiveTurn(projectId, threadId);
+        return;
+      }
+      if (cancelled) return;
+      if (!res.ok || !res.body) {
+        forgetLiveTurn(projectId, threadId);
+        return;
+      }
+
+      liveTurn.current = { id: pending.id, seq: pending.seq };
+      turnDone.current = false;
+      setStreaming(true);
+      // The turn is mid-answer, so it needs somewhere to land. Anything it
+      // already streamed before the reload is in the events being replayed.
+      setTurns((prev) =>
+        prev[prev.length - 1]?.role === "assistant" && prev[prev.length - 1]?.pending
+          ? prev
+          : [...prev, blankAssistant()],
+      );
+      setNotice(
+        language === "sw"
+          ? "Naendelea kufuatilia zamu iliyokuwa inaendelea."
+          : "Picking up the turn that was still running.",
+      );
+
+      try {
+        await drainStream(res.body);
+        await followUntilDone(ac);
+        stream.finish();
+        await waitFor(() => stream.pending() === 0, 4000);
+      } catch {
+        /* handled by followUntilDone; nothing useful to add here */
+      } finally {
+        const rest = stream.flushNow();
+        if (rest) appendText(rest);
+        patchLast((m) => ({ ...m, pending: false, phase: undefined }));
+        setStreaming(false);
+        forgetLiveTurn(projectId, threadId);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+    // Deliberately keyed on the CHAT, not on every dependency the body reads:
+    // this must run exactly once per chat opened, and the helpers it calls are
+    // stable for the life of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, threadId]);
 
   /* --------------------------------------------------- block mutation utils */
 
@@ -429,7 +582,29 @@ export default function ChatClient({
 
   /* ---------------------------------------------------------------- actions */
 
+  /**
+   * Stop the running turn — on the server, not just on this screen.
+   *
+   * Aborting the fetch used to be enough, because closing the stream cancelled
+   * the run. It no longer does: a turn now survives a dropped connection, which
+   * is the entire point, and that makes "the socket closed" and "the user
+   * pressed Stop" two different statements. Only the second one should stop the
+   * model, and only an explicit request can say it.
+   *
+   * The order matters. Tell the server first, then abort: aborting first would
+   * cancel the very fetch that carries the instruction.
+   */
   function stop() {
+    const id = liveTurn.current?.id;
+    turnDone.current = true; // do not reconnect to something we just cancelled
+    if (id) {
+      forgetLiveTurn(projectId, threadRef.current);
+      void fetch(`/api/chat/cancel/${encodeURIComponent(id)}`, { method: "POST" }).catch(
+        () => {
+          /* best effort: the abort below still detaches this view */
+        },
+      );
+    }
     abortRef.current?.abort();
   }
 
@@ -503,34 +678,25 @@ export default function ChatClient({
     await runTurn(content, false);
   }
 
-  async function runTurn(content: string, regenerate: boolean) {
-    setStreaming(true);
-    setNotice(null);
-    activeStep.current = null;
-    scroller.pin();
-
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    try {
-      const res = await fetch(`/api/chat/${projectId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: ac.signal,
-        body: JSON.stringify({
-          content,
-          language,
-          dataset_id: datasetId || null,
-          thread_id: threadRef.current ?? null,
-          effort,
-          model: model || null,
-          regenerate,
-          services,
-        }),
-      });
-      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => "request failed"));
-
-      await consumeSse(res.body, (event, data) => {
+  /**
+   * Read one SSE stream to its end, applying every event to the transcript.
+   *
+   * Split out of `runTurn` so the SAME handler serves the initial POST and any
+   * number of resume connections. A reconnect that applied a different subset
+   * of events would produce a transcript that depends on how many times the
+   * network dropped, which is precisely the kind of bug nobody reproduces.
+   */
+  async function drainStream(body: ReadableStream<Uint8Array>) {
+    await consumeSse(body, (event, data) => {
+        // Record how far we have read BEFORE handling the event. If applying it
+        // throws, the next resume asks for this event again rather than
+        // skipping it — replaying one event is recoverable, losing one is not.
+        if (typeof data?.seq === "number" && liveTurn.current) {
+          liveTurn.current.seq = data.seq;
+          if (liveTurn.current.id) {
+            rememberLiveTurn(projectId, threadRef.current, liveTurn.current.id, data.seq);
+          }
+        }
         switch (event) {
           /* ---- structured step protocol (preferred) ---- */
           case "step_start":
@@ -733,6 +899,24 @@ export default function ChatClient({
           case "thinking":
             patchLast((m) => ({ ...m, thinking: m.thinking + (data.text ?? "") }));
             break;
+          case "turn":
+            // The server's address for this run, sent before anything else so
+            // it is known even if the connection dies on the next byte.
+            liveTurn.current = { id: String(data.turn_id ?? ""), seq: -1 };
+            if (liveTurn.current.id) {
+              rememberLiveTurn(projectId, threadRef.current, liveTurn.current.id, -1);
+            }
+            break;
+          case "resume_gap":
+            // Too much was missed to splice the stream back together. Saying so
+            // and reloading beats showing an answer with an unmarked hole in
+            // the middle of it.
+            setNotice(
+              language === "sw"
+                ? "Muunganisho ulikatika kwa muda mrefu. Pakia upya mazungumzo kuona jibu kamili."
+                : "The connection was lost for too long to continue watching. Reload the chat to see the finished answer.",
+            );
+            break;
           case "meta":
             if (data.message_id) patchLast((m) => ({ ...m, id: data.message_id }));
             if (data.steerable && data.message_id) setSteerTurn(String(data.message_id));
@@ -877,6 +1061,8 @@ export default function ChatClient({
             break;
 
           case "done":
+            turnDone.current = true;
+            forgetLiveTurn(projectId, threadRef.current);
             // The server rolls to a successor thread when this one filled the
             // model's window; follow it, or the next turn would be written into
             // a chat the model can no longer read in full.
@@ -885,13 +1071,116 @@ export default function ChatClient({
             }
             break;
           case "error":
+            turnDone.current = true;
+            forgetLiveTurn(projectId, threadRef.current);
             patchLast((m) => ({ ...m, pending: false, error: true }));
             appendText(`\n\n⚠ ${data.message ?? "error"}`);
             break;
           default:
             break;
         }
+    });
+  }
+
+  /**
+   * Keep reattaching to the live turn until the server says it is over.
+   *
+   * Backoff is short and the ceiling is low on purpose. The thing being waited
+   * for is a network that has just come back, not a server that is down: if it
+   * has not come back within about a minute the turn's own detach grace has
+   * expired anyway and the server has cancelled it, so retrying past that point
+   * is spending the user's battery to learn nothing.
+   */
+  async function followUntilDone(ac: AbortController) {
+    const BACKOFF_MS = [400, 900, 2000, 4000, 8000, 12000];
+    let attempt = 0;
+
+    while (!turnDone.current && !ac.signal.aborted) {
+      const live = liveTurn.current;
+      // No turn id means the server never got far enough to name one, so there
+      // is nothing to reattach to.
+      if (!live?.id) return;
+      if (attempt >= BACKOFF_MS.length) {
+        setNotice(
+          language === "sw"
+            ? "Muunganisho umepotea. Pakia upya kuona jibu likikamilika."
+            : "Lost the connection to this turn. Reload to see how it finished.",
+        );
+        return;
+      }
+
+      await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+      if (turnDone.current || ac.signal.aborted) return;
+      attempt += 1;
+
+      try {
+        const res = await fetch(
+          `/api/chat/resume/${encodeURIComponent(live.id)}?after=${live.seq}`,
+          { signal: ac.signal },
+        );
+        if (res.status === 404) return; // the server no longer has this turn
+        if (!res.ok || !res.body) continue;
+        await drainStream(res.body);
+        // A clean read that reached `done` ends the loop through the condition
+        // above; one that did not means the transport dropped again, so the
+        // next iteration reconnects. Reset the backoff, because a stream that
+        // delivered events is evidence the network is working.
+        attempt = 0;
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        // Fall through to the next attempt with a longer wait.
+      }
+    }
+  }
+
+  /**
+   * Run a turn, and keep watching it across a dropped connection.
+   *
+   * THE DISTINCTION THIS DRAWS
+   *
+   * A stream can end for two very different reasons, and treating them the same
+   * way is what made a network blip look like a failed turn. The user pressing
+   * Stop is an ABORT: the turn is over and should be. The transport failing —
+   * a tunnel restarting, a phone moving from wifi to mobile data, a proxy
+   * timing out — says nothing about the turn, which is still running on the
+   * server and still doing the work.
+   *
+   * So: abort ends everything, and a transport failure reconnects to the same
+   * turn from the last event that was actually received. `consumeSse` returning
+   * normally is a third case — the server closed the stream cleanly — which
+   * only happens when the turn has finished or the connection was closed at the
+   * far end, and is distinguished by whether a `done` or `error` event arrived.
+   */
+  async function runTurn(content: string, regenerate: boolean) {
+    setStreaming(true);
+    setNotice(null);
+    activeStep.current = null;
+    liveTurn.current = null;
+    turnDone.current = false;
+    scroller.pin();
+
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    try {
+      const res = await fetch(`/api/chat/${projectId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: ac.signal,
+        body: JSON.stringify({
+          content,
+          language,
+          dataset_id: datasetId || null,
+          thread_id: threadRef.current ?? null,
+          effort,
+          model: model || null,
+          regenerate,
+          services,
+        }),
       });
+      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => "request failed"));
+      await drainStream(res.body);
+      await followUntilDone(ac);
 
       // Let the smoother land the tail naturally rather than dumping it.
       stream.finish();
