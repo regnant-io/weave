@@ -15,12 +15,25 @@ the architecture's explicit constraint.
 ## Quick start (Docker — recommended)
 
 The backend's scientific stack (pandas/scipy/statsmodels/matplotlib) has stable
-wheels on Python 3.12, so the backend image pins 3.12. Everything boots with **zero
-external services** (SQLite + an offline deterministic LLM engine + a subprocess
-sandbox).
+wheels on Python 3.12, so the backend image pins 3.12.
 
 ```bash
 docker compose up --build
+```
+
+This brings up **Postgres and Redis** alongside the app. They used to be behind
+the `full` profile, so the default was SQLite with per-process rate limits —
+fine for one person and quietly wrong for a class. SQLite has exactly one
+writer, so two people sending a message at the same moment serialise and a third
+waits behind both; per-process limits multiply the configured number by the
+worker count. Neither announces itself; both present as "Weave is slow today".
+
+The zero-external-services boot still exists and is still one command — it is
+just no longer what you get by accident:
+
+```bash
+WEAVE_DATABASE_URL=sqlite:///./var/weave.db WEAVE_REDIS_URL= \
+  docker compose up backend frontend --build
 ```
 
 - Frontend → http://localhost:3000
@@ -146,6 +159,8 @@ service; adding a capability = adding one `Tool`.
 | `create_3d_experience` | Render service (**Babylon.js**) — games, 3D building, physics, walkthroughs | wired; needs `deep` profile |
 | `generate_3d` / `create_diagram` / `create_simulation` / `create_animation` | Render service (spec-driven) | wired; needs `deep` profile |
 | `query_warehouse` | **DuckDB** (embedded) / ClickHouse | working (DuckDB), read-only SQL guard |
+| `delegate` | Scoped read-only worker; several run at once, and its sources never enter your context | working |
+| `update_visual` | In-place edit of any generated visual, against its stored source | working |
 | `ask_user` | Interaction broker (blocks the turn on a real question) | working |
 | `remember` / `recall` / `forget` | Project memory, shared across chats | working |
 | `workspace_write/read/edit/list/move/delete` | Developer workspace (host FS, traversal-guarded) | working |
@@ -189,6 +204,22 @@ WEAVE_GOTENBERG_URL=http://gotenberg:3000 \
 Security note: web content is **untrusted data, never instructions**; fetches are
 SSRF-guarded (private/loopback/link-local/cloud-metadata blocked) and size/time
 bounded. Warehouse SQL is read-only (SELECT/WITH only; file/system/DDL blocked).
+
+## Two behaviours worth knowing before you use it
+
+**A turn is not tied to your connection.** Losing the network, refreshing the
+page or switching from wifi to mobile data detaches your VIEW of a running turn;
+the work continues, and reconnecting replays exactly what you missed. Stopping
+is something you do with the Stop button, which now tells the server, rather
+than something the network does to you. A turn nobody comes back to is cancelled
+after a short grace period.
+
+**Everything rendered is opened in a real browser before you see it.** A chart,
+scene, page or diagram that fails is withheld and handed back to the model as a
+failed tool call listing what went wrong; it gets two attempts to repair it by
+EDITING the stored source rather than regenerating from scratch. If it still
+fails, you get it anyway with an explicit description of what does not work —
+never described as finished.
 
 ## Faithful substitutions (documented, drop-in swappable)
 
