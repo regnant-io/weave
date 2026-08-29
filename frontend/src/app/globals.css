@@ -252,6 +252,10 @@ body {
      them rather than inventing another offset. */
   --float-top: calc(0.625rem + var(--safe-top));
   --float-h: 2.25rem;
+
+  /* The composer publishes its measured height here (see Composer.tsx). The
+     value below is only the pre-measurement fallback for the first paint. */
+  --composer-h: 9.5rem;
 }
 
 .h-app {
@@ -890,6 +894,33 @@ body,
   overflow-anchor: none;
 }
 .transcript {
+  /*
+    Content dissolves under the floating rail rather than colliding with it.
+
+    Three controls hover over the top of the transcript — the sidebar reveal,
+    the chat switcher, the thread menu — with a transparent background, because
+    a solid bar there would cost a permanent 56px of reading height on a phone.
+    Transparent chrome over live text means the text runs THROUGH the labels: a
+    paragraph scrolling past the "Chat 1" pill was legible letters on top of
+    legible letters, which is indistinguishable from a rendering fault.
+
+    A mask on the scroller fades the first rail-height of the visible area, so
+    text arrives out of the page edge instead of out from behind a word. It is
+    applied to the scroll container, so it tracks the viewport rather than the
+    content, and it costs one compositing layer.
+  */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.12) calc(var(--float-top) * 0.6),
+    #000 calc(var(--float-top) + var(--float-h) + 0.35rem)
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.12) calc(var(--float-top) * 0.6),
+    #000 calc(var(--float-top) + var(--float-h) + 0.35rem)
+  );
   scroll-behavior: auto; /* smooth-scroll + per-frame growth = jitter */
   /* Reserve the scrollbar gutter so the column never shifts sideways the
      moment content becomes tall enough to overflow. */
