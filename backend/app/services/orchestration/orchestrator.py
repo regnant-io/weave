@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...db import release as release_db
 from ...models import Dataset, Message, Project
 from ..analysis import get_analysis_service
 from ..memory import get_memory_service
@@ -93,6 +94,7 @@ class Orchestrator:
         q: "queue.Queue" = queue.Queue()
         holder: dict = {}
         cancel = threading.Event()
+        project_id = str(project.id)
 
         def emit(event: str, data: dict) -> None:
             # The turn id is learned by watching the stream rather than being
@@ -104,8 +106,32 @@ class Orchestrator:
             q.put({"event": event, "data": data})
 
         def worker() -> None:
+            """Run the turn on its OWN database session.
+
+            The request's session used to be handed straight to this thread
+            while the generator kept it as well. A SQLAlchemy Session is
+            explicitly not thread-safe: it owns identity-map state and, in "commit
+            as you go" mode, a transaction. Two threads sharing one is a data
+            race that mostly does not fire, which is the worst kind — under load
+            it surfaces as an object appearing with another request's values, or
+            a transaction committed from underneath the thread that opened it.
+
+            The thread that does the work owns the session, opens it, and closes
+            it. `_process` re-reads the project through it, so nothing crosses
+            the boundary except ids.
+            """
+            from ...db import SessionLocal
+
+            worker_db = SessionLocal()
             try:
-                msg, meta = self._process(db, project, user_text, language, dataset_id,
+                own_project = worker_db.query(Project).filter(
+                    Project.id == project_id
+                ).first()
+                if own_project is None:
+                    holder["error"] = "project not found"
+                    return
+                msg, meta = self._process(worker_db, own_project, user_text, language,
+                                          dataset_id,
                                           emit=emit, effort=effort, model=model,
                                           cancel=cancel, regenerate=regenerate,
                                           services_pref=services_pref, thread_id=thread_id,
@@ -118,6 +144,7 @@ class Orchestrator:
                 if holder.get("turn_id"):
                     from ..steering import get_steering
                     get_steering().finish(holder["turn_id"])
+                worker_db.close()
                 q.put(None)
 
         t = threading.Thread(target=worker, daemon=True)
@@ -208,6 +235,7 @@ class Orchestrator:
         passages: list[dict] = []
         if route.needs_retrieval or route.intent in {"literature", "concept"}:
             passages = self.retrieval.search(db, user_text, language=language)
+            release_db(db)
 
         # 5. integrity guard (architecture 6.5)
         integrity = guardrails.triggers_integrity_guard(user_text, project.mode)
@@ -432,6 +460,12 @@ class Orchestrator:
             # object costs one shallow copy and removes the whole class of bug.
             call_ctx = dataclasses.replace(ctx, emit=_scoped)
             result = registry.execute(name, call_ctx, tool_input)
+            # Hand the connection back. A tool that read or wrote through the
+            # session leaves a transaction open, and an open transaction holds a
+            # connection (and, on SQLite, the write lock) for the rest of the
+            # turn -- through every subsequent model call, which need no database
+            # at all. See db.release.
+            release_db(ctx.db)
 
             verdict = None
             if gated:
@@ -520,6 +554,11 @@ class Orchestrator:
             messages, history_trimmed = self._history_as_messages(
                 db, thread, language, up_to=user_msg, context_window=context_window,
             )
+            # Everything the database is needed for before generation is done.
+            # The turn from here on is model calls and tools; holding a
+            # connection across all of that is what turns a hundred concurrent
+            # conversations into a hundred idle connections.
+            release_db(db)
             # Screen-share frames ride on the LAST user message, in the
             # engine-neutral `images` shape Ollama consumes natively and the
             # Anthropic engine converts (see `AnthropicEngine._with_images`).
