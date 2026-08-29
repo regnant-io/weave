@@ -269,11 +269,52 @@ export default function Composer({
   const sw = language === "sw";
   const label = (p: [string, string]) => (sw ? p[0] : p[1]);
 
+  /*
+    Auto-size the input to its content.
+
+    Re-measured on RESIZE as well as on typing. Height depends on how the text
+    wraps, and wrapping depends on width — so a height computed at one width is
+    simply wrong at another. Keying it only on `input` meant a composer sized
+    for a phone kept its three-line height when the device was rotated, when the
+    on-screen keyboard closed and gave the viewport its height back, or when a
+    side panel opened and took width away. The result was a tall empty box
+    sitting over the conversation until the next keystroke.
+  */
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
-    ta.style.height = "0px";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+
+    const fit = () => {
+      ta.style.height = "0px";
+      ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+    };
+    fit();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", fit);
+      return () => window.removeEventListener("resize", fit);
+    }
+
+    // Observe the element, but react to WIDTH only.
+    //
+    // `fit` changes the textarea's height, so an observer that reacted to
+    // height would be watching its own output — the classic "ResizeObserver
+    // loop completed with undelivered notifications" feedback. Width is the
+    // input to the calculation and is never changed by it, so gating on width
+    // makes the loop impossible rather than merely convergent.
+    //
+    // Observing the element rather than the window also catches what a window
+    // resize does not: a panel opening beside the chat, the sidebar collapsing,
+    // a webfont finally landing.
+    let lastWidth = ta.getBoundingClientRect().width;
+    const ro = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? lastWidth;
+      if (Math.abs(width - lastWidth) < 0.5) return;
+      lastWidth = width;
+      fit();
+    });
+    ro.observe(ta);
+    return () => ro.disconnect();
   }, [input]);
 
   /*

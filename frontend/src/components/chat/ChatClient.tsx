@@ -24,7 +24,6 @@ import type { ServicePrefs } from "@/lib/services";
 import { DEFAULT_SERVICES } from "@/lib/services";
 import type { AskUserRequest, Block, ChatTurn, StepBlock } from "@/lib/chatTypes";
 import {
-  isArtifactBlock,
   isAsk,
   isStep,
   isText,
@@ -41,7 +40,7 @@ import LiveBar from "./LiveBar";
 import Markdown from "./Markdown";
 import PlanRail from "./PlanRail";
 import SteerBar from "./SteerBar";
-import StepChip from "./StepChip";
+import StepGroup from "./StepGroup";
 import TurnRail from "./TurnRail";
 import { readingLine, summaryForResult, titleForTool } from "./stepTitles";
 import { useSmoothStream } from "./useSmoothStream";
@@ -1451,7 +1450,7 @@ export default function ChatClient({
                 "calc(var(--composer-h, 9.5rem) + 1.75rem + var(--kb-inset))",
             }}
           >
-            {empty && <EmptyState language={language} mode={mode} />}
+            {empty && <EmptyState language={language} mode={mode} onPick={setInput} />}
             {turns.map((turn, i) =>
               turn.role === "user" ? (
                 <UserTurn
@@ -1520,20 +1519,34 @@ export default function ChatClient({
           language={language}
         />
 
-        {/* scroll to bottom — only when detached */}
+        {/* Back to the bottom — only when detached.
+            While a turn is still writing, this is not a navigation control but
+            a REJOIN control: the answer is growing somewhere the reader cannot
+            see, and a bare arrow does not say that. The label appears only
+            while streaming, so a user scrolling back through a finished
+            transcript gets the quiet arrow and nothing to read. */}
         <button
           onClick={() => scroller.pin("smooth")}
           aria-label={language === "sw" ? "Nenda chini" : "Scroll to bottom"}
           /* Rides above the composer, so it tracks both the keyboard and a
              composer that has grown (a long draft, the steering bar). */
           style={{ bottom: "calc(var(--composer-h, 9.5rem) + 0.6rem + var(--kb-inset))" }}
-          className={`absolute left-1/2 z-30 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-border bg-surface text-fg-muted shadow-soft transition-all duration-slow ease-expo hover:border-accent-line hover:text-fg ${
+          className={`absolute left-1/2 z-30 flex h-9 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-surface px-3 shadow-soft transition-all duration-slow ease-expo ${
+            streaming
+              ? "border-accent-line text-accent hover:bg-accent-soft"
+              : "border-border text-fg-muted hover:border-accent-line hover:text-fg"
+          } ${
             scroller.pinned
               ? "pointer-events-none translate-y-3 scale-90 opacity-0"
               : "translate-y-0 scale-100 opacity-100"
           }`}
         >
           <IcoArrowDown size={16} />
+          {streaming && (
+            <span className="text-[11.5px] font-medium">
+              {language === "sw" ? "Bado inaandika" : "Still writing"}
+            </span>
+          )}
         </button>
 
         <Composer
@@ -1694,6 +1707,10 @@ const AssistantTurn = memo(function AssistantTurn({
   register: (id: string, el: HTMLElement | null) => void;
 }) {
   const nothingYet = turn.blocks.length === 0 && !turn.thinking;
+  // Computed once. Calling `groupBlocks` again inside the map to answer
+  // "is this the last entry" would walk the whole timeline on every entry, on
+  // every render, during streaming.
+  const grouped = groupBlocks(turn.blocks);
 
   return (
     <div ref={(el) => register(turn.id, el)} data-turn-id={turn.id} className="animate-rise mb-2">
@@ -1704,16 +1721,61 @@ const AssistantTurn = memo(function AssistantTurn({
       {turn.thinking && <Reasoning text={turn.thinking} active={turn.pending} language={language} />}
 
       {/* The block timeline: prose, work, questions and generated output,
-          interleaved in the order they actually happened. */}
-      {turn.blocks.map((b, i) => {
-        if (isText(b)) {
-          return b.text.trim() ? (
-            <Markdown
-              key={b.id}
-              text={b.text}
-              streaming={streaming && i === turn.blocks.length - 1}
+          interleaved in the order they actually happened.
+
+          Adjacent steps are handed to StepGroup TOGETHER rather than rendered
+          one by one. Grouping is the only thing that changes; the ordering is
+          untouched, because a group ends the moment anything that is not a step
+          appears. A run of twelve consecutive lookups becomes one line the
+          reader can skip past, while a step-then-prose-then-step sequence still
+          reads as three separate things, which is what it is. */}
+      {grouped.map((entry, i) => {
+        // WHERE THE WORK ENDS AND THE ANSWER BEGINS.
+        //
+        // A user turn is introduced by "You" over a hairline. An assistant turn
+        // had nothing: after five step chips the prose simply started, at the
+        // same indent and with the same gap as everything above it, so a reader
+        // scanning back through a long transcript had no landmark for the part
+        // they actually wanted. This draws the same rule before the first prose
+        // that FOLLOWS work — not before a turn that opens with prose, where
+        // there is nothing to separate it from and a label would be noise.
+        const answerStarts =
+          entry.kind === "block" &&
+          isText(entry.block) &&
+          entry.block.text.trim().length > 0 &&
+          grouped.slice(0, i).some((e) => e.kind === "steps") &&
+          !grouped.slice(0, i).some((e) => e.kind === "block" && isText(e.block) &&
+            e.block.text.trim().length > 0);
+
+        const marker = answerStarts ? (
+          <div key="answer-rule" className="mb-2 mt-5 flex items-center gap-2">
+            <span className="eyebrow">{language === "sw" ? "Jibu" : "Answer"}</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        ) : null;
+
+        if (entry.kind === "steps") {
+          return (
+            <StepGroup
+              key={entry.key}
+              steps={entry.steps}
+              language={language}
               onOpenArtifact={onOpenArtifact}
             />
+          );
+        }
+        const b = entry.block;
+        const isLast = i === grouped.length - 1;
+        if (isText(b)) {
+          return b.text.trim() ? (
+            <div key={b.id}>
+              {marker}
+              <Markdown
+                text={b.text}
+                streaming={streaming && isLast}
+                onOpenArtifact={onOpenArtifact}
+              />
+            </div>
           ) : null;
         }
         if (isAsk(b)) {
@@ -1726,17 +1788,14 @@ const AssistantTurn = memo(function AssistantTurn({
             />
           );
         }
-        if (isArtifactBlock(b)) {
-          return (
-            <InlineArtifact
-              key={b.id}
-              artifact={b.artifact}
-              language={language}
-              onOpen={onOpenArtifact}
-            />
-          );
-        }
-        return <StepChip key={b.id} step={b} language={language} onOpenArtifact={onOpenArtifact} />;
+        return (
+          <InlineArtifact
+            key={b.id}
+            artifact={b.artifact}
+            language={language}
+            onOpen={onOpenArtifact}
+          />
+        );
       })}
 
       {/* No prebuilt loader. Just an honest, unbounded presence indicator that
@@ -1767,6 +1826,41 @@ const AssistantTurn = memo(function AssistantTurn({
     </div>
   );
 });
+
+/**
+ * Collapse runs of ADJACENT step blocks into single entries.
+ *
+ * Everything else passes through untouched and in order, so this cannot change
+ * what the transcript says — only how many boxes it is drawn in. A group ends
+ * at the first block that is not a step, which is what keeps prose written
+ * between two tool calls separating them on screen the way it separated them in
+ * time.
+ */
+type Grouped =
+  | { kind: "steps"; key: string; steps: StepBlock[] }
+  | { kind: "block"; block: Exclude<Block, StepBlock> };
+
+function groupBlocks(blocks: Block[]): Grouped[] {
+  const out: Grouped[] = [];
+  let run: StepBlock[] = [];
+
+  const flush = () => {
+    if (!run.length) return;
+    out.push({ kind: "steps", key: `g-${run[0].id}`, steps: run });
+    run = [];
+  };
+
+  for (const b of blocks) {
+    if (isStep(b)) {
+      run.push(b);
+      continue;
+    }
+    flush();
+    out.push({ kind: "block", block: b });
+  }
+  flush();
+  return out;
+}
 
 /**
  * What the supervisor is doing between bursts of visible work.
@@ -1893,19 +1987,136 @@ function Sources({ citations, language }: { citations: Citation[]; language: Lan
   );
 }
 
-function EmptyState({ language, mode }: { language: Language; mode: string }) {
+/**
+ * Openings offered on an empty chat.
+ *
+ * Each one is a real capability that nobody discovers by looking at a text box.
+ * A new user's model of this product is "a chat window", and every day they
+ * hold that model is a day they do not upload a dataset, do not ask for
+ * something they can drag, and do not find out that it will build and run
+ * software. A blank page with a tagline does nothing to change that.
+ *
+ * Written as things a person would actually type, in the first person, not as
+ * feature names. "Build me a simulation of…" teaches the capability by being an
+ * example of using it; "Interactive simulations" teaches a menu.
+ */
+const OPENINGS: Record<
+  "student" | "researcher",
+  { sw: string; en: string; hint: [string, string] }[]
+> = {
+  student: [
+    {
+      sw: "Nifafanulie [dhana] kwa mfano wa Kitanzania, kisha unipe swali la kujipima.",
+      en: "Explain [a concept] with a Tanzanian example, then give me one question to test myself.",
+      hint: ["kufundisha", "teaching"],
+    },
+    {
+      sw: "Nitengenezee uigaji ninaoweza kucheza nao ili nielewe [dhana].",
+      en: "Build me something I can drag a slider on so I can feel how [X] works.",
+      hint: ["uigaji", "simulation"],
+    },
+    {
+      sw: "Nipe maswali ya mazoezi ya mtihani kuhusu [mada], kisha uyasahihishe.",
+      en: "Set me exam-style practice on [topic], then mark it honestly.",
+      hint: ["mtihani", "exam"],
+    },
+    {
+      sw: "Nisaidie kupanga ratiba ya marudio hadi mtihani wangu tarehe […].",
+      en: "Help me plan revision between now and my exam on [date].",
+      hint: ["ratiba", "planning"],
+    },
+  ],
+  researcher: [
+    {
+      sw: "Nimepakia data yangu — ichunguze, kisha uniambie tatizo lililopo ndani yake.",
+      en: "I have uploaded my data — profile it, then tell me what is wrong with it.",
+      hint: ["data", "analysis"],
+    },
+    {
+      sw: "Nifanyie mapitio ya maandiko kuhusu [mada] na unionyeshe pengo lililopo.",
+      en: "Review the literature on [topic] and show me where the gap is.",
+      hint: ["maandiko", "literature"],
+    },
+    {
+      sw: "Nijengee ramani ya dhana inayoonyesha jinsi tafiti hizi zinavyohusiana.",
+      en: "Map how these studies relate to each other so I can see the argument.",
+      hint: ["ramani", "graph"],
+    },
+    {
+      sw: "Jenga na uendeshe programu inayochakata faili zangu za uwandani.",
+      en: "Build and actually run a script that processes my field data files.",
+      hint: ["programu", "software"],
+    },
+  ],
+};
+
+function EmptyState({
+  language,
+  mode,
+  onPick,
+}: {
+  language: Language;
+  mode: string;
+  onPick: (text: string) => void;
+}) {
+  const sw = language === "sw";
+  const openings = OPENINGS[mode === "researcher" ? "researcher" : "student"];
+
   return (
-    <div className="flex min-h-[52vh] flex-col items-center justify-center text-center">
+    /* The wordmark and the floating chat switcher are both centred, so without
+       this clearance they land on each other on an empty chat — the one screen
+       where there is no text to fade under the rail and hide the collision. */
+    <div
+      className="flex flex-col items-center justify-center"
+      style={{
+        minHeight: "52vh",
+        paddingTop: "calc(var(--float-top) + var(--float-h) + 1.25rem)",
+      }}
+    >
       <WeaveMark size="lg" className="text-fg" duration={2600} />
-      <p className="mt-6 max-w-sm font-read text-[15px] italic leading-relaxed text-fg-muted">
+      <p className="mt-6 max-w-sm text-center font-read text-[15px] italic leading-relaxed text-fg-muted">
         {mode === "researcher"
-          ? language === "sw"
+          ? sw
             ? "Hali ya mtafiti — majibu ya moja kwa moja yenye rejea."
             : "Researcher mode — direct answers, strictly cited."
-          : language === "sw"
+          : sw
             ? "Hali ya mwanafunzi — mwongozo hatua kwa hatua."
             : "Student mode — guided, step by step."}
       </p>
+
+      <div className="mt-9 w-full max-w-lg">
+        <div className="eyebrow mb-2.5 flex items-center gap-2">
+          <span>{sw ? "Jaribu" : "Try"}</span>
+          <span className="h-px flex-1 bg-border" />
+        </div>
+        <ul className="space-y-px">
+          {openings.map((o) => {
+            const text = sw ? o.sw : o.en;
+            return (
+              <li key={o.en}>
+                {/*
+                  Fills the composer rather than sending. Every one of these has
+                  a bracket in it that only the user can fill, and sending it
+                  verbatim would ask the assistant about "[topic]" — which is
+                  both useless and a small lesson that the suggestions do not
+                  work.
+                */}
+                <button
+                  onClick={() => onPick(text)}
+                  className="group flex w-full items-center gap-3 border-l-2 border-border py-2 pl-3 pr-2 text-left transition-all duration-fast ease-soft hover:border-accent hover:bg-surface-2/50"
+                >
+                  <span className="min-w-0 flex-1 font-read text-[14.5px] leading-snug text-fg-muted transition-colors duration-fast group-hover:text-fg">
+                    {text}
+                  </span>
+                  <span className="eyebrow flex-shrink-0 opacity-0 transition-opacity duration-fast group-hover:opacity-100">
+                    {sw ? o.hint[0] : o.hint[1]}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
     </div>
   );
 }

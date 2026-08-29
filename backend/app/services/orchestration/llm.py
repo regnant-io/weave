@@ -985,12 +985,22 @@ class OfflineEngine:
             )
         return "\n\n".join(p for p in parts if p).strip()
 
-    def translate(self, text: str, target_language: str) -> str:
-        # No translation service offline. Return the text with an honest marker so
-        # the bilingual toggle still shows content rather than a blank field.
-        note = "[Tafsiri ya moja kwa moja haipatikani nje ya mtandao]" if target_language == "sw" \
-            else "[Automatic translation unavailable offline]"
-        return f"{note}\n\n{text}"
+    def translate(self, text: str, _target_language: str) -> str:
+        """No translation offline. Hand the text back UNCHANGED.
+
+        This used to prepend a bracketed marker -- "[Automatic translation
+        unavailable offline]" -- and return that together with the text. The
+        caller writes the result into the mirror-language column, so the marker
+        became the first line of the stored answer: a user reading in that
+        language opened their answer to an apology in square brackets sitting
+        above it, in the wrong language.
+
+        The caller already treats "the translation equals the original" as
+        nothing worth writing, and the row already holds readable text in both
+        columns. Returning the text unchanged therefore degrades exactly the way
+        the design intends -- the same language twice -- rather than degrading
+        into a defaced answer."""
+        return text
 
     def _describe_analysis(self, analysis: dict, sw: bool) -> str:
         status = analysis.get("status")
