@@ -1,6 +1,6 @@
 # Weave — what it is today
 
-*Snapshot: 30 July 2026. A description of the system as built, not as planned.*
+*Snapshot: 29 August 2026. A description of the system as built, not as planned.*
 
 Weave is a bilingual (Kiswahili / English) study and research workspace for
 Tanzanian students and researchers. It is a working instrument rather than a
@@ -32,9 +32,18 @@ FastAPI backend
         └─ weave-workspace  per-command container for the developer sandbox
 ```
 
-Compose profiles: default (`backend` + `frontend`), `deep` (the capability
-services above), `full` (Postgres + Redis + a Celery worker), `build-images`
-(builds the workspace image).
+Compose profiles: **default now includes Postgres and Redis** alongside
+`backend` and `frontend`; `deep` adds the capability services above; `full` adds
+a Celery worker; `build-images` builds the workspace image.
+
+Postgres and Redis were behind `full` until they were moved into the default,
+because the default was SQLite with per-process rate limits — fine for one
+person and quietly wrong for a class. SQLite has exactly one writer, so two
+students sending a message at the same moment serialise and a third waits behind
+both; per-process limits multiply the configured number by the worker count.
+Neither announces itself; both present as "Weave is slow today". The
+zero-service boot is still one command, it is just no longer what you get by
+accident.
 
 **Ports.** frontend `:3000`, backend `:8001→8000`, render `:3100`, SearXNG
 `:8888`, Browserless `:3001`, Gotenberg `:3002`, MinIO `:9000/:9001`, Qdrant
@@ -82,7 +91,7 @@ essay") so ordinary drafting is untouched.
 
 ---
 
-## 3. Tools — 45 of them
+## 3. Tools — 51 of them
 
 Registered in `services/tools/`, gated by mode, trust tier, wired services and
 router intent.
@@ -120,7 +129,7 @@ and reading were previously the same expensive operation), `create_knowledge_gra
 
 ## 4. Skills
 
-A library of 15 worked procedures in `services/skills/library/`, as plain
+A library of 22 worked procedures in `services/skills/library/`, as plain
 Markdown with front matter. `list_skills` is cheap (names and one-liners);
 `read_skill` loads one body. The assistant is instructed to read before
 following, and never to claim it applied a skill it has not read.
@@ -133,10 +142,18 @@ conversation and make small models measurably worse.
 `literature-review`, `research-proposal`, `survey-design`, `academic-writing`,
 `exam-revision`, `teach-a-hard-concept`.
 
-**Making things well:** `beautiful-visualisation` (form heuristic, palette
-rules, labelling), `single-file-html`, `knowledge-graph` (React Flow),
-`interactive-3d-scene` (Babylon), `build-and-ship-software`,
-`verify-before-shipping`, `using-weave-well`.
+**Making things well:** `choose-the-right-output` (which surface a request
+belongs on — the decision that goes wrong before a line is written),
+`beautiful-visualisation`, `single-file-html`, `knowledge-graph` (React Flow),
+`interactive-3d-scene` (Babylon), `interactive-simulation`, `presentation-deck`,
+`fix-a-broken-artifact` (repair by editing, with each gate error mapped to its
+actual cause), `build-and-ship-software`, `verify-before-shipping`,
+`delegate-and-parallelise`, `using-weave-well`.
+
+**Writing and examining:** `academic-kiswahili` (the register, and the habits
+that make Kiswahili academic prose read as translated English),
+`exam-paper-practice` (NECTA/CSEE command words, mark allocation, and marking
+honestly rather than generously).
 
 ---
 
@@ -289,6 +306,14 @@ docker compose --profile deep up --build -d
 - API + Swagger → http://localhost:8001/docs
 - Demo login: phone `+255700000001`, password `weave-demo-123`
 
+Without Postgres and Redis (development only — see §1 for why this is not a
+deployment):
+
+```bash
+WEAVE_DATABASE_URL=sqlite:///./var/weave.db WEAVE_REDIS_URL= \
+  docker compose up backend frontend --build
+```
+
 Fully local with Ollama:
 
 ```bash
@@ -302,7 +327,7 @@ With Claude:
 ANTHROPIC_API_KEY=sk-ant-... docker compose --profile deep up --build -d
 ```
 
-Backend tests: `cd backend && python -m pytest tests` (68 passing).
+Backend tests: `cd backend && python -m pytest tests` (148 passing).
 
 ---
 
@@ -444,3 +469,202 @@ because Next route handlers proxy HTTP but not upgrades.
 The self-correction loop *is* built: `VERIFY_YOUR_WORK` in the prompt, the
 `verify-before-shipping` skill, `verify_artifact`, `workspace_verify`, and the
 render service's static linter.
+
+---
+
+## 16. What changed on 29 August 2026
+
+A pass over correctness, capacity and the surface, driven by symptoms that were
+each visible and none of which had an obvious cause. Recorded here because the
+mechanisms are more interesting than the fixes, and because most of them have
+the same shape: something correct in isolation producing the opposite of its
+intent in the one situation that mattered.
+
+### Four UI faults with the same character
+
+**Scrolling up during a stream was impossible.** The bottom-pinning hook fenced
+its own scroll assignments behind a boolean the scroll handler checked and
+cleared on the next animation frame. That works when assignments are rare;
+during a stream they are constant, so the fence was never down and a real user
+scroll could never unstick the view. Pressing "scroll to bottom" made it worse,
+because it re-armed the fence for a 420ms animation. Replaced with two
+unambiguous signals: the exact `scrollTop` we last wrote, and direct observation
+of wheel, touch, keyboard and scrollbar input.
+
+**Tokens printed on top of each other.** Settled markdown segments carried
+`content-visibility: auto` with `contain-intrinsic-size: auto 1px`, so every
+off-screen block measured one pixel tall. `scrollHeight` was therefore wrong,
+pinning scrolled against a wrong height, and the browser resolved the real
+heights mid-paint — between those two states, lines from different blocks
+occupied the same pixels. The performance goal it served was already met by
+memoising each segment.
+
+**"JavaScript did not load" on a working app.** The banner was hidden by
+removing a `no-js` class the server renders onto `<html>`. `className` is part
+of the React tree, so every client-side navigation re-committed the server's
+value and put the class back — the warning appeared for the first time at the
+moment the user proved it false. Now `<noscript>` for scripting-off, and a
+head-set timer cleared by a mounted client component for a genuinely dropped
+bundle.
+
+**The dashboard peeked before onboarding.** The gate lived in the page
+component, below the shared layout, so the whole application painted for a beat
+before redirecting a first-run user into the flow meant to introduce it. Moved
+to middleware, which decides before anything renders. Onboarding's Skip button
+was separately broken: it fired the request that sets the `onboarded` cookie and
+navigated in the same tick, so the navigation raced the fetch, lost, and was
+bounced straight back.
+
+### Streaming
+
+The Ollama path falls back to a non-streaming request when a stream dies, and
+then emitted the whole regenerated answer — including the part already on screen
+— so the opening was printed twice, interleaved with itself. It now sends only
+the delta, or retracts with `answer_restart` when the retry diverged.
+
+`TurnResult.text` was whatever the FINAL step said, so a model that writes a
+paragraph and then calls a tool had that paragraph streamed and then dropped:
+the transcript was right until it was reloaded. Every non-empty step is kept.
+
+The Anthropic path did not stream at all, and the "did the engine stream?" test
+was a hard-coded comparison against the string `"ollama"` — so its finished
+answer was re-emitted through the fake token generator meant for engines that
+cannot stream. Engines now declare `streams`.
+
+**Tapestry produced the worst answer in the product.** A supervised turn's
+delivered text was every pass concatenated, and models re-orient when handed a
+conversation: a continuation restates the problem, a repair restates what was
+already fine. At one continuation that is a stray paragraph; at five
+continuations and two repair rounds it is the same material up to eight times,
+with later copies contradicting earlier ones. Paragraphs repeated by a later
+pass are now dropped. The per-phase pass limits also multiplied — 6 + 2×6 =
+eighteen generations, a number nobody chose — so there is a ceiling on the
+total.
+
+### Concurrency
+
+Independent tool calls run at the same time. Tools opt in via
+`Tool.parallel_safe`, off by default and set only on reads that touch neither
+the database (one Session, not thread-safe) nor the world. A mixed batch stays
+serial; results come back in the order the model asked for them.
+
+Making that safe required two prerequisites, both latent bugs on their own: tool
+events now carry the id of the step they belong to (substeps used to attach to
+whichever step started most recently), and each call gets its own `ToolContext`
+copy rather than mutating `emit` on a shared object.
+
+### Durable turns (`services/orchestration/live.py`)
+
+A turn was owned by the HTTP request that started it, so a refresh, a tunnel
+restart or a phone moving from wifi to mobile data cancelled it. For a chat
+reply that is a reasonable trade; for a twenty-minute build it means the work,
+the installed packages and the spent quota all vanish with no record — and
+people learn not to start long jobs, which removes the capability the product is
+built around.
+
+A turn is now a first-class object that writes numbered events into a buffer.
+Connections attach and read from where they left off, so a reconnect replays
+exactly what was missed (`?after=<seq>`). A turn nobody comes back to is still
+cancelled, after a grace period long enough to survive a bad handover. Because
+losing a connection no longer means anything, Stop had to become explicit: there
+is a cancel endpoint, and the client calls it.
+
+The registry is per-process; a reconnect routed to a different worker gets a 404
+and the client reloads the thread, which for a finished turn shows the real
+answer.
+
+### Delegation (`services/orchestration/subagent.py`)
+
+`delegate` hands one self-contained lookup to a read-only worker whose sources
+never enter the caller's conversation. This is a context fix, not an
+architectural fashion: comparing four districts means forty pages of raw text
+landing in the window the model is answering from, of which about a paragraph
+each survives into the answer. Delegates cannot write, run code, produce
+artifacts, touch the database, or delegate further — the tool is simply absent
+from the set they are given, which is stronger than instructing them not to.
+
+### Artifacts that rendered nothing
+
+A SyntaxError is raised when a script is PARSED, and the model's Babylon scene
+code was inlined into the same `<script>` as the harness that reports errors —
+so one stray comma took the reporting down with it and the page sat on "Loading
+scene…" forever while every layer above reported success. The code is now
+compiled server-side with `new Function` before it is sent, lives in its own
+`<script>`, and is wrapped async so a scene that awaits a mesh loader is legal
+rather than a syntax error. The canvas is `renderCanvas`, because that is the id
+in every Babylon sample and therefore the id models type when they look one up
+instead of using the one they were handed.
+
+A Vega-Lite spec can be valid, compile cleanly, render without a warning and
+produce an SVG with nothing in it — an empty data array, a misspelled field
+name, a filter matching no rows. Every layer reported success because from the
+outside a blank chart and a real one are both "an SVG". The render service is
+the only place that can look at the marks, so that is where the question is now
+asked.
+
+**Repair means edit.** The brief used to say "call the tool again with the
+corrected version", which does not converge: the rewrite has a new fault about
+as often as the original did, so the budget is spent going sideways and the user
+watches the same thing break three times in three different ways.
+`update_visual` previously handled five of the eleven visual kinds and refused
+the rest — including Babylon scenes and HTML pages, the two that break most — so
+there was no honest alternative to offer. It now handles every kind, against
+source kept for exactly this purpose, and the brief names the id and asks for
+the smallest change that fixes the fault.
+
+### Capacity
+
+A `Session` checks out a connection when a transaction begins and returns it on
+commit — and in commit-as-you-go mode a plain SELECT opens one. So a single
+query early in a turn held a connection through minutes of generation and tool
+calls that need no database at all. Released after retrieval, after history is
+read, and after each tool call. Added pool sizing and `pool_pre_ping`.
+
+The streaming turn ran on the request's session, from another thread, while the
+generator held it too. It now opens and owns its own.
+
+Rate limits were per-process, so N workers allowed N times the configured
+number, silently. Buckets move to Redis when `WEAVE_REDIS_URL` is set, with
+refill-and-take in a Lua script so it is atomic under exactly the concurrency
+that makes limiting matter.
+
+Postgres was never fully set up: only SQLite got the keyword-search index and
+the add-missing-column pass, so a Postgres instance had no full-text index and
+every keyword search was a sequential scan of the corpus. Its search path also
+built an invalid `tsquery` from an empty token list, which was a 500 rather than
+no results.
+
+### Credentials
+
+Four routes had no limit of any kind, and they are the four where calling
+repeatedly IS the attack. `/auth/otp/verify` was the worst: six digits, a
+million values, ten minutes, unlimited guesses. It now has a per-address rate
+limit AND an attempt budget attached to the code — the budget is on the code and
+not the phone number, because burning a number would let anyone lock a real
+person out of their own account by guessing badly on their behalf.
+
+`decode_access_token` raised on a malformed token rather than returning None, so
+a corrupt cookie produced a 500 with a traceback. `LocalStorage` tested
+containment with a string prefix, which accepts a sibling directory whose name
+starts with the root's.
+
+### The chat surface
+
+An assistant turn now expresses the structure it has: what I planned, what I
+did, what I found. Adjacent steps are grouped into one collapsible entry —
+ordering untouched, because a group ends at the first block that is not a step —
+and a finished run of four or more folds to a single line. A group with anything
+running stays open, and so does one with a failure: an error behind a chevron is
+an error nobody reads. A rule marks where the answer begins, matching the "You"
+rule on a user turn.
+
+The steering bar and the live-voice bar were laid out underneath the composer
+overlay and had been invisible and unclickable. The transcript padded against a
+constant rather than the composer's measured height, so a multi-line draft hid
+the last line of the answer. Per-token render cost was proportional to
+conversation length, because a callback closing over a freshly-created object
+defeated memoisation for every turn.
+
+An empty chat offers four mode-aware openings written as things a person would
+type. A new user's model of this product is "a chat window", and a blank page
+with a tagline does nothing to change that.
