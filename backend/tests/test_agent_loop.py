@@ -653,3 +653,73 @@ def test_every_generation_is_asked_a_question():
     a._adopt_plan({"surface": "artifact", "goal": "g", "steps": ["one"]})
     a.run()
     assert seen and all(r == "user" for r in seen), seen
+
+
+# --------------------------------------------------------------------------- #
+#  Effort levels: the two the user reported as misbehaving                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_total_pass_ceiling_bounds_a_deep_turn():
+    """The per-phase limits MULTIPLY, and nobody chose the product.
+
+    The working loop may run `max_continuations + 1` passes, and then each
+    review round calls the same loop again with a repair brief. At Tapestry that
+    is 6 + 2x6 = eighteen generations, each of which may make up to forty tool
+    calls. The first time anyone notices is when one question has been running
+    for twenty minutes and the session quota is gone.
+    """
+    from app.services.orchestration.agent import LoopPolicy
+
+    for level in ("spool", "weave", "tapestry"):
+        p = LoopPolicy.for_effort(level, complex_request=True)
+        worst_case_without_ceiling = (p.max_continuations + 1) * (1 + p.max_review_rounds)
+        assert p.max_total_passes <= worst_case_without_ceiling, level
+        assert p.max_total_passes >= 2, level
+
+    # And the ordering is the point: deeper must mean more, not merely different.
+    quick = LoopPolicy.for_effort("spool", complex_request=True)
+    deep = LoopPolicy.for_effort("tapestry", complex_request=True)
+    assert quick.max_total_passes < deep.max_total_passes
+
+
+def test_repeated_paragraphs_are_dropped_from_the_delivered_answer():
+    """Why the deep setting produced the worst answer in the product.
+
+    Each pass produces prose and the answer was every pass concatenated. Models
+    re-orient when handed a conversation, so a continuation restates the problem
+    and a repair restates what was already fine. At one continuation that is a
+    stray paragraph; at five continuations and two repair rounds it is the same
+    material up to eight times, with later copies contradicting earlier ones
+    because the work changed underneath them.
+    """
+    from app.services.orchestration.agent import _compose
+
+    opening = (
+        "Rural piped-water coverage in Dodoma is 61 percent, against a national "
+        "rural figure of 72 percent, and the gap has widened since 2019."
+    )
+    out = _compose([
+        opening + "\n\nThe district spread matters more than the average.",
+        # A continuation pass re-orienting itself, with real new content after.
+        opening + "\n\nScheme failure after handover explains most of it.",
+    ])
+
+    assert out.count("Rural piped-water coverage in Dodoma is 61 percent") == 1
+    assert "The district spread matters" in out
+    assert "Scheme failure after handover" in out
+    # Order is preserved: the reader met the opening first, so it stays first.
+    assert out.index("61 percent") < out.index("district spread")
+
+
+def test_short_repeated_lines_are_left_alone():
+    """"Done." and "Here is the code:" are signposts, not duplication.
+
+    Suppressing them would remove structure rather than repetition, which is why
+    the dedupe has a length floor rather than matching everything.
+    """
+    from app.services.orchestration.agent import _compose
+
+    out = _compose(["Here is the code:\n\n```py\na = 1\n```",
+                    "Here is the code:\n\n```py\nb = 2\n```"])
+    assert out.count("Here is the code:") == 2
