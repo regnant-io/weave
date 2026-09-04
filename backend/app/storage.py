@@ -19,9 +19,18 @@ class LocalStorage:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
+        """Resolve a key to a path, refusing anything outside the root.
+
+        The containment test is `is_relative_to`, not a string prefix. A prefix
+        comparison accepts a SIBLING whose name merely starts with the root's:
+        with a root of `/var/storage`, the key `../storage-public/x` resolves to
+        `/var/storage-public/x`, and `str(p).startswith("/var/storage")` is
+        perfectly true. Path-aware containment compares components, so it cannot
+        be fooled that way.
+        """
         p = (self.root / key).resolve()
-        # prevent path traversal outside the storage root
-        if not str(p).startswith(str(self.root.resolve())):
+        root = self.root.resolve()
+        if p != root and not p.is_relative_to(root):
             raise ValueError("invalid storage key")
         p.parent.mkdir(parents=True, exist_ok=True)
         return p

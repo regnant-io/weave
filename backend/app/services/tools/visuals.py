@@ -126,24 +126,75 @@ def _create_html_page(ctx: ToolContext, inp: dict) -> dict:
 def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
     """Check a page opens BEFORE it is handed over.
 
-    Deliberately read-only and cheap: the point is that the model can run it on
-    its own output, see a concrete failure, and fix it in the same turn instead
-    of shipping something that renders blank.
+    Two passes, because they catch different things:
+
+      * the STATIC lint reads the source and finds what is visibly wrong — ESM
+        syntax in a classic script, a CDN `<script src>`, a truncated file;
+      * the LIVE run opens the page in a real browser and finds what is only
+        discoverable by executing it. This is the pass that catches
+        "createScene did not return a BABYLON.Scene", which is a perfectly
+        well-formed document that renders a black rectangle.
+
+    Artifacts produced by the tools are gated automatically (see
+    services/orchestration/verification.py), so this tool is for pages the model
+    has written but not yet submitted — checking a draft, or a page it read out
+    of the workspace.
     """
     client = _render(ctx)
     if not client:
         return _unavailable()
     html = str(inp.get("html") or "")
+    source = "supplied html"
     if not html.strip():
         vid = str(inp.get("visual_id") or "")
+        path = str(inp.get("workspace_path") or "")
         if vid:
             from ..render import visuals
             html = visuals.load_html(_project_id(ctx), vid)
+            source = f"visual {vid}"
+        elif path:
+            # Checking a page the model built in the workspace is the same
+            # question, and refusing to answer it just because the file lives
+            # somewhere else would send the model back to guessing.
+            workspace = ctx.services.get("workspace")
+            if workspace is None:
+                return {"status": "error",
+                        "error": "the workspace is not available on this server"}
+            read = workspace.read_file(_project_id(ctx), path)
+            if read.get("status") != "ok":
+                return {"status": "error", "error": read.get("error") or "could not read the file"}
+            html = read.get("content") or ""
+            source = path
         if not html.strip():
-            return {"status": "error", "error": "supply html, or a visual_id that exists"}
-    result = client.verify_html(html)
-    result["tool"] = "verify_artifact"
-    return result
+            return {"status": "error",
+                    "error": "supply `html`, a `visual_id`, or a `workspace_path` that exists"}
+
+    static = client.verify_html(html)
+    errors = [str(e) for e in (static.get("errors") or [])]
+    warnings = [str(w) for w in (static.get("warnings") or [])]
+
+    from ..render.probe import get_probe
+    run = get_probe().run(html, heavy=bool(inp.get("heavy", True)))
+    if run.available:
+        errors += run.errors
+        warnings += run.warnings
+
+    ok = not errors
+    return {
+        "status": "ok",
+        "tool": "verify_artifact",
+        "checked": source,
+        "executed": run.available,
+        "ok": ok,
+        "errors": errors[:12],
+        "warnings": warnings[:8],
+        "note": (
+            "The page opens and renders without errors."
+            if ok else
+            "This page is BROKEN. Fix the errors listed and check it again before "
+            "showing it to the user."
+        ),
+    }
 
 
 def _render_custom(ctx: ToolContext, inp: dict) -> dict:
@@ -168,7 +219,27 @@ def _list_visuals(ctx: ToolContext, _inp: dict) -> dict:
 
 
 def _update_visual(ctx: ToolContext, inp: dict) -> dict:
-    """Re-render an existing visual in place, keeping its id and URL."""
+    """Re-render an existing visual in place, keeping its id and URL.
+
+    THIS IS THE REPAIR PATH, AND IT HAS TO COVER EVERY KIND OF VISUAL.
+
+    When a rendered artifact comes back broken, there are two ways to fix it:
+    change the part that is wrong, or write the whole thing again. Only one of
+    those converges. A model asked to re-emit four hundred lines of scene code
+    to fix one missing `return` produces four hundred DIFFERENT lines, with a
+    different fault in them, and the loop can run its whole budget without ever
+    getting closer -- which is exactly the "it keeps breaking it again" failure.
+
+    Editing converges because everything that was already right stays right.
+    That only works if the thing can be edited at all, and it previously could
+    not: this function handled five of the eleven visual kinds and returned
+    "unknown type" for the rest, including Babylon scenes and HTML pages, which
+    are precisely the two that break most often. So the repair brief had no
+    honest option to offer except regeneration.
+
+    Every kind is handled now, and the stored SOURCE (see render/visuals.py) is
+    merged with the patch, so a caller can send only the field it wants changed.
+    """
     from ..render import visuals
 
     client = _render(ctx)
@@ -183,7 +254,17 @@ def _update_visual(ctx: ToolContext, inp: dict) -> dict:
     tool = rec.get("tool")
     title = str(inp.get("title") or rec.get("title") or "Visual")
     spec = visuals.merge_spec(rec.get("spec") or {}, inp.get("spec") or {})
+    stored = visuals.load_source(pid, vid)
     theme = inp.get("theme", "light")
+
+    # A caller may pass the changed field at the top level (`code`, `html`) or
+    # inside `spec`. Both read naturally; accepting only one of them is a trap
+    # that costs a whole round trip to discover.
+    def field(name: str, default=""):
+        for source in (inp, inp.get("spec") or {}):
+            if isinstance(source, dict) and source.get(name) is not None:
+                return source[name]
+        return stored.get(name, default)
 
     if tool == "create_diagram":
         out = client.diagram(spec, project_id=pid, title=title, theme=theme, visual_id=vid)
@@ -191,12 +272,36 @@ def _update_visual(ctx: ToolContext, inp: dict) -> dict:
         out = client.simulation(spec, project_id=pid, title=title, theme=theme, visual_id=vid)
     elif tool == "create_animation":
         out = client.animation(spec, project_id=pid, title=title, theme=theme, visual_id=vid)
+    elif tool == "create_knowledge_graph":
+        out = client.graph(spec, project_id=pid, title=title,
+                           subtitle=str(field("subtitle", "")), theme=theme, visual_id=vid)
     elif tool == "generate_3d":
         out = client.three_visual(spec.get("scene") or {}, project_id=pid, title=title,
                                   theme=theme, visual_id=vid)
+    elif tool == "create_3d_experience":
+        code = str(field("code", ""))
+        if not code.strip():
+            return {"status": "error",
+                    "error": "this scene's source could not be read, so it cannot be "
+                             "edited in place; create a new one instead"}
+        out = client.babylon(project_id=pid, code=code, title=title,
+                             subtitle=str(field("subtitle", "")), theme=theme,
+                             assets=field("assets", {}) or {},
+                             controls=str(spec.get("controls") or ""),
+                             libs=spec.get("libs") or [], visual_id=vid)
+    elif tool == "create_html_page":
+        html = str(field("html", ""))
+        if not html.strip():
+            return {"status": "error",
+                    "error": "this page's source could not be read, so it cannot be "
+                             "edited in place; create a new one instead"}
+        out = client.html_page(html, project_id=pid, title=title,
+                               strict=bool(spec.get("strict")), visual_id=vid)
     elif tool == "render_custom":
-        out = client.custom(project_id=pid, code=spec.get("code", ""), html=spec.get("html", ""),
-                            title=title, theme=theme, libs=spec.get("libs") or [], visual_id=vid)
+        out = client.custom(project_id=pid, code=str(field("code", "")),
+                            html=str(field("html", "")),
+                            title=title, theme=theme, libs=spec.get("libs") or [],
+                            visual_id=vid)
     else:
         return {"status": "error", "error": f"visual {vid!r} has unknown type {tool!r}"}
 
@@ -434,16 +539,23 @@ def register_visual_tools(reg: ToolRegistry) -> None:
     reg.register(Tool(
         name="verify_artifact",
         description=(
-            "Check that a page you generated will actually OPEN, before you tell the "
-            "user it is ready. Catches the failures that look fine in the source and "
-            "render blank in the browser: ESM syntax in a classic script, external "
-            "resources that the sandbox blocks, and truncated files. Pass either the "
-            "raw `html` or the `visual_id` of something you already created. Read-only "
-            "— it never stores or changes anything."
+            "OPEN a page in a real headless browser and report what actually "
+            "happened: uncaught exceptions, console errors, blocked network "
+            "requests, and whether anything was painted at all. This catches the "
+            "failures that look perfectly fine in the source — a scene function "
+            "that never returns its scene, setup code that throws halfway, a page "
+            "that draws nothing — as well as the static ones (ESM syntax in a "
+            "classic script, external resources, truncated files). Pass raw "
+            "`html`, the `visual_id` of something you created, or a "
+            "`workspace_path` to a page in the project workspace. Read-only."
         ),
         input_schema={"type": "object", "properties": {
             "html": {"type": "string"},
             "visual_id": {"type": "string"},
+            "workspace_path": {"type": "string",
+                               "description": "Path to an HTML file in the workspace."},
+            "heavy": {"type": "boolean",
+                      "description": "Allow longer to boot (3D/WebGL). Default true."},
         }},
         execute=_verify_artifact, trust_required="anonymous", requires_services=("render",),
     ))
@@ -470,6 +582,7 @@ def register_visual_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="list_visuals",
+        parallel_safe=True,
         description=(
             "List every visual already generated in this project, with its visual_id, "
             "title and type. Call this before revising or deleting so you edit the right "
@@ -483,13 +596,33 @@ def register_visual_tools(reg: ToolRegistry) -> None:
         name="update_visual",
         description=(
             "Revise an existing visual IN PLACE by visual_id, keeping its URL so any "
-            "view the user already has open updates. The spec you pass is merged over "
-            "the stored one, so send only the keys that change (passing null removes a "
-            "key). Use this for every follow-up edit rather than creating a new visual."
+            "view the user already has open updates. Send ONLY what changes: the spec "
+            "you pass is merged over the stored one (null removes a key), and `code` "
+            "or `html` replaces just that part. Works for every kind of visual, "
+            "including 3D scenes and HTML pages.\n\n"
+            "USE THIS TO FIX SOMETHING THAT CAME BACK BROKEN. Editing the one thing "
+            "that is wrong converges; re-emitting the whole artifact from scratch "
+            "usually replaces one fault with a different one, and does it more slowly. "
+            "Also use it for every follow-up edit the user asks for, rather than "
+            "creating a second near-identical visual."
         ),
         input_schema={"type": "object", "properties": {
             "visual_id": {"type": "string"},
             "spec": {"type": "object", "description": "Partial spec merged over the stored one."},
+            "code": {
+                "type": "string",
+                "description": (
+                    "For a 3D scene or a custom visual: the CORRECTED scene/visual code, "
+                    "complete. Change what is wrong and leave everything else exactly as "
+                    "it was."
+                ),
+            },
+            "html": {
+                "type": "string",
+                "description": (
+                    "For an HTML page or a custom visual: the corrected document, complete."
+                ),
+            },
             "title": {"type": "string"}, "theme": _THEME,
         }, "required": ["visual_id"]},
         execute=_update_visual, trust_required="verified", requires_services=("render",),

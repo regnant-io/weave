@@ -162,11 +162,250 @@ def _glob(ctx: ToolContext, inp: dict) -> dict:
     return svc.glob_files(_project_id(ctx), str(inp.get("pattern") or "**/*"))
 
 
+def _serve(ctx: ToolContext, inp: dict) -> dict:
+    """Start a dev server and hand back a URL that actually works."""
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    command = str(inp.get("command") or "").strip()
+    if not command:
+        return {"status": "error", "error": "a command is required, e.g. 'npm run dev'"}
+    try:
+        port = int(inp.get("port") or 5173)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "port must be a number"}
+
+    ctx.progress("step_sub", {"text": f"Starting {command[:90]} on :{port}"})
+    out = svc.serve(_project_id(ctx), command, port,
+                    wait_seconds=int(inp.get("wait") or 45))
+    if out.get("status") != "ok":
+        return out
+
+    # Tell the client so it can open the preview panel. The URL is on the host
+    # loopback, which is where the USER's browser can reach it.
+    ctx.progress("preview", {
+        "url": out.get("url", ""),
+        "port": port,
+        "command": command,
+    })
+    out["note"] = (
+        "The server is up and the user can see it in the preview panel. Now CHECK "
+        "IT: call `preview_check` to open the running app in a real browser and "
+        "get back its console errors and a screenshot. A server that starts is not "
+        "an app that works."
+    )
+    return out
+
+
+def _stop_server(ctx: ToolContext, _inp: dict) -> dict:
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    out = svc.stop_server(_project_id(ctx))
+    ctx.progress("preview", {"url": "", "stopped": True})
+    return out
+
+
+def _server_log(ctx: ToolContext, inp: dict) -> dict:
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    return svc.server_log(_project_id(ctx), lines=int(inp.get("lines") or 200))
+
+
+def _preview_check(ctx: ToolContext, inp: dict) -> dict:
+    """Open the running dev server in a real browser and report what happened.
+
+    This is the workspace counterpart of the artifact gate. Building a web app
+    and never loading it is the same failure as rendering a scene and never
+    opening it — the code looks right, the server said "ready in 340ms", and the
+    page is blank because a module failed to resolve.
+
+    Browserless reaches the server by CONTAINER NAME on the Docker network. The
+    host-loopback URL the user opens is meaningless from inside another
+    container, and using it here is the obvious mistake that makes this tool
+    report "connection refused" for a perfectly healthy app.
+    """
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    status = svc.server_status(_project_id(ctx))
+    if not status.get("running"):
+        return {
+            "status": "error",
+            "error": (
+                "no dev server is running. This tool checks a web app you started "
+                "with `workspace_serve` — it is not for artifacts. An artifact you "
+                "rendered has ALREADY been opened in a browser and verified; if you "
+                "want to check one yourself, use `verify_artifact`."
+            ),
+        }
+
+    path = str(inp.get("path") or "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    target = status["internal_url"].rstrip("/") + path
+
+    from ..render.probe import get_probe
+    ctx.progress("step_sub", {"text": f"Opening {path} in a browser"})
+    run = get_probe().run_url(target, heavy=True)
+
+    if not run.available:
+        return {"status": "ok", "checked": target, "executed": False,
+                "note": run.note or "the browser pool is not available"}
+
+    errors, warnings = list(run.errors), list(run.warnings)
+
+    log = svc.server_log(_project_id(ctx), lines=40).get("log", "")
+    return {
+        "status": "ok",
+        "checked": target,
+        "executed": True,
+        "ok": not errors,
+        "errors": errors[:10],
+        "warnings": warnings[:6],
+        "server_log": log[-2000:],
+        "note": ("The page loads and renders without errors."
+                 if not errors else
+                 "The running app is BROKEN. Fix these and check again before "
+                 "telling the user it works."),
+    }
+
+
+def _git(ctx: ToolContext, inp: dict) -> dict:
+    """Version control inside the workspace.
+
+    A long agentic run makes dozens of edits, and until now there was no way to
+    see what changed or to undo a pass that made things worse — the only records
+    were the files as they ended up. Committing at each checkpoint turns the run
+    into something reviewable, and `revert` makes a bad pass recoverable instead
+    of terminal.
+    """
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    action = str(inp.get("action") or "status").lower()
+    pid = _project_id(ctx)
+
+    # Identity and an initial commit are set up on first use rather than asked
+    # for: a model that has to remember to `git init` will forget, and the
+    # failure surfaces much later as "not a git repository".
+    setup = (
+        "git rev-parse --git-dir >/dev/null 2>&1 || { "
+        "  git init -q && "
+        "  git config user.email weave@local && "
+        "  git config user.name Weave && "
+        "  printf 'node_modules/\\n.cache/\\n.weave/\\ndist/\\n.next/\\n__pycache__/\\n' > .gitignore; "
+        "}"
+    )
+
+    if action == "commit":
+        message = str(inp.get("message") or "checkpoint").replace("'", "")[:200]
+        cmd = (f"{setup} && git add -A && "
+               f"(git diff --cached --quiet && echo 'nothing to commit' || "
+               f"git commit -q -m '{message}' && git log --oneline -1)")
+    elif action == "log":
+        cmd = f"{setup} && git log --oneline -n {int(inp.get('limit') or 15)} || true"
+    elif action == "diff":
+        ref = str(inp.get("ref") or "HEAD").replace("'", "")[:80]
+        cmd = f"{setup} && git --no-pager diff --stat {ref} && git --no-pager diff {ref} | head -c 12000"
+    elif action == "revert":
+        ref = str(inp.get("ref") or "HEAD").replace("'", "")[:80]
+        cmd = f"{setup} && git reset --hard {ref} && git log --oneline -1"
+    else:
+        cmd = f"{setup} && git status --short && echo '---' && git log --oneline -n 5 || true"
+
+    res = svc.exec(pid, cmd, timeout=90, cancel=ctx.cancel)
+    return {
+        "status": "ok" if res.status == "ok" else "error",
+        "action": action,
+        "output": (res.stdout or "")[:12000],
+        "error": (res.stderr or "")[:1000] if res.status != "ok" else "",
+    }
+
+
 def register_workspace_tools(reg: ToolRegistry) -> None:
     common = {"trust_required": "verified", "requires_services": ("workspace",)}
 
     reg.register(Tool(
+        name="workspace_serve",
+        description=(
+            "Start a dev server (`npm run dev`, `vite`, `python3 -m http.server`) "
+            "and get back a URL the user can actually open — the app appears in a "
+            "live preview panel beside the chat. The command runs in the "
+            "background and keeps running between turns, so this is how you show "
+            "someone a working web app rather than a tarball. Ports 5173, 3000, "
+            "8000 and 8080 are published; bind to 0.0.0.0, not localhost, or "
+            "nothing outside the container can reach it. Returns once the port is "
+            "genuinely accepting connections, so a URL you get back is a URL that "
+            "works. ALWAYS follow it with `preview_check`."
+        ),
+        input_schema={"type": "object", "properties": {
+            "command": {"type": "string",
+                        "description": "e.g. 'npm run dev -- --host 0.0.0.0 --port 5173'"},
+            "port": {"type": "integer", "description": "5173, 3000, 8000 or 8080."},
+            "wait": {"type": "integer", "description": "Seconds to wait for it (default 45)."},
+        }, "required": ["command", "port"]},
+        execute=_serve, **common,
+    ))
+
+    reg.register(Tool(
+        name="preview_check",
+        description=(
+            "Open the RUNNING dev server in a real headless browser and report what "
+            "actually happened: uncaught exceptions, console errors, whether "
+            "anything rendered, plus the server's own log. This is how you find out "
+            "your app works instead of assuming it. A build that compiles and a "
+            "page that renders are different claims, and only this one tests the "
+            "second. Run it after every significant change."
+        ),
+        input_schema={"type": "object", "properties": {
+            "path": {"type": "string", "description": "Route to open, default '/'."},
+            "note": {"type": "string"},
+        }},
+        execute=_preview_check, **common,
+    ))
+
+    reg.register(Tool(
+        name="workspace_stop_server",
+        description="Stop the running dev server. Use when switching to a different "
+                    "command or when the app is finished.",
+        input_schema={"type": "object", "properties": {}},
+        execute=_stop_server, **common,
+    ))
+
+    reg.register(Tool(
+        name="workspace_server_log",
+        description="Read the dev server's output. The first place to look when a "
+                    "page is blank or a request 500s.",
+        input_schema={"type": "object", "properties": {
+            "lines": {"type": "integer", "description": "How many lines (default 200)."},
+        }},
+        execute=_server_log, **common,
+    ))
+
+    reg.register(Tool(
+        name="workspace_git",
+        description=(
+            "Version control for the workspace. `commit` a checkpoint after each "
+            "working milestone so the user can see the history and you can undo a "
+            "change that made things worse; `status`, `log` and `diff` to see what "
+            "changed; `revert` to roll back to a commit. The repository and a "
+            "sensible .gitignore are created on first use. Commit BEFORE a risky "
+            "change, not only after a successful one."
+        ),
+        input_schema={"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["status", "commit", "log", "diff", "revert"]},
+            "message": {"type": "string", "description": "Commit message."},
+            "ref": {"type": "string", "description": "Commit ref for diff/revert."},
+            "limit": {"type": "integer"},
+        }, "required": ["action"]},
+        execute=_git, **common,
+    ))
+
+    reg.register(Tool(
         name="workspace_grep",
+        parallel_safe=True,
         description=(
             "Search the project workspace for a regular expression and get back the "
             "matching lines with their file and line number. This is how you find "
@@ -189,6 +428,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_glob",
+        parallel_safe=True,
         description=(
             "List workspace files matching a glob pattern ('**/*.py', 'src/*.ts'), "
             "with their sizes. Returns paths only. Use it to orient yourself in a "
@@ -239,6 +479,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_read",
+        parallel_safe=True,
         description=(
             "Read a workspace file, optionally a line range. Read before editing so "
             "your `find` string matches the file exactly."
@@ -253,6 +494,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_list",
+        parallel_safe=True,
         description=(
             "List the workspace file tree. Call this first when returning to an "
             "existing project so you build on what is already there instead of "

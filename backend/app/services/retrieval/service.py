@@ -37,6 +37,9 @@ GLOSSARY: dict[str, str] = {
 }
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+#: Everything that is not a word character, stripped before a token is
+#: spliced into a Postgres tsquery expression. See `_sparse_search_pg`.
+_TS_SAFE = re.compile(r"[^\w]", re.UNICODE)
 
 
 def _chunk_text(text: str, target_words: int = 120) -> list[str]:
@@ -192,13 +195,40 @@ class RetrievalService:
         # bm25() returns lower = better; convert to a descending score list
         return [(r[0], -float(r[1])) for r in rows]
 
-    def _sparse_search_pg(self, db: Session, query: str, limit: int):  # pragma: no cover
-        tokens = self._expand_query_tokens(query)
+    def _sparse_search_pg(self, db: Session, query: str, limit: int):
+        """BM25-equivalent half on Postgres, via full-text search.
+
+        Two things here that the SQLite path gets for free and this one did not.
+
+        AN EMPTY QUERY IS NOT A tsquery. `_expand_query_tokens` legitimately
+        returns nothing -- a message that is only punctuation, only stopword-
+        length words, or only characters the word pattern does not match. Joining an empty
+        list gives an empty string, and `to_tsquery('simple', '')` is a syntax
+        error, so on Postgres a search for "?" was a 500 rather than no results.
+        The SQLite branch guards this; this one has to as well.
+
+        AND THE TOKENS GO INTO tsquery SYNTAX, NOT INTO A VALUE. `to_tsquery`
+        parses its argument as an expression language with its own operators
+        (`&`, `|`, `!`, `<->`, parentheses), so a token containing one of them
+        is a parse error at best. Parameter binding does not help, because the
+        string is still parsed after it is bound. Restricting tokens to word
+        characters -- which is what they should already be -- makes the
+        expression well-formed by construction.
+        """
+        tokens = [_TS_SAFE.sub("", t) for t in self._expand_query_tokens(query)]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return []
         tsquery = " | ".join(tokens)
         rows = db.execute(
             sql_text(
-                "SELECT id, ts_rank(to_tsvector('simple', content), to_tsquery('simple', :q)) AS rank "
-                "FROM source_chunks WHERE to_tsvector('simple', content) @@ to_tsquery('simple', :q) "
+                # `content_ts` is the stored, GIN-indexed vector created in
+                # init_db. Computing to_tsvector(content) per row at query time
+                # (what this used to do) cannot use an index, so every search was
+                # a sequential scan over the whole corpus -- fine on the seeded
+                # eight documents, quadratically less fine as the library grows.
+                "SELECT id, ts_rank(content_ts, to_tsquery('simple', :q)) AS rank "
+                "FROM source_chunks WHERE content_ts @@ to_tsquery('simple', :q) "
                 "ORDER BY rank DESC LIMIT :n"
             ),
             {"q": tsquery, "n": limit},

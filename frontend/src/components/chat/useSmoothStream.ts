@@ -39,6 +39,8 @@ const DRAIN_TARGET_MS = 130;
 const FINISH_TARGET_MS = 220;
 /** Backlog past this means the model is far ahead; shorten the target. */
 const FLOOD_CHARS = 700;
+/** The most the flood response may compress the drain target. */
+const MAX_FLOOD_COMPRESSION = 3;
 /** Chars/ms. ~0.02 is a readable trickle; without a floor a slow model freezes. */
 const MIN_RATE = 0.02;
 /** Chars/ms ceiling, so a huge paste still reads as fast typing, not a jump. */
@@ -47,6 +49,8 @@ const MAX_RATE = 3.5;
 const RATE_SMOOTHING = 0.18;
 /** Never spend longer than this hunting for a word boundary. */
 const BOUNDARY_LOOKAHEAD = 16;
+/** Stop the idle loop after this long with nothing to drain. */
+const IDLE_TIMEOUT_MS = 1500;
 
 export function useSmoothStream(onChars: (chunk: string) => void) {
   const buffer = useRef("");
@@ -56,6 +60,7 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
   const rate = useRef(0); // chars per millisecond
   const lastTs = useRef(0);
   const carry = useRef(0); // sub-character remainder, so slow rates still advance
+  const idleSince = useRef(0); // when the buffer last ran dry, for the idle timeout
   const onCharsRef = useRef(onChars);
   onCharsRef.current = onChars;
 
@@ -66,6 +71,7 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
     raf.current = null;
     rate.current = 0;
     carry.current = 0;
+    idleSince.current = 0;
   }, []);
 
   const tick = useCallback((ts: number) => {
@@ -76,23 +82,50 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
         stop();
         return;
       }
-      // Idle but still connected: keep the loop alive and the clock current, or
-      // the first frame after a gap would release a huge burst.
+      /*
+        Idle but still connected.
+
+        The loop is kept alive briefly so the first frame after a short gap
+        between tool calls does not release a burst - but only briefly. The
+        previous version span a requestAnimationFrame forever for the whole
+        turn, waking the main thread sixty times a second through every pause,
+        every tool call and every minute of a long agentic run, to discover
+        that there was nothing to do. `push` restarts it, so stopping costs
+        nothing but the clock reset, which `start` performs anyway.
+      */
+      if (!idleSince.current) idleSince.current = ts;
+      else if (ts - idleSince.current > IDLE_TIMEOUT_MS) {
+        stop();
+        return;
+      }
       lastTs.current = ts;
       rate.current = 0;
       raf.current = requestAnimationFrame(tick);
       return;
     }
+    idleSince.current = 0;
 
     const elapsed = lastTs.current ? Math.min(64, ts - lastTs.current) : 16;
     lastTs.current = ts;
 
-    // Target rate empties the reservoir within the window we're aiming for.
-    const target = finishing.current
-      ? FINISH_TARGET_MS
-      : pending > FLOOD_CHARS
-        ? DRAIN_TARGET_MS / 3
-        : DRAIN_TARGET_MS;
+    /*
+      Target rate empties the reservoir within the window we are aiming for.
+
+      The flood response used to be a STEP: below 700 buffered characters the
+      target was 130ms, at 701 it became 43ms. Crossing that line mid-sentence -
+      which happens constantly, because a model emits in bursts - tripled the
+      release rate between one frame and the next, and a threefold speed change
+      inside a word is exactly the lurch the smoother exists to remove. Scaling
+      continuously past the same threshold reaches the same maximum urgency
+      without a discontinuity anywhere.
+    */
+    let target = DRAIN_TARGET_MS;
+    if (finishing.current) {
+      target = FINISH_TARGET_MS;
+    } else if (pending > FLOOD_CHARS) {
+      const compression = Math.min(MAX_FLOOD_COMPRESSION, pending / FLOOD_CHARS);
+      target = DRAIN_TARGET_MS / compression;
+    }
     const observed = Math.min(MAX_RATE, Math.max(MIN_RATE, pending / target));
 
     // Ease toward the observed rate rather than snapping to it.
@@ -111,10 +144,23 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
 
     // Snap forward to the next whitespace so a word is never half-revealed.
     if (n < pending) {
+      const budget = n;
       const window = buffer.current.slice(n, Math.min(pending, n + BOUNDARY_LOOKAHEAD));
       const ws = window.search(/\s/);
       if (ws >= 0) n += ws + 1;
       else if (pending - n <= BOUNDARY_LOOKAHEAD) n = pending; // short tail: take it all
+      /*
+        Charge the overshoot back.
+
+        Snapping forward hands out characters this frame's budget had not
+        earned. Taking them for free meant every long word was a small
+        acceleration, so the perceived speed rose and fell with the vocabulary -
+        technical prose visibly ran faster than plain prose. Recording the
+        excess as negative carry makes the next frames release proportionally
+        less, so the AVERAGE rate is exactly what was asked for and the cadence
+        is even regardless of word length.
+      */
+      carry.current -= n - budget;
     }
 
     const chunk = buffer.current.slice(0, n);
@@ -130,6 +176,7 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
     finishing.current = false;
     lastTs.current = 0;
     carry.current = 0;
+    idleSince.current = 0;
     raf.current = requestAnimationFrame(tick);
   }, [tick]);
 
@@ -149,6 +196,7 @@ export function useSmoothStream(onChars: (chunk: string) => void) {
     if (!running.current && buffer.current.length) {
       running.current = true;
       lastTs.current = 0;
+      idleSince.current = 0;
       raf.current = requestAnimationFrame(tick);
     }
   }, [tick]);

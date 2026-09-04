@@ -69,6 +69,35 @@ def _preflight() -> None:
     if is_prod and settings.debug:
         problems.append("WEAVE_DEBUG is on in a production environment.")
 
+    # SQLite in production is not a configuration, it is an accident.
+    #
+    # It has exactly one writer, so two people sending a message at the same
+    # moment serialise and a third waits behind both. That is invisible in
+    # testing with one user and is the whole experience with a class of them --
+    # and it presents as "the model is slow", which sends everyone looking in
+    # the wrong place. Loud rather than fatal: an instance already running this
+    # way should keep running while someone moves it.
+    if settings.is_sqlite:
+        msg = ("the database is SQLite, which serialises every write. Two users "
+               "sending a message at the same time will queue behind each other. "
+               "Set WEAVE_DATABASE_URL to a postgresql+psycopg:// URL.")
+        if is_prod:
+            log.error("CAPACITY: %s", msg)
+        else:
+            log.info("Using SQLite (development default). %s", msg)
+
+    # Rate limits that only bind inside one process are not rate limits once
+    # there is more than one worker, and nothing about the running system makes
+    # that visible -- the configured number stays in the settings and stops
+    # being true. See ratelimit.py.
+    if not settings.redis_url:
+        log.warning(
+            "SECURITY: no WEAVE_REDIS_URL, so rate limits are per-process. With N "
+            "uvicorn workers the effective limit is N times the configured one. "
+            "Point WEAVE_REDIS_URL at a Redis instance before running more than "
+            "one worker."
+        )
+
     if problems:
         raise RuntimeError(
             "Refusing to start with insecure production settings:\n  - "

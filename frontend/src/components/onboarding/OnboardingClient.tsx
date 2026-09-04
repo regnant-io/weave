@@ -119,12 +119,21 @@ export default function OnboardingClient({
     ],
   };
 
+  /**
+   * Write preferences as SSR-readable cookies.
+   *
+   * Throws on failure rather than swallowing it. `onboarded` is a routing gate,
+   * so a save that quietly failed used to leave the user pressing a button that
+   * could never work — the one failure mode where silence is worse than an
+   * error message.
+   */
   async function savePrefs(patch: Record<string, unknown>) {
-    await fetch("/api/prefs", {
+    const res = await fetch("/api/prefs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
-    }).catch(() => {});
+    });
+    if (!res.ok) throw new Error(`could not save your preferences (${res.status})`);
   }
 
   function next() {
@@ -162,8 +171,6 @@ export default function OnboardingClient({
       setBusy(false);
     }
   }
-
-  const canAdvance = id !== "field" || true;
 
   return (
     <div className="tx-noise min-h-app relative">
@@ -345,12 +352,33 @@ export default function OnboardingClient({
               {sw ? "Rudi" : "Back"}
             </button>
           )}
+          {/*
+            AWAIT the save before navigating.
+
+            This used to fire `savePrefs` and `router.push` in the same tick.
+            `savePrefs` is what writes the `weave_onboarded` cookie, and the
+            route being pushed to is gated on that cookie — so the navigation
+            raced the fetch, lost, and the gate sent the user straight back to
+            onboarding. Clicking Skip did nothing at all, forever, with no error
+            anywhere: the request succeeded, it just landed after the decision
+            that depended on it.
+          */}
           <button
-            onClick={() => {
-              savePrefs({ onboarded: true });
-              router.push("/app/projects");
+            onClick={async () => {
+              if (busy) return;
+              setBusy(true);
+              setError("");
+              try {
+                await savePrefs({ language, mode, services, onboarded: true });
+                router.push("/app/projects");
+                router.refresh();
+              } catch (e) {
+                setError((e as Error).message);
+                setBusy(false);
+              }
             }}
-            className="ml-auto text-[11px] uppercase tracking-widest text-fg-faint transition-colors duration-fast hover:text-fg"
+            disabled={busy}
+            className="ml-auto text-[11px] uppercase tracking-widest text-fg-faint transition-colors duration-fast hover:text-fg disabled:opacity-50"
           >
             {sw ? "Ruka" : "Skip"}
           </button>
@@ -366,7 +394,6 @@ export default function OnboardingClient({
           ) : (
             <button
               onClick={next}
-              disabled={!canAdvance}
               className="inline-flex items-center gap-2 bg-fg px-5 py-2.5 text-[11px] uppercase tracking-widest text-bg transition-all duration-fast ease-soft hover:opacity-85 active:scale-[.98]"
             >
               {sw ? "Endelea" : "Continue"}

@@ -10,12 +10,16 @@ Exposes `stream_turn` — a generator of Server-Sent-Event payloads (architectur
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
+import uuid
+import threading as _threading
 from collections.abc import Iterator
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...db import release as release_db
 from ...models import Dataset, Message, Project
 from ..analysis import get_analysis_service
 from ..memory import get_memory_service
@@ -26,7 +30,7 @@ from ..warehouse import get_warehouse
 from ..websearch import get_web_search
 from ..workspace import get_workspace_service
 from . import guardrails, prompts
-from .llm import OfflineEngine, TurnResult, get_engine
+from .llm import OfflineEngine, get_engine
 from .router import classify
 
 log = logging.getLogger("weave.orchestrator")
@@ -81,76 +85,157 @@ class Orchestrator:
         thread_id: str | None = None, channel: str = "chat",
         frames: list[str] | None = None,
     ) -> Iterator[dict]:
-        """Yield SSE events LIVE. The turn runs in a worker thread; _process emits
-        every event onto a queue which this generator drains in real time. If the
-        client disconnects (Stop), a GeneratorExit fires here and we set a cancel
-        Event that _process / the Ollama stream loop check to abort promptly."""
-        import queue
+        """Start a turn and stream it. The turn OUTLIVES this connection.
+
+        The work runs in a worker thread that writes into a `LiveTurn` (see
+        live.py); this generator is one reader of that buffer, and losing it is
+        not the same as losing the turn. A dropped connection detaches, the work
+        continues, and `resume_turn` picks it back up from the last event the
+        client actually received.
+
+        That distinction did not exist before: the generator owned the queue, so
+        `GeneratorExit` -- fired by a refresh, a tunnel restart, or a phone
+        moving from wifi to mobile data -- cancelled the run. Losing twenty
+        minutes of a build to a network handover is bad on its own and worse
+        than it looks, because everything the turn had already done was gone
+        with no record of it and no way to ask for it back.
+
+        A turn nobody comes back to is still cancelled, by the reaper in
+        live.py, after a grace period. Stopping is something the user does, not
+        something the network does to them.
+        """
         import threading
 
-        q: "queue.Queue" = queue.Queue()
-        holder: dict = {}
-        cancel = threading.Event()
+        from .live import get_turns
 
-        def emit(event: str, data: dict) -> None:
-            # The turn id is learned by watching the stream rather than being
-            # returned by _process, because it has to be known on the FAILURE
-            # paths too — a turn that raised halfway still holds a steering
-            # registration, and only the finally below can release it.
-            if event == "meta" and data.get("message_id"):
-                holder["turn_id"] = data["message_id"]
-            q.put({"event": event, "data": data})
+        # The turn id is decided HERE rather than learned from the stream.
+        # Resume needs an address before the first event exists, and a turn that
+        # fails during setup still has to be addressable to be cleaned up.
+        turn_id = uuid.uuid4().hex
+        project_id = str(project.id)
+        user_id = str(getattr(getattr(project, "user", None), "id", "") or "")
+
+        live = get_turns().create(turn_id, project_id, user_id)
+        holder: dict = {}
 
         def worker() -> None:
+            """Run the turn on its OWN database session.
+
+            The request's session used to be handed straight to this thread
+            while the generator kept it as well. A SQLAlchemy Session is
+            explicitly not thread-safe: it owns identity-map state and, in
+            "commit as you go" mode, a transaction. Two threads sharing one is a
+            data race that mostly does not fire, which is the worst kind --
+            under load it surfaces as an object appearing with another request's
+            values, or a transaction committed from underneath the thread that
+            opened it.
+
+            The thread that does the work owns the session, opens it, and closes
+            it. `_process` re-reads the project through it, so nothing crosses
+            the boundary except ids.
+            """
+            from ...db import SessionLocal
+
+            worker_db = SessionLocal()
+            error = ""
             try:
-                msg, meta = self._process(db, project, user_text, language, dataset_id,
-                                          emit=emit, effort=effort, model=model,
-                                          cancel=cancel, regenerate=regenerate,
+                own_project = worker_db.query(Project).filter(
+                    Project.id == project_id
+                ).first()
+                if own_project is None:
+                    error = "project not found"
+                    return
+                msg, meta = self._process(worker_db, own_project, user_text, language,
+                                          dataset_id,
+                                          emit=live.emit, effort=effort, model=model,
+                                          cancel=live.cancel, regenerate=regenerate,
                                           services_pref=services_pref, thread_id=thread_id,
-                                          channel=channel, frames=frames)
+                                          channel=channel, frames=frames,
+                                          assistant_message_id=turn_id)
                 holder["msg"] = msg
                 holder["meta"] = meta
             except Exception as exc:  # noqa: BLE001
-                holder["error"] = str(exc)
+                error = str(exc)
+                log.exception("turn %s failed", turn_id)
             finally:
-                if holder.get("turn_id"):
-                    from ..steering import get_steering
-                    get_steering().finish(holder["turn_id"])
-                q.put(None)
+                from ..steering import get_steering
+                get_steering().finish(turn_id)
+                worker_db.close()
+                meta = holder.get("meta") or {}
+                msg = holder.get("msg")
+                # The closing event goes into the BUFFER, so a client that
+                # reconnects after the turn has already finished still receives
+                # the ending it missed instead of an empty stream.
+                if error:
+                    live.emit("error", {"message": error})
+                else:
+                    live.emit("done", {
+                        "message_id": msg.id if msg else turn_id,
+                        "thread_id": meta.get("thread_id"),
+                        # Set when this turn filled the window and a successor
+                        # thread was opened. The client switches to it rather
+                        # than silently writing the next turn into a thread the
+                        # model can no longer read in full.
+                        "next_thread_id": meta.get("next_thread_id"),
+                        "context_used": meta.get("context_used"),
+                        "context_window": meta.get("context_window"),
+                    })
+                live.finish(error=error, result=meta)
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        threading.Thread(target=worker, daemon=True,
+                         name="weave-turn-" + turn_id[:8]).start()
 
-        try:
-            yield {"event": "status", "data": {"phase": "thinking"}}
-            while True:
-                try:
-                    item = q.get(timeout=10)
-                except queue.Empty:
-                    yield {"event": "ping", "data": {}}
-                    continue
-                if item is None:
-                    break
-                yield item
-            t.join()
-            if "error" in holder:
-                yield {"event": "error", "data": {"message": holder["error"]}}
-                return
-            meta = holder.get("meta") or {}
-            yield {"event": "done", "data": {
-                "message_id": holder.get("msg").id if holder.get("msg") else None,
-                "thread_id": meta.get("thread_id"),
-                # Set when this turn filled the window and a successor thread was
-                # opened. The client switches to it rather than silently writing
-                # the next turn into a thread the model can no longer read.
-                "next_thread_id": meta.get("next_thread_id"),
-                "context_used": meta.get("context_used"),
-                "context_window": meta.get("context_window"),
+        yield from self._follow(live, from_seq=0, first_event={
+            "event": "turn",
+            # Sent before anything else so the client has the address it would
+            # need to resume, even if the connection dies on the next byte.
+            "data": {"turn_id": turn_id, "resumable": True},
+        })
+
+    def resume_turn(self, turn_id: str, user_id: str, from_seq: int = 0) -> Iterator[dict]:
+        """Reattach to a turn that is already running, or has just finished.
+
+        Raises LookupError when there is no such turn IN THIS PROCESS. That is a
+        real limitation of an in-process registry and a survivable one: a
+        finished turn is in the database, so the client's fallback is to reload
+        the thread and read the answer there. See live.py.
+        """
+        from .live import get_turns
+
+        live = get_turns().for_user(turn_id, user_id)
+        if live is None:
+            raise LookupError(turn_id)
+        if not live.has(from_seq):
+            # The client is asking for events that have been trimmed out of the
+            # buffer. Sending the events that ARE there would leave an unmarked
+            # hole in the middle of an answer, so say plainly that the
+            # transcript has to be reloaded instead.
+            yield {"event": "resume_gap", "data": {
+                "turn_id": turn_id,
+                "message": "too much was missed to continue this stream",
             }}
-        except GeneratorExit:
-            # client disconnected (Stop) — signal the worker to abort promptly
-            cancel.set()
-            raise
+            return
+        yield from self._follow(live, from_seq=from_seq, first_event={
+            "event": "turn",
+            "data": {"turn_id": turn_id, "resumed": True, "from": from_seq},
+        })
+
+    def _follow(self, live, *, from_seq: int, first_event: dict) -> Iterator[dict]:
+        """Drain one live turn into SSE events for one connection."""
+        yield first_event
+        yield {"event": "status", "data": {"phase": "thinking"}}
+        for item in live.follow(from_seq):
+            if item is None:
+                # Keepalive. A silent connection is closed by proxies and by
+                # mobile networks long before a long turn finishes, which would
+                # defeat the point of all of this.
+                yield {"event": "ping", "data": {}}
+                continue
+            # `seq` rides on every event so a client that reconnects can say
+            # exactly where it got to. Without it, resume could only ever replay
+            # from the beginning -- which for a half-written answer means
+            # printing the first half twice.
+            yield {"event": item.event, "data": {**item.data, "seq": item.seq}}
 
     # -- core ----------------------------------------------------------------
 
@@ -159,7 +244,7 @@ class Orchestrator:
         dataset_id: str | None, emit=None, effort: str | None = None, model: str | None = None,
         cancel=None, regenerate: bool = False, services_pref: dict | None = None,
         thread_id: str | None = None, channel: str = "chat",
-        frames: list[str] | None = None,
+        frames: list[str] | None = None, assistant_message_id: str | None = None,
     ) -> tuple[Message, dict]:
         engine = get_engine()
 
@@ -206,18 +291,38 @@ class Orchestrator:
         passages: list[dict] = []
         if route.needs_retrieval or route.intent in {"literature", "concept"}:
             passages = self.retrieval.search(db, user_text, language=language)
+            release_db(db)
 
         # 5. integrity guard (architecture 6.5)
         integrity = guardrails.triggers_integrity_guard(user_text, project.mode)
 
         # 6. assistant placeholder so tool executions can link to it
+        # The id can be assigned by the CALLER. A streamed turn is addressable
+        # for resume before it has emitted anything (see stream_turn), and the
+        # address has to be the same one the finished message carries -- so the
+        # id is chosen first and the row is built around it, rather than the
+        # other way round.
         assistant_msg = Message(
             project_id=project.id, thread_id=thread.id, role="assistant",
             content_sw="", content_en="", original_language=language,
             tool_calls=[], citations=[],
+            **({"id": assistant_message_id} if assistant_message_id else {}),
         )
         db.add(assistant_msg)
-        db.flush()
+        # COMMIT, not flush.
+        #
+        # A flush opens SQLite's single write transaction and holds it until the
+        # commit at the end of the turn — which, for a supervised run with tool
+        # calls, is minutes. Every other write in the process then queues behind
+        # it and dies on the 30s busy timeout: a second chat, a second tab, or
+        # even the background translation of the previous answer fails with
+        # "database is locked". Committing here closes the transaction, and the
+        # row is filled in and committed again at the end.
+        #
+        # The cost is that a turn which dies mid-flight leaves an empty
+        # assistant row. `history_for` and the thread endpoint skip those, and
+        # they carry no content, so nothing is lost.
+        db.commit()
 
         # -- capability bus: registry + per-turn context ----------------------
         trust = getattr(getattr(project, "user", None), "trust_tier", "verified") or "verified"
@@ -303,25 +408,45 @@ class Orchestrator:
         _web_tools = {"web_search", "deep_research"}
 
         _step_seq = {"n": 0}
+        # Tool calls from one model turn can now run concurrently (see
+        # Tool.parallel_safe), so the per-turn bookkeeping below is shared
+        # mutable state reached from several threads. The counters guard real
+        # limits -- sandbox runs, web calls, container starts -- and a lost
+        # increment is a limit that silently does not hold.
+        _turn_lock = _threading.Lock()
+
+        # The artifact gate. Nothing a tool renders reaches the transcript until
+        # it has been opened in a real browser — see services/orchestration/
+        # verification.py for why this cannot be left to the model's discretion.
+        from .design_critic import for_turn as _critic_for_turn
+        from .verification import MAX_REPAIRS, ArtifactGate
+        # At the deepest effort level, and only when a vision-capable model is
+        # available, an artifact that renders cleanly is still checked by
+        # LOOKING at it. Returns None otherwise, and the gate then does exactly
+        # what it did before.
+        gate = ArtifactGate(str(project.id), polish=_critic_for_turn(engine, effort))
 
         def tool_executor(name: str, tool_input: dict) -> dict:
             # Per-turn caps: a runaway agentic loop must not hammer the sandbox or
             # crawl the web unboundedly (defence-in-depth atop the iter limit).
-            if name == "run_analysis":
-                _counts["sandbox"] += 1
-                if _counts["sandbox"] > _s.max_sandbox_runs_per_turn:
-                    return {"status": "rejected", "error": "sandbox run limit reached for this turn"}
-            if name in _web_tools:
-                _counts["web"] += 1
-                if _counts["web"] > _s.max_web_calls_per_turn:
-                    return {"status": "rejected", "error": "web call limit reached for this turn"}
-            if name == "workspace_exec":
-                # Each exec starts a container; a looping agent would otherwise
-                # spawn hundreds in a single turn.
-                _counts["exec"] += 1
-                if _counts["exec"] > _s.max_workspace_execs_per_turn:
-                    return {"status": "rejected",
-                            "error": "workspace command limit reached for this turn"}
+            with _turn_lock:
+                if name == "run_analysis":
+                    _counts["sandbox"] += 1
+                    if _counts["sandbox"] > _s.max_sandbox_runs_per_turn:
+                        return {"status": "rejected",
+                                "error": "sandbox run limit reached for this turn"}
+                if name in _web_tools:
+                    _counts["web"] += 1
+                    if _counts["web"] > _s.max_web_calls_per_turn:
+                        return {"status": "rejected",
+                                "error": "web call limit reached for this turn"}
+                if name == "workspace_exec":
+                    # Each exec starts a container; a looping agent would
+                    # otherwise spawn hundreds in a single turn.
+                    _counts["exec"] += 1
+                    if _counts["exec"] > _s.max_workspace_execs_per_turn:
+                        return {"status": "rejected",
+                                "error": "workspace command limit reached for this turn"}
 
             tool_input = dict(tool_input or {})
             # `note` is the model-authored step title. It is a UI concern, never a
@@ -331,8 +456,9 @@ class Orchestrator:
             # step chip is never blank and never waits on the model.
             note = tool_input.pop("note", None)
 
-            _step_seq["n"] += 1
-            step_id = f"st{_step_seq['n']}"
+            with _turn_lock:
+                _step_seq["n"] += 1
+                step_id = f"st{_step_seq['n']}"
             _emit("step_start", {
                 "id": step_id,
                 "tool": name,
@@ -354,7 +480,90 @@ class Orchestrator:
                     "title": str(tool_input.get("title") or note or "").strip()[:120],
                 })
 
-            result = registry.execute(name, ctx, tool_input)
+            # --- gated execution ------------------------------------------
+            # An artifact-producing tool pushes its output into the transcript
+            # the instant the render service accepts it. That is exactly the
+            # emit-and-continue behaviour we are removing, so for gated tools
+            # the `artifact` events are BUFFERED here and released only once the
+            # page has been proven to open. Buffering at the emit boundary keeps
+            # every tool implementation untouched.
+            gated = gate.gates(name)
+            buffered: list[dict] = []
+            saved_emit = _emit
+
+            def _scoped(event: str, data: dict) -> None:
+                """Everything a tool emits belongs to THIS step.
+
+                Substeps used to arrive unlabelled and the client attached them
+                to whatever step it had most recently seen start. With one tool
+                running at a time that is the same thing; with several running
+                concurrently it is not, and the progress of one search would
+                appear underneath another. Stamping the id at the boundary means
+                no tool has to know its own step number, and the client can stop
+                guessing from ordering.
+                """
+                if event == "artifact" and gated:
+                    # Held back until the artifact has been proven to render --
+                    # see the comment above and services/orchestration/
+                    # verification.py.
+                    buffered.append(dict(data))
+                    return
+                payload = data if "id" in data else {**data, "id": step_id}
+                saved_emit(event, payload)
+
+            # A COPY, not a mutation.
+            #
+            # `ctx` is one object shared by every tool in the turn. Swapping its
+            # `emit` for the duration of a call was fine while calls were
+            # strictly sequential and is a race the moment two of them overlap:
+            # the second call's assignment wins, the first call's events are
+            # stamped with the wrong step, and on a gated tool its artifacts are
+            # buffered into the wrong list. Giving each call its own context
+            # object costs one shallow copy and removes the whole class of bug.
+            call_ctx = dataclasses.replace(ctx, emit=_scoped)
+            result = registry.execute(name, call_ctx, tool_input)
+            # Hand the connection back. A tool that read or wrote through the
+            # session leaves a transaction open, and an open transaction holds a
+            # connection (and, on SQLite, the write lock) for the rest of the
+            # turn -- through every subsequent model call, which need no database
+            # at all. See db.release.
+            release_db(ctx.db)
+
+            verdict = None
+            if gated:
+                _emit("verify_start", {"id": step_id, "tool": name})
+                verdict = gate.check(name, tool_input, result)
+                _emit("verify_end", {
+                    "id": step_id,
+                    "tool": name,
+                    "checked": verdict.checked,
+                    "ok": verdict.ok,
+                    "attempt": verdict.attempt,
+                    "max_attempts": MAX_REPAIRS,
+                    "exhausted": verdict.exhausted,
+                    "errors": verdict.errors[:4],
+                    "warnings": verdict.warnings[:3],
+                    "polish": verdict.polish_notes[:4],
+                    "summary": verdict.summary,
+                    "ms": verdict.duration_ms,
+                })
+                if verdict.released:
+                    from ...security import sign_path as _sign
+                    preview = ""
+                    if verdict.screenshot_key:
+                        preview = (f"/api/artifact/{verdict.screenshot_key}"
+                                   f"?sig={_sign(verdict.screenshot_key)}")
+                    for art in buffered:
+                        # A real screenshot of the real page: proof it rendered,
+                        # and a poster frame so a transcript full of 3D scenes
+                        # does not need a dozen live WebGL contexts at once.
+                        if preview:
+                            art["preview"] = preview
+                        art["verified"] = verdict.ok
+                        if not verdict.ok:
+                            art["defects"] = verdict.errors[:4]
+                        _emit("artifact", art)
+                result = ArtifactGate.apply(result, verdict, name)
 
             # Always resolve the placeholder — on failure too, or the skeleton
             # would shimmer forever.
@@ -380,6 +589,40 @@ class Orchestrator:
             tool_events.append({"name": name, "input": tool_input, "result": result})
             return result
 
+        # -- delegation ------------------------------------------------------
+        #
+        # Installed here rather than with the other services because it needs the
+        # turn's own toolset and executor, which are built above. A delegate runs
+        # against exactly the same tool plumbing as the turn that spawned it --
+        # same per-turn limits, same artifact gate, same step events -- so there
+        # is no second, weaker path into the capabilities.
+        def _run_delegate(*, task: str, context: str = "", expect: str = "") -> dict:
+            from .subagent import run_delegate
+
+            return run_delegate(
+                engine=engine,
+                tools=tool_schemas,
+                tool_executor=tool_executor,
+                emit=_emit,
+                task=task,
+                context=context,
+                expect=expect,
+                model=model,
+                cancel=cancel,
+                parallel_safe=registry.parallel_safe_names(),
+            )
+
+        # Only worth offering when there is something to look things up WITH.
+        # A delegate with no research tools is a model call that returns the
+        # model's own recollection dressed up as a finding, which is worse than
+        # not having the tool at all.
+        if {"websearch", "workspace", "skills"} & set(services.keys()):
+            services["delegate"] = _run_delegate
+            tool_schemas = registry.schemas(
+                mode=project.mode, trust=trust, services=services,
+                intent=route.intent, force=forced,
+            )
+
         # 6b. Retrieval-before-generation, extended to the web (Principle 3): only
         # for LITERATURE intent ("what does the research/web say"). Concept
         # explanations answer from the model's knowledge (+ grounding guard) rather
@@ -394,6 +637,10 @@ class Orchestrator:
         translate_fn = engine.translate
         engine_streamed = False
         history_trimmed = False
+        # The plan this turn worked to, when it had one. Persisted on the
+        # message so a reloaded conversation still shows what was attempted
+        # and what was ticked off, not just the prose that came out.
+        turn_plan: dict | None = None
         if getattr(engine, "available", False):
             system = self._system_prompt(project, language, passages, dataset_profile, integrity,
                                          effort, thread=thread, db=db,
@@ -403,6 +650,11 @@ class Orchestrator:
             messages, history_trimmed = self._history_as_messages(
                 db, thread, language, up_to=user_msg, context_window=context_window,
             )
+            # Everything the database is needed for before generation is done.
+            # The turn from here on is model calls and tools; holding a
+            # connection across all of that is what turns a hundred concurrent
+            # conversations into a hundred idle connections.
+            release_db(db)
             # Screen-share frames ride on the LAST user message, in the
             # engine-neutral `images` shape Ollama consumes natively and the
             # Anthropic engine converts (see `AnthropicEngine._with_images`).
@@ -432,30 +684,52 @@ class Orchestrator:
             )
             try:
                 _emit("answer_start", {})
-                while True:
-                    result: TurnResult = engine.generate(
-                        system=system, messages=messages, tools=tool_schemas,
-                        tool_executor=tool_executor, tier=route.tier,
-                        on_event=_emit, effort=effort, model=model,
-                        cancel=steer_cancel,
-                    )
-                    answer = result.text
-                    tool_events = result.tool_events
-                    tier_used = result.tier_used
-                    engine_streamed = getattr(engine, "name", "") == "ollama"
+                # --- the supervised loop ---------------------------------
+                # Not a single generate() call any more. See agent.py: the
+                # model no longer decides on its own that the work is done by
+                # going quiet, because "it stopped emitting tool calls" is not
+                # a definition of finished.
+                from .agent import Agent, LoopPolicy, looks_like_work
 
+                policy = LoopPolicy.for_effort(
+                    effort, complex_request=looks_like_work(user_text),
+                )
+                agent = Agent(
+                    engine=engine, system=system, messages=messages,
+                    tools=tool_schemas, tool_executor=tool_executor,
+                    emit=_emit, policy=policy, tier=route.tier, effort=effort,
+                    model=model, cancel=steer_cancel, user_text=user_text,
+                    capabilities=set(services.keys()),
+                    # Which of this turn's tools may run concurrently. Decided by
+                    # the registry (see Tool.parallel_safe), not here: whether a
+                    # tool touches the database or changes the world is a
+                    # property of the tool.
+                    parallel_safe=registry.parallel_safe_names(),
+                )
+
+                def _after_pass(_result) -> str | None:
+                    """Steering, checked at the pass boundary.
+
+                    A redirect must be applied between passes rather than inside
+                    one: mid-pass the model may be halfway through a tool call,
+                    and splicing an instruction there produces a conversation
+                    that does not typecheck as a dialogue. See services/
+                    steering.py for why restarting beats splicing.
+                    """
                     if _steer_turn is None:
-                        break
+                        return None
                     redirects = steering.drain(assistant_msg.id)
-                    if not redirects or steer_cancel.cancelled:
-                        break
+                    if not redirects:
+                        return None
+                    if steer_cancel.cancelled:
+                        return "stop"
                     if steering.restarts_left(assistant_msg.id) <= 0:
                         # Out of budget: still deliver the redirect so it is not
                         # silently swallowed, but stop restarting so the turn
                         # terminates. It becomes context for the next turn.
                         for r in redirects:
                             _emit("steer_deferred", {"text": r["text"]})
-                        break
+                        return None
 
                     steering.note_restart(assistant_msg.id)
                     for r in redirects:
@@ -463,7 +737,7 @@ class Orchestrator:
                         # conversation as one. Marking it as mid-stream is what
                         # tells the model this supersedes the direction it was
                         # taking rather than being a fresh, separate request.
-                        messages.append({
+                        agent.messages.append({
                             "role": "user",
                             "content": (
                                 "[REDIRECT — sent while you were still working, and it "
@@ -478,11 +752,52 @@ class Orchestrator:
                     # overridden. Tell the client to clear it, so what is on
                     # screen matches what the model actually reasoned about.
                     _emit("answer_restart", {"reason": "steered"})
+                    return "restart"
+
+                agent.on_pass_end = _after_pass
+                run = agent.run()
+                answer = run.text
+                tool_events = run.tool_events
+                tier_used = run.tier_used
+                turn_plan = run.plan.to_json() if run.plan else None
+                engine_streamed = bool(getattr(engine, "streams", False))
+                log.info(
+                    "turn %s: %s after %d pass(es), %d review round(s), %d tool call(s)",
+                    assistant_msg.id, run.stopped_because, run.passes,
+                    run.review_rounds, len(tool_events),
+                )
             except Exception as exc:  # noqa: BLE001
                 # Remote LLM (Ollama/Anthropic) failed after retries -> degrade to
                 # the offline engine so the turn still completes rather than 500s.
+                #
+                # SAY SO. A silent degrade is the worst of both worlds: the user
+                # gets the deterministic fallback's much thinner answer and has
+                # no way to know it is not what the model would have said, so
+                # they conclude the product is bad rather than that the provider
+                # was unavailable. Rate limiting is the common cause and is
+                # temporary, which makes telling them doubly worth it — the fix
+                # is to wait a minute and ask again.
                 log.warning("LLM engine '%s' failed (%s); falling back to offline",
                             getattr(engine, "name", "?"), exc)
+                from .llm import QuotaExhausted
+                if isinstance(exc, QuotaExhausted):
+                    # Relay the provider's own words. They name the account and
+                    # the upgrade path; anything we substitute is vaguer, and
+                    # this is the one message the user can actually act on.
+                    text = (
+                        f"The model provider refused this request: {exc}. "
+                        "This answer came from the offline fallback. Wait for the "
+                        "limit to reset, upgrade the plan, or choose a different "
+                        "model in the composer."
+                    )
+                elif "429" in str(exc) or "Too Many Requests" in str(exc):
+                    text = ("The model provider is rate-limiting this account, so this "
+                            "answer came from the offline fallback rather than the "
+                            "model. Try again shortly.")
+                else:
+                    text = ("The language model could not be reached, so this answer "
+                            "came from the offline fallback rather than the model.")
+                _emit("notice", {"kind": "degraded", "text": text})
                 answer, tier_used = self._offline_turn(
                     project, language, route, user_text, passages, integrity,
                     dataset, tool_events, tool_executor, web_enabled="websearch" in services,
@@ -515,7 +830,7 @@ class Orchestrator:
         assistant_msg.content_sw = answer
         assistant_msg.content_en = answer
         citations = self._collect_citations(passages, tool_events)
-        artifacts = self._collect_artifacts(tool_events)
+        artifacts = _artifacts_from_events(progress_events)
         images = self._collect_web_images(tool_events, passages)
         assistant_msg.citations = citations
         # Persist the STEP TIMELINE, not just a list of tool names. Reloading a
@@ -526,6 +841,7 @@ class Orchestrator:
         # from the events the client actually received, which keeps the replayed
         # transcript identical to the live one by construction.
         assistant_msg.tool_calls = _step_timeline(progress_events)
+        assistant_msg.plan = turn_plan or {}
         # persist artifacts + images on the message so history re-renders them
         assistant_msg.artifacts = artifacts
         assistant_msg.images = images
@@ -578,6 +894,7 @@ class Orchestrator:
             "grounding_note": grounding_note if not grounded else "",
             "tool_events": tool_events, "progress": progress_events,
             "artifacts": artifacts, "images": images,
+            "plan": turn_plan,
             "thread_id": thread.id, "next_thread_id": next_thread_id,
             "context_window": context_window,
             "context_used": thread.token_estimate,
@@ -612,18 +929,29 @@ class Orchestrator:
         standards produces worse output than the same model handed two, because
         it spends its attention on the instructions rather than the task.
 
-        Classification is by engine and by parameter count in the model tag,
-        which is what Ollama names actually encode ("llama3.2:3b",
-        "qwen2.5:14b"). Anything hosted (Claude) is large; an unrecognised local
-        tag is treated as small, because under-instructing a capable model costs
-        far less than drowning a small one.
+        The engine classifies when it can, because it knows what the server
+        actually reports — parameter count and whether the model advertises
+        reasoning. Only when it cannot do we fall back to reading the name, and
+        that fallback is why `minimax-m3:cloud` and `gemma4:cloud` were being
+        handed the cut-down prompt meant for a 3B model: neither tag contains a
+        parameter count to match on.
         """
         import re
 
         if type(engine).__name__ == "AnthropicEngine":
             return "large"
-        name = (model or getattr(engine, "model", "") or "").lower()
-        match = re.search(r"[:\-](\d+(?:\.\d+)?)\s*b\b", name)
+        name = model or getattr(engine, "model", "") or ""
+        classifier = getattr(engine, "model_class", None)
+        if callable(classifier):
+            try:
+                resolved = getattr(engine, "resolve_model", lambda n: n)(name) if name else name
+                return classifier(resolved or engine.model_for_tier("fast"))
+            except Exception:  # noqa: BLE001 - unreachable server: fall through
+                pass
+        low = name.lower()
+        if low.endswith(":cloud") or ":cloud-" in low:
+            return "large"
+        match = re.search(r"[:\-](\d+(?:\.\d+)?)\s*b\b", low)
         if match:
             try:
                 return "large" if float(match.group(1)) >= 27 else "small"
@@ -632,8 +960,12 @@ class Orchestrator:
         return "small"
 
     def _collect_artifacts(self, tool_events: list[dict]) -> list[dict]:
-        """Turn tool output_files (charts/decks/PDFs/3D) into renderable artifact
-        references with a frontend-proxied URL."""
+        """Kept for callers outside the turn loop (tests, batch channels).
+
+        The live path uses `_artifacts_from_events` instead — see its docstring
+        for why deriving from what the client was actually sent is the only way
+        history and the live transcript stay identical.
+        """
         from ...security import sign_path
         arts: list[dict] = []
         for e in tool_events:
@@ -874,7 +1206,10 @@ class Orchestrator:
             content_sw=content_sw, content_en=content_en, tool_calls=[], citations=[],
         )
         db.add(msg)
-        db.flush()
+        # Committed rather than flushed, for the same reason as the assistant
+        # placeholder above: holding SQLite's write lock across a whole turn
+        # locks out every other writer in the process.
+        db.commit()
         return msg
 
     def _update_summary(self, project: Project, user_text: str, answer: str) -> None:
@@ -945,6 +1280,31 @@ _PENDING_ARTIFACT_KIND = {
 }
 
 
+def _artifacts_from_events(events: list[dict]) -> list[dict]:
+    """The artifacts the client was actually shown, in the order it saw them.
+
+    Derived from the emitted events rather than re-walked from `tool_events`
+    for one reason that matters: an artifact that FAILED verification was never
+    emitted, and re-collecting from tool results would put it back — the exact
+    broken output the gate exists to withhold would reappear on reload.
+
+    It also preserves what the gate attached (`preview`, `verified`, `defects`),
+    which the tool result does not carry.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ev in events:
+        if ev.get("event") != "artifact":
+            continue
+        data = ev.get("data") or {}
+        url = str(data.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(dict(data))
+    return out
+
+
 def _step_timeline(events: list[dict]) -> list[dict]:
     """Rebuild the tool-step timeline from the events the client was sent.
 
@@ -1000,6 +1360,21 @@ def _step_timeline(events: list[dict]) -> list[dict]:
                     "detail": data.get("detail", ""),
                     "state": "running",
                 })
+
+        elif kind == "verify_end":
+            # Keep the verdict on the step so a reloaded transcript still shows
+            # that the artifact was opened and what the browser reported. A
+            # "verified" badge that vanishes on refresh teaches the user not to
+            # trust it.
+            target = by_id.get(str(data.get("id"))) or current
+            if target and data.get("checked"):
+                target["verification"] = {
+                    "ok": bool(data.get("ok")),
+                    "attempt": data.get("attempt"),
+                    "errors": data.get("errors") or [],
+                    "warnings": data.get("warnings") or [],
+                    "summary": data.get("summary", ""),
+                }
 
         elif kind == "step_end":
             target = by_id.get(str(data.get("id"))) or current
@@ -1117,8 +1492,19 @@ def _summarise(name: str, result: dict) -> str:
     if not isinstance(result, dict):
         return ""
     status = result.get("status")
+    if status == "needs_repair":
+        v = result.get("verification") or {}
+        n = len(v.get("errors") or [])
+        return (f"broken · {n} error{'s' if n != 1 else ''} · "
+                f"repairing ({v.get('attempt', 1)}/{v.get('attempt', 1) + max(0, v.get('attempts_remaining', 0))})")
     if status and status not in {"ok", "success"}:
         return str(status)
+    verification = result.get("verification")
+    if isinstance(verification, dict) and verification.get("ran"):
+        if verification.get("ok"):
+            files = len(result.get("output_files") or [])
+            return "verified · renders clean" + (f" · {files} files" if files > 1 else "")
+        return f"released with {len(verification.get('errors') or [])} known defects"
     if name == "web_search":
         n = len(result.get("results") or [])
         return f"{n} results" if n else ""

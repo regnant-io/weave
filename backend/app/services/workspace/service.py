@@ -21,11 +21,23 @@ Isolation model
 File operations run on the HOST, inside a per-project directory, guarded by
 `_resolve()` against traversal. They never need a container and are fast.
 
-Execution runs in a throwaway Docker container with the project directory bind
-mounted at /workspace: non-root, read-only root filesystem apart from the mount,
-all Linux capabilities dropped, `--security-opt no-new-privileges`, and hard
-memory / CPU / PID / wall-clock limits. The container is removed on exit; only
-/workspace survives.
+Execution runs in ONE LONG-LIVED Docker container per project, with the project
+directory bind-mounted at /workspace: non-root, all Linux capabilities dropped,
+`--security-opt no-new-privileges`, and hard memory / CPU / PID / wall-clock
+limits. Commands run through `docker exec`.
+
+It used to be a throwaway container per command, which is a tidier model and
+made three things impossible: a dev server (a process that never returns always
+hit the timeout, so a web app could be built and never once looked at), any warm
+state between commands, and a fast build-test-fix loop (a second of container
+creation per command, thirty times over). The security posture is unchanged —
+those properties belong to how the container is created, and it is still created
+that way. Only its lifetime changed. Idle containers are reaped by label.
+
+Dev servers get their ports published to the host loopback for the user's
+browser, and are reachable by container name on the Docker network so
+Browserless can open and screenshot the running app — which is what lets the
+assistant check its own web app instead of asking the user to look.
 
 If Docker is not available the service reports `enabled = False` and its tools
 are simply not advertised to the model, exactly like every other optional
@@ -72,6 +84,11 @@ class WorkspaceService:
         self.root = Path(settings.workspace_root)
         self.image = settings.workspace_image
         self._docker: bool | None = None
+        self._net: str | None = None
+        #: container name -> monotonic timestamp of its last command. Drives
+        #: idle reaping; empty after a restart, which reap_idle handles by
+        #: giving an unknown container one grace period.
+        self._last_used: dict[str, float] = {}
 
     # ------------------------------------------------------------ availability
 
@@ -110,7 +127,35 @@ class WorkspaceService:
     def project_dir(self, project_id: str) -> Path:
         d = self.root / str(project_id)
         d.mkdir(parents=True, exist_ok=True)
+        # Checked every time rather than only on creation: a directory made
+        # before ownership was handled stays root-owned forever otherwise, and
+        # the symptom (every command fails with EACCES, every file write
+        # succeeds) is the same confusing one this is meant to prevent. A stat
+        # is far cheaper than that bug.
+        self._own(d, only_if_foreign=True)
         return d
+
+    def _own(self, path: Path, only_if_foreign: bool = False) -> None:
+        """Hand a path to the uid the workspace container runs as.
+
+        The backend runs as root and creates these directories; the container
+        runs as uid 1000 and has to write into them. Without this every command
+        the model runs fails with EACCES while `workspace_write` keeps working
+        (it writes host-side, as root) — which presents as a model that cannot
+        install a package but can create files, and is very hard to read.
+
+        Silently best-effort: on a synthesised filesystem chown is a no-op and
+        raising here would take down file writing over a permissions model that
+        does not exist on that host.
+        """
+        try:
+            uid, _, gid = str(settings.workspace_user or "1000:1000").partition(":")
+            uid, gid = int(uid), int(gid or uid)
+            if only_if_foreign and path.stat().st_uid == uid:
+                return
+            os.chown(path, uid, gid)
+        except Exception:  # noqa: BLE001 - no chown on this filesystem, or not root
+            pass
 
     def _resolve(self, project_id: str, rel: str) -> Path:
         """Resolve a model-supplied path INSIDE the project workspace.
@@ -468,9 +513,299 @@ class WorkspaceService:
 
     # ---------------------------------------------------------------- execution
 
+    # ------------------------------------------------------- the live container
+    #
+    # Execution used to be one `docker run --rm` per command. That is a clean
+    # model and it made three things impossible:
+    #
+    #   * A DEV SERVER. `npm run dev` never returns, so it always hit the
+    #     timeout and was killed. The model could build a web app and could
+    #     never once look at it running — which is most of the distance between
+    #     this and a real development environment.
+    #   * WARM STATE. Every command started a fresh container, so nothing
+    #     survived but the bind mount. Fine for files, useless for a running
+    #     process, a background build, or an installed global.
+    #   * SPEED. Container creation is ~1s. On a build-test-fix loop of thirty
+    #     commands that is half a minute of pure overhead.
+    #
+    # So each project gets ONE long-lived container and commands run with
+    # `docker exec`. The security posture is unchanged — non-root, all
+    # capabilities dropped, no-new-privileges, hard memory/CPU/PID ceilings —
+    # because those are properties of how the container was created, and it is
+    # still created that way. What changes is only its lifetime.
+
+    #: Ports published from every workspace container, covering the defaults of
+    #: the dev servers that actually get used (Vite, Next/CRA, Python http.server
+    #: and friends). Published on 127.0.0.1 with an ephemeral host port, so
+    #: nothing is exposed off-box and two projects never collide.
+    DEV_PORTS = (5173, 3000, 8000, 8080)
+
+    def container_name(self, project_id: str) -> str:
+        return f"weave-ws-{_safe_id(project_id)}"
+
+    def host_path(self, project_id: str) -> str:
+        """The project directory AS THE DOCKER DAEMON SEES IT.
+
+        This is the bug that made the whole workspace a no-op, and it is worth
+        being precise about because it looked like it worked.
+
+        `docker run -v SRC:/workspace` is interpreted by the DAEMON, on the
+        host. The backend was passing its own in-container path
+        (`/app/var/workspaces/<id>`), which on the host names nothing — so
+        Docker helpfully created a brand-new empty directory there and mounted
+        that. Every command therefore ran against an empty /workspace, could not
+        see a single file the model had written, and could not write anything
+        back that the model would ever read. Files were written host-side and
+        read host-side, so `workspace_write` then `workspace_read` round-tripped
+        perfectly and the failure only appeared when a COMMAND was involved:
+        `npm install` in an empty directory, a test run that found no tests, a
+        build with no source. Which reads as the model being confused.
+
+        So: ask Docker where our own mount actually comes from, and translate.
+        Self-configuring, because a configured host path is a setting that is
+        wrong on every machine but the one it was written on.
+        """
+        local = self.project_dir(project_id).resolve()
+        base = self._host_root()
+        if not base:
+            return local.as_posix()
+        rel = local.relative_to(Path(settings.workspace_root).resolve())
+        # Host separator, not ours: the daemon may be on Windows while this
+        # process is in a Linux container.
+        sep = "\\" if ("\\" in base and ":" in base[:3]) else "/"
+        return base.rstrip("/\\") + sep + str(rel).replace("/", sep).replace("\\", sep)
+
+    def _root_mount(self) -> dict:
+        """How `workspace_root` is backed, as Docker sees it.
+
+        Returns {"type": "volume"|"bind"|"", "name": ..., "source": ..., "sub": ...}
+        where `sub` is the path from the mount point down to the workspace root.
+
+        Two shapes are supported, and which one you get decides whether the
+        container can write:
+
+          * VOLUME (what compose now provides). Real ext4 inside the VM, so
+            ownership is real and each project is mounted with
+            `volume-subpath`. The container stays non-root.
+          * BIND. Used when someone has bind-mounted a host directory. On Linux
+            this works if the directory is owned by the workspace uid; on Docker
+            Desktop the host filesystem synthesises ownership, chown is a no-op,
+            and the container cannot write — see `_mount_args`.
+        """
+        cached = getattr(self, "_rmount", None)
+        if cached is not None:
+            return cached
+        out = {"type": "", "name": "", "source": "", "sub": ""}
+        try:
+            import json as _json
+            import socket
+
+            r = subprocess.run(
+                ["docker", "inspect", socket.gethostname(), "--format", "{{json .Mounts}}"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if r.returncode == 0:
+                root = Path(settings.workspace_root).resolve()
+                best = -1
+                for m in _json.loads(r.stdout or "[]"):
+                    dest_raw = str(m.get("Destination") or "")
+                    if not dest_raw:
+                        continue
+                    dest = Path(dest_raw)
+                    if root != dest and dest not in root.parents:
+                        continue
+                    depth = len(dest.parts)
+                    if depth <= best:
+                        continue
+                    best = depth
+                    out = {
+                        "type": str(m.get("Type") or ""),
+                        "name": str(m.get("Name") or ""),
+                        "source": str(m.get("Source") or ""),
+                        "sub": "" if root == dest else root.relative_to(dest).as_posix(),
+                    }
+        except Exception as exc:  # noqa: BLE001 - not containerised: paths are host paths
+            log.debug("workspace: could not resolve root mount (%s)", exc)
+        self._rmount = out
+        log.info("workspace: root is backed by %s", out or "the local filesystem")
+        return out
+
+    def _host_root(self) -> str:
+        """Host path backing `workspace_root` (bind case only)."""
+        mount = self._root_mount()
+        if mount.get("type") != "bind" or not mount.get("source"):
+            return ""
+        src, sub = mount["source"], mount.get("sub") or ""
+        if not sub:
+            return src
+        sep = "\\" if ("\\" in src and ":" in src[:3]) else "/"
+        return src.rstrip("/\\") + sep + sub.replace("/", sep)
+
+    def _mount_args(self, project_id: str) -> list[str]:
+        """How to give the container this project's directory."""
+        mount = self._root_mount()
+        sub = (mount.get("sub") or "").strip("/")
+        pid = _safe_id(project_id)
+
+        if mount.get("type") == "volume" and mount.get("name"):
+            inner = f"{sub}/{pid}" if sub else pid
+            return ["--mount",
+                    f"type=volume,source={mount['name']},target=/workspace,"
+                    f"volume-subpath={inner}"]
+
+        # Bind, or not containerised at all.
+        return ["-v", f"{self.host_path(project_id)}:/workspace"]
+
+    def _network(self) -> str:
+        """The Docker network to attach workspace containers to.
+
+        Discovered from the backend's OWN container rather than configured,
+        because the two have to match for anything to work: Browserless has to
+        be able to reach a dev server by container name to screenshot it. A
+        hard-coded network name is a setting that is wrong on every deployment
+        whose compose project is not called "weave".
+        """
+        if getattr(self, "_net", None) is not None:
+            return self._net
+        net = settings.workspace_network_mode or "bridge"
+        try:
+            import socket
+
+            r = subprocess.run(
+                ["docker", "inspect", socket.gethostname(), "--format",
+                 "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            found = (r.stdout or "").strip().splitlines()
+            if r.returncode == 0 and found and found[0].strip():
+                net = found[0].strip()
+        except Exception as exc:  # noqa: BLE001 - not in a container, or no socket
+            log.debug("workspace: could not detect network (%s); using %s", exc, net)
+        self._net = net
+        return net
+
+    def _container_state(self, name: str) -> str:
+        """'running', 'exited', 'missing' — whatever Docker actually thinks."""
+        try:
+            r = subprocess.run(
+                ["docker", "inspect", name, "--format", "{{.State.Status}}"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if r.returncode != 0:
+                return "missing"
+            return (r.stdout or "").strip() or "missing"
+        except Exception:  # noqa: BLE001
+            return "missing"
+
+    def ensure_container(self, project_id: str) -> ExecResult:
+        """Start this project's container if it is not already up."""
+        name = self.container_name(project_id)
+        state = self._container_state(name)
+        if state == "running":
+            return ExecResult(status="ok")
+        if state != "missing":
+            # Exited or created: a restart preserves the published port mapping,
+            # which a remove-and-recreate would change under any preview URL the
+            # user already has open.
+            r = subprocess.run(["docker", "start", name], capture_output=True,
+                               text=True, timeout=60, check=False)
+            if r.returncode == 0:
+                return ExecResult(status="ok")
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True,
+                           text=True, timeout=60, check=False)
+
+        self.project_dir(project_id)          # make sure it exists before mounting
+        args = [
+            "docker", "run", "-d", "--name", name,
+            "--workdir", "/workspace",
+        ]
+        # Volume subpath, or a host-path bind — see `_mount_args`.
+        args += self._mount_args(project_id)
+        args += [
+            "--memory", f"{settings.workspace_memory_mb}m",
+            "--memory-swap", f"{settings.workspace_memory_mb}m",
+            "--cpus", str(settings.workspace_cpus),
+            "--pids-limit", str(settings.workspace_pids_limit),
+            "--user", settings.workspace_user,
+            "--security-opt", "no-new-privileges",
+            "--cap-drop", "ALL",
+            # Labelled so the reaper can find every workspace container without
+            # keeping its own registry, which would go stale across a restart.
+            "--label", "weave.workspace=1",
+            "--label", f"weave.project={_safe_id(project_id)}",
+        ]
+        if settings.workspace_network:
+            args += ["--network", self._network()]
+            for port in self.DEV_PORTS:
+                args += ["-p", f"127.0.0.1::{port}"]
+        else:
+            args += ["--network", "none"]
+        # `sleep infinity` as PID 1: the container exists to be exec'd into, and
+        # anything longer-lived would be a second thing to reason about.
+        args += ["--entrypoint", "sleep", self.image, "infinity"]
+
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, check=False)
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            log.warning("workspace: could not start container %s: %s", name, err[:300])
+            return ExecResult(status="error", stderr=err[:600] or "could not start the workspace")
+        return ExecResult(status="ok")
+
+    def ports(self, project_id: str) -> dict[int, int]:
+        """container port -> host port, for whatever is published."""
+        name = self.container_name(project_id)
+        out: dict[int, int] = {}
+        for port in self.DEV_PORTS:
+            try:
+                r = subprocess.run(["docker", "port", name, f"{port}/tcp"],
+                                   capture_output=True, text=True, timeout=10, check=False)
+                line = (r.stdout or "").strip().splitlines()
+                if r.returncode == 0 and line:
+                    out[port] = int(line[0].rsplit(":", 1)[1])
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def stop_container(self, project_id: str) -> dict:
+        name = self.container_name(project_id)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True,
+                       text=True, timeout=60, check=False)
+        return {"status": "ok", "stopped": name}
+
+    def reap_idle(self, older_than_seconds: int = 3600) -> int:
+        """Remove workspace containers nothing has touched for a while.
+
+        A container per project is cheap but not free, and a server left running
+        for a week is a server nobody is watching. Driven off Docker's own
+        labels rather than in-process state so it still works after a restart.
+        """
+        removed = 0
+        try:
+            r = subprocess.run(
+                ["docker", "ps", "-a", "--filter", "label=weave.workspace=1",
+                 "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            for name in (r.stdout or "").split():
+                last = self._last_used.get(name)
+                if last is not None and (time.monotonic() - last) < older_than_seconds:
+                    continue
+                if last is None and self._container_state(name) == "running":
+                    # Started by a previous process. Give it one grace period
+                    # rather than killing a build someone is watching.
+                    self._last_used[name] = time.monotonic()
+                    continue
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True,
+                               text=True, timeout=60, check=False)
+                self._last_used.pop(name, None)
+                removed += 1
+        except Exception as exc:  # noqa: BLE001
+            log.debug("workspace reap failed: %s", exc)
+        return removed
+
     def exec(self, project_id: str, command: str, timeout: int | None = None,
              cancel=None) -> ExecResult:
-        """Run a shell command inside the project's container."""
+        """Run a shell command in the project's long-lived container."""
         if not self.enabled:
             return ExecResult(status="unavailable",
                               stderr="workspace execution is not configured (Docker unavailable)")
@@ -479,54 +814,211 @@ class WorkspaceService:
 
         timeout = int(timeout or settings.workspace_exec_timeout)
         timeout = max(5, min(timeout, settings.workspace_exec_max_timeout))
-        workdir = self.project_dir(project_id)
 
-        args = [
-            "docker", "run", "--rm", "-i",
-            "--workdir", "/workspace",
-            "-v", f"{workdir.resolve().as_posix()}:/workspace",
-            # Hard resource ceilings. A runaway `npm install` in a loop must not
-            # take the host down.
-            "--memory", f"{settings.workspace_memory_mb}m",
-            "--memory-swap", f"{settings.workspace_memory_mb}m",
-            "--cpus", str(settings.workspace_cpus),
-            "--pids-limit", str(settings.workspace_pids_limit),
-            # Never root, never able to gain privileges, no ambient capabilities.
-            "--user", settings.workspace_user,
-            "--security-opt", "no-new-privileges",
-            "--cap-drop", "ALL",
-        ]
-        if settings.workspace_network:
-            # Explicitly requested: installing dependencies and fetching assets
-            # is the whole point of this sandbox.
-            args += ["--network", settings.workspace_network_mode]
-        else:
-            args += ["--network", "none"]
-        args += [self.image, "bash", "-lc", command]
+        up = self.ensure_container(project_id)
+        if up.status != "ok":
+            return up
+        name = self.container_name(project_id)
+        self._last_used[name] = time.monotonic()
+
+        args = ["docker", "exec", "-i", "--user", settings.workspace_user,
+                "--workdir", "/workspace", name, "bash", "-lc", command]
 
         started = time.monotonic()
         try:
-            proc = subprocess.run(
-                args, capture_output=True, text=True, timeout=timeout + 10,
-                check=False, encoding="utf-8", errors="replace",
+            # Popen rather than run(), so a client that disconnects mid-build
+            # actually stops the build. `cancel` was accepted and ignored
+            # before, which meant closing the tab left an npm install running to
+            # completion against a turn nobody was waiting for.
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
             )
-        except subprocess.TimeoutExpired:
-            return ExecResult(status="timeout", exit_code=124,
-                              stderr=f"command exceeded the {timeout}s limit",
-                              duration_ms=int((time.monotonic() - started) * 1000))
         except FileNotFoundError:
             self._docker = False
             return ExecResult(status="unavailable", stderr="docker is not installed on this host")
 
+        deadline = started + timeout
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                proc.communicate()
+                return ExecResult(status="error", exit_code=130,
+                                  stderr="cancelled — the user stopped this turn",
+                                  duration_ms=int((time.monotonic() - started) * 1000))
+            if time.monotonic() > deadline:
+                proc.kill()
+                out, err = proc.communicate()
+                return ExecResult(
+                    status="timeout", exit_code=124,
+                    stdout=_tail(out or "", settings.workspace_output_chars),
+                    stderr=(_tail(err or "", 2000)
+                            + f"\ncommand exceeded the {timeout}s limit"),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+
         return ExecResult(
             status="ok" if proc.returncode == 0 else "error",
-            exit_code=proc.returncode,
+            exit_code=proc.returncode or 0,
             # Truncate from the FRONT of long logs: an npm install prints
             # thousands of progress lines and the error is at the end.
-            stdout=_tail(proc.stdout, settings.workspace_output_chars),
-            stderr=_tail(proc.stderr, settings.workspace_output_chars),
+            stdout=_tail(stdout or "", settings.workspace_output_chars),
+            stderr=_tail(stderr or "", settings.workspace_output_chars),
             duration_ms=int((time.monotonic() - started) * 1000),
         )
+
+    # ------------------------------------------------------------- dev servers
+
+    #: Where a started server's bookkeeping lives inside the workspace. On disk
+    #: rather than in memory so a backend restart does not orphan a running
+    #: process that nothing then knows how to stop.
+    SERVER_STATE = ".weave/server.json"
+
+    def serve(self, project_id: str, command: str, port: int,
+              wait_seconds: int = 45) -> dict:
+        """Start a long-running dev server and wait until it actually answers.
+
+        Returns both URLs, and they are different on purpose:
+
+          * `url` is on 127.0.0.1 and is what the USER's browser opens — the
+            port is published to the host loopback.
+          * `internal_url` is `container-name:port` on the Docker network, which
+            is how Browserless reaches it to screenshot the running app. A
+            headless browser in another container cannot resolve the host's
+            loopback, and this is the difference between being able to check the
+            app works and having to ask the user to look.
+
+        Waiting for the port matters more than it sounds: a server reports
+        "started" long before it has compiled anything, and handing back a URL
+        that 502s for ten seconds teaches the user the preview is broken.
+        """
+        if not self.enabled:
+            return {"status": "unavailable",
+                    "message": "workspace execution is not configured"}
+        if port not in self.DEV_PORTS:
+            return {"status": "error",
+                    "error": f"port {port} is not published; use one of "
+                             f"{', '.join(str(p) for p in self.DEV_PORTS)}"}
+
+        up = self.ensure_container(project_id)
+        if up.status != "ok":
+            return {"status": "error", "error": up.stderr}
+
+        self.stop_server(project_id)
+
+        name = self.container_name(project_id)
+        # Detached, output to a log the model can read back. `setsid` divorces
+        # it from the exec session so it survives the command returning.
+        # `;` after the mkdir, not `&&`.
+        #
+        # `A && B & C` backgrounds the whole `A && B` list, so with `&&` the
+        # `echo $! > .weave/server.pid` ran immediately — racing the mkdir that
+        # was supposed to create the directory it writes into, and losing.
+        launch = (
+            "mkdir -p .weave; "
+            f"setsid nohup bash -lc {_sh_quote(command)} "
+            "> .weave/server.log 2>&1 < /dev/null & "
+            "echo $! > .weave/server.pid"
+        )
+        started = self.exec(project_id, launch, timeout=30)
+        if started.status not in {"ok"}:
+            return {"status": "error", "error": started.stderr or "could not start the server"}
+
+        # Poll from INSIDE the container: the process may bind before the host
+        # mapping is usable, and this is the check that matches what Browserless
+        # will experience.
+        probe = (
+            f"for i in $(seq 1 {max(1, wait_seconds)}); do "
+            f"  if (echo > /dev/tcp/127.0.0.1/{port}) 2>/dev/null; then echo UP; exit 0; fi; "
+            "  sleep 1; "
+            "done; echo DOWN; exit 1"
+        )
+        ready = self.exec(project_id, probe, timeout=wait_seconds + 15)
+        logs = self.exec(project_id, "tail -c 4000 .weave/server.log 2>/dev/null || true",
+                         timeout=20)
+
+        host_ports = self.ports(project_id)
+        host_port = host_ports.get(port)
+        state = {"command": command, "port": port, "host_port": host_port}
+        self.write_file(project_id, self.SERVER_STATE, json.dumps(state))
+
+        if "UP" not in (ready.stdout or ""):
+            return {
+                "status": "error",
+                "error": f"the server did not start listening on port {port} within "
+                         f"{wait_seconds}s",
+                "log": _tail(logs.stdout or "", 3000),
+                "hint": "Read the log above. A dev server that exits immediately is "
+                        "usually a missing dependency or a syntax error.",
+            }
+
+        return {
+            "status": "ok",
+            "port": port,
+            "url": f"http://127.0.0.1:{host_port}" if host_port else "",
+            "internal_url": f"http://{name}:{port}",
+            "log": _tail(logs.stdout or "", 2000),
+        }
+
+    def stop_server(self, project_id: str) -> dict:
+        """Stop whatever this project last started. Safe to call when nothing is."""
+        if not self.enabled:
+            return {"status": "unavailable"}
+        if self._container_state(self.container_name(project_id)) != "running":
+            return {"status": "ok", "stopped": False}
+        self.exec(
+            project_id,
+            "if [ -f .weave/server.pid ]; then "
+            "  kill -TERM -$(cat .weave/server.pid) 2>/dev/null || "
+            "  kill -TERM $(cat .weave/server.pid) 2>/dev/null || true; "
+            "  rm -f .weave/server.pid; fi",
+            timeout=20,
+        )
+        return {"status": "ok", "stopped": True}
+
+    def server_status(self, project_id: str) -> dict:
+        """What is running, if anything — for the preview panel."""
+        if not self.enabled:
+            return {"status": "unavailable", "running": False}
+        if self._container_state(self.container_name(project_id)) != "running":
+            return {"status": "ok", "running": False}
+        state = self.read_file(project_id, self.SERVER_STATE)
+        if state.get("status") != "ok":
+            return {"status": "ok", "running": False}
+        try:
+            saved = json.loads(state.get("content") or "{}")
+        except ValueError:
+            return {"status": "ok", "running": False}
+        port = int(saved.get("port") or 0)
+        if not port:
+            return {"status": "ok", "running": False}
+        alive = self.exec(
+            project_id,
+            f"(echo > /dev/tcp/127.0.0.1/{port}) 2>/dev/null && echo UP || echo DOWN",
+            timeout=20,
+        )
+        running = "UP" in (alive.stdout or "")
+        host_port = self.ports(project_id).get(port)
+        return {
+            "status": "ok",
+            "running": running,
+            "port": port,
+            "url": f"http://127.0.0.1:{host_port}" if (running and host_port) else "",
+            "internal_url": f"http://{self.container_name(project_id)}:{port}" if running else "",
+            "command": saved.get("command", ""),
+        }
+
+    def server_log(self, project_id: str, lines: int = 200) -> dict:
+        if not self.enabled:
+            return {"status": "unavailable"}
+        out = self.exec(project_id, f"tail -n {max(1, min(lines, 2000))} "
+                                    ".weave/server.log 2>/dev/null || true", timeout=25)
+        return {"status": "ok", "log": _tail(out.stdout or "", 12000)}
 
     # ---------------------------------------------------------------- packaging
 
@@ -598,6 +1090,18 @@ class WorkspaceService:
         shutil.rmtree(base, ignore_errors=True)
         self.project_dir(project_id)
         return {"status": "ok", "reset": True}
+
+
+def _safe_id(value: str) -> str:
+    """A Docker-name-safe form of a project id.
+
+    Container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*. Project ids are hex
+    uuids so this is normally a no-op, but a name Docker rejects would fail every
+    command in the workspace with an error about the container rather than about
+    the work, which is a miserable thing to debug.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "", str(value or "shared"))
+    return (cleaned or "shared")[:48]
 
 
 def _tail(text: str, limit: int) -> str:

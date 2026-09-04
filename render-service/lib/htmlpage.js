@@ -15,7 +15,7 @@
 // reported, because guessing at a fix would produce a page that renders but is
 // not what was asked for.
 
-import { lintHtml, prepareScript } from "./js.js";
+import { checkSyntax, lintHtml, prepareScript } from "./js.js";
 
 const MAX_BYTES = 900_000;
 
@@ -59,6 +59,42 @@ function repairScripts(html) {
     },
   );
   return { html: out, repairs, failures };
+}
+
+/**
+ * Compile every inline script without running it.
+ *
+ * A truncated page -- the most common way a long generation goes wrong -- is
+ * syntactically fine as HTML and catastrophic as JavaScript: the browser parses
+ * the document, reaches an unterminated function, and abandons the whole script
+ * silently. The page then loads to a blank body with a working stylesheet, which
+ * looks far more like a rendering bug than like a file that stops mid-line.
+ * Finding it here turns it into an error the model can act on.
+ */
+function checkScripts(html) {
+  const problems = [];
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m;
+  let n = 0;
+  while ((m = re.exec(html))) {
+    n += 1;
+    const attrs = m[1] || "";
+    const body = m[2] || "";
+    if (/\bsrc\s*=/i.test(attrs)) continue;
+    if (/type\s*=\s*["']?(application|text)\/(ld\+)?json/i.test(attrs)) continue;
+    if (!body.trim()) continue;
+    const isModule = /type\s*=\s*["']?module/i.test(attrs);
+    const res = checkSyntax(body, { async: isModule });
+    if (!res.ok) {
+      problems.push(
+        `script #${n} does not parse: ${res.error}` +
+          (res.line ? ` (around line ${res.line} of that script)` : "") +
+          `. The browser abandons a script that fails to parse, so the page ` +
+          `would load blank.`,
+      );
+    }
+  }
+  return problems;
 }
 
 /** Ensure the document carries the artifact CSP and a mobile viewport. */
@@ -120,6 +156,15 @@ export function renderHtmlPage({ html = "", title = "Page", strict = false } = {
 <title>${String(title).replace(/[<>&"]/g, "")}</title></head><body>\n${doc}\n</body></html>`;
   }
   doc = harden(doc);
+
+  // Parse check before the lint. A script that does not compile is a harder
+  // failure than anything the lint looks for, and reporting it first means the
+  // model is told about the broken brace rather than about a missing viewport.
+  const parseErrors = checkScripts(doc);
+  if (parseErrors.length) {
+    return { status: "error", error: parseErrors[0], problems: parseErrors,
+             repairs: fixed.repairs };
+  }
 
   const problems = lintHtml(doc);
   const errors = problems.filter((p) => p.severity === "error");

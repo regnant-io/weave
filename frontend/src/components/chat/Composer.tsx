@@ -235,6 +235,7 @@ export default function Composer({
   setServices,
   contextUsed,
   contextLimit,
+  above,
 }: {
   input: string;
   setInput: (v: string) => void;
@@ -255,17 +256,100 @@ export default function Composer({
   contextUsed: number;
   /** The selected model's REAL window, resolved server-side. 0 hides the meter. */
   contextLimit: number;
+  /**
+   * Rendered directly above the control rail, INSIDE the composer's own
+   * overlay: the steering bar while a turn is running, the live-voice bar when
+   * one is not. See the comment at the render site for why they cannot be
+   * siblings.
+   */
+  above?: React.ReactNode;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
   const sw = language === "sw";
   const label = (p: [string, string]) => (sw ? p[0] : p[1]);
 
+  /*
+    Auto-size the input to its content.
+
+    Re-measured on RESIZE as well as on typing. Height depends on how the text
+    wraps, and wrapping depends on width — so a height computed at one width is
+    simply wrong at another. Keying it only on `input` meant a composer sized
+    for a phone kept its three-line height when the device was rotated, when the
+    on-screen keyboard closed and gave the viewport its height back, or when a
+    side panel opened and took width away. The result was a tall empty box
+    sitting over the conversation until the next keystroke.
+  */
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
-    ta.style.height = "0px";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+
+    const fit = () => {
+      ta.style.height = "0px";
+      ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+    };
+    fit();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", fit);
+      return () => window.removeEventListener("resize", fit);
+    }
+
+    // Observe the element, but react to WIDTH only.
+    //
+    // `fit` changes the textarea's height, so an observer that reacted to
+    // height would be watching its own output — the classic "ResizeObserver
+    // loop completed with undelivered notifications" feedback. Width is the
+    // input to the calculation and is never changed by it, so gating on width
+    // makes the loop impossible rather than merely convergent.
+    //
+    // Observing the element rather than the window also catches what a window
+    // resize does not: a panel opening beside the chat, the sidebar collapsing,
+    // a webfont finally landing.
+    let lastWidth = ta.getBoundingClientRect().width;
+    const ro = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? lastWidth;
+      if (Math.abs(width - lastWidth) < 0.5) return;
+      lastWidth = width;
+      fit();
+    });
+    ro.observe(ta);
+    return () => ro.disconnect();
   }, [input]);
+
+  /*
+    Publish the composer's real height as `--composer-h`.
+
+    The transcript is a scroller with the composer floating over its bottom
+    edge, so it has to pad itself by however much the composer covers. That was
+    a hard-coded 11rem, which is right for a one-line input and wrong the moment
+    the composer grows — a multi-line draft (the textarea expands to 200px), the
+    steering bar appearing mid-turn, the control rail wrapping on a narrow
+    phone. In every one of those cases the last line of the answer disappeared
+    underneath the input.
+
+    Measuring is the only thing that stays correct, and a ResizeObserver on the
+    overlay catches all three causes without any of them knowing about each
+    other. The variable goes on the document element so the scroll-to-bottom
+    button can ride on the same number.
+  */
+  useEffect(() => {
+    const el = shellRef.current;
+    if (!el) return;
+    const publish = () =>
+      document.documentElement.style.setProperty(
+        "--composer-h",
+        `${Math.round(el.getBoundingClientRect().height)}px`,
+      );
+    publish();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      document.documentElement.style.removeProperty("--composer-h");
+    };
+  }, []);
 
   const activeServices = SERVICES.filter((s) => services[s.id]);
   const inputTokens = Math.ceil(input.length / 3.6);
@@ -282,6 +366,7 @@ export default function Composer({
 
   return (
     <div
+      ref={shellRef}
       className="pointer-events-none absolute inset-x-0 bottom-0 z-20"
       /*
         --kb-inset lifts the composer clear of the iOS on-screen keyboard. iOS
@@ -301,6 +386,23 @@ export default function Composer({
         style={{ paddingBottom: "calc(0.75rem + var(--safe-bottom))" }}
       >
         <div className="pointer-events-auto mx-auto w-full min-w-0 max-w-chat">
+          {/*
+            ANYTHING ANCHORED ABOVE THE INPUT BELONGS INSIDE THIS OVERLAY.
+
+            The steering bar and the live-voice bar used to be rendered as
+            siblings of the composer, in normal flow at the bottom of the chat
+            column. The composer is `absolute; bottom: 0; z-20`, so it was
+            painted directly on top of both of them: the bar that lets you
+            redirect a running turn, and the entry point to voice and screen
+            sharing, were laid out at exactly the coordinates the composer
+            covers and were therefore invisible and unclickable. Nothing errored
+            and the DOM looked right, which is why it survived.
+
+            Putting them in here also means `--composer-h` below measures the
+            real occupied height including them, so the transcript's bottom
+            padding is correct whether or not a bar is showing.
+          */}
+          {above}
           {/* control rail */}
           <div className="hide-scrollbar mb-1.5 flex items-center gap-1.5 overflow-x-auto px-0.5 pb-0.5">
             <Popover

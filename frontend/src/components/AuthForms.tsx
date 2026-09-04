@@ -1,6 +1,6 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 import type { Language, Mode } from "@/lib/types";
@@ -11,8 +11,26 @@ const field =
 const btn =
 "w-full rounded-full bg-accent px-4 py-2.5 font-medium text-accent-fg transition-opacity hover:opacity-90 disabled:opacity-60";
 
+/**
+ * Where to send someone after they sign in.
+ *
+ * `next` arrives in a query string, so it is attacker-controllable: an
+ * absolute URL or a protocol-relative `//evil.example` would turn our own login
+ * form into an open redirect. Only a single-slash, same-origin path is honoured;
+ * anything else falls back to the project list.
+ */
+function safeNext(raw: string | null | undefined): string {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/app/projects";
+  return raw;
+}
+
 export function LoginForm({ language }: { language: Language }) {
   const router = useRouter();
+  // Middleware bounces an unauthenticated request here with `?next=` set to
+  // where the user was actually going. Landing them on the project list instead
+  // would silently discard a deep link — a shared chat URL, a dataset page —
+  // which is the most annoying possible outcome of asking someone to sign in.
+  const next = safeNext(useSearchParams()?.get("next"));
   const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -33,7 +51,7 @@ export function LoginForm({ language }: { language: Language }) {
       setError(data.error ?? "Login failed");
       return;
     }
-    router.push("/app/projects");
+    router.push(next);
     router.refresh();
   }
 
@@ -79,7 +97,10 @@ export function RegisterForm({ language, initialMode }: { language: Language; in
       setError(data.error ?? "Registration failed");
       return;
     }
-    router.push("/app/projects");
+    // Straight to onboarding, not to the dashboard. Middleware would redirect
+    // there anyway; going directly saves a round trip and, more importantly,
+    // removes the frame in which the app shell paints behind the redirect.
+    router.push("/onboarding");
     router.refresh();
   }
 
@@ -113,6 +134,7 @@ export function RegisterForm({ language, initialMode }: { language: Language; in
 
 export function OtpForm({ language }: { language: Language }) {
   const router = useRouter();
+  const next = safeNext(useSearchParams()?.get("next"));
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [sent, setSent] = useState(false);
@@ -145,7 +167,7 @@ export function OtpForm({ language }: { language: Language }) {
       const data = await res.json().catch(() => ({}));
       return setError(data.error ?? "verification failed");
     }
-    router.push("/app/projects");
+    router.push(next);
     router.refresh();
   }
 
