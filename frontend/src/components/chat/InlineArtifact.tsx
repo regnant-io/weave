@@ -281,9 +281,23 @@ function formatBytes(n: number): string {
 
 const InlineArtifact = memo(
   InlineArtifactInner,
+  /*
+    Compare on everything that is DRAWN, not just on identity.
+
+    A repaired artifact keeps its URL — that is the point of editing in place,
+    so a panel the user already has open updates rather than a near-duplicate
+    appearing beside it. Comparing on the URL alone therefore made the one case
+    that matters invisible: an artifact released with known faults, then fixed,
+    would keep showing "has known faults" because React was told nothing had
+    changed. A stale warning on working output is only marginally better than a
+    missing warning on broken output.
+  */
   (a, b) =>
     a.artifact.url === b.artifact.url &&
     a.artifact.name === b.artifact.name &&
+    a.artifact.verified === b.artifact.verified &&
+    a.artifact.preview === b.artifact.preview &&
+    (a.artifact.defects?.length ?? 0) === (b.artifact.defects?.length ?? 0) &&
     a.language === b.language &&
     a.onOpen === b.onOpen,
 );
