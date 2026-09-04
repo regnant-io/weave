@@ -37,7 +37,32 @@ class Settings(BaseSettings):
 
     # --- database ---
     # Production: postgresql+psycopg://... with pgvector. Dev default: SQLite.
+    #
+    # docker-compose brings Postgres up in the DEFAULT profile and points this
+    # at it; SQLite is what you get running the API directly with nothing else
+    # configured. That ordering is deliberate: SQLite has one writer, so two
+    # students sending a message at the same moment serialise, and a third waits
+    # behind them. It is a fine development database and not a deployment.
     database_url: str = f"sqlite:///{(DATA_DIR / 'weave.db').as_posix()}"
+
+    # --- connection pool (Postgres only; SQLite ignores all of it) ---
+    #
+    # Sized against WORKERS x POOL, not against users. A turn holds a connection
+    # only while it is actually reading or writing -- generation and tool calls
+    # run with none checked out -- so a pool of 10 per worker serves far more
+    # than 10 concurrent conversations. Getting this wrong in the other
+    # direction is expensive: Postgres' own default max_connections is 100, and
+    # four workers each demanding 30 exhausts the server rather than the pool.
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    #: Seconds to wait for a free connection before failing the request. Long
+    #: enough to ride out a burst, short enough that a genuinely exhausted pool
+    #: reports itself instead of hanging every request behind it.
+    db_pool_timeout: int = 30
+    #: Recycle connections before a proxy or Postgres itself drops them. Cloud
+    #: managed databases commonly cut idle connections at 5-10 minutes, and a
+    #: dead connection handed to a request is a 500 the user cannot retry into.
+    db_pool_recycle_seconds: int = 900
 
     # --- object storage (S3-compatible). Dev default: local filesystem. ---
     storage_backend: str = "local"  # local | s3
@@ -175,6 +200,17 @@ class Settings(BaseSettings):
     rate_limit_chat_per_min: int = 20
     rate_limit_sandbox_per_min: int = 6
     rate_limit_anon_per_min: int = 10
+    #: Credential endpoints -- login, register, OTP request, OTP verify.
+    #:
+    #: Much stricter than the rest, because these are the only routes where an
+    #: attacker gains something by calling them thousands of times. A person
+    #: signing in mistypes their password twice, not twenty times a minute.
+    rate_limit_auth_per_min: int = 8
+    #: How many wrong codes one OTP may absorb before it is burned.
+    #:
+    #: A six-digit code has a million values and a ten-minute life. Without a
+    #: cap, guessing it is arithmetic rather than luck.
+    otp_max_attempts: int = 5
 
     # --- cors ---
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]

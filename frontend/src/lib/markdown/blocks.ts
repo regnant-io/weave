@@ -285,29 +285,64 @@ function parseLines(lines: string[]): Blk[] {
  * construct-aware.
  */
 export function splitSegments(text: string): string[] {
+  return splitSegmentsFrom(text).segments;
+}
+
+/**
+ * The same split, but reporting where the LAST segment begins.
+ *
+ * That offset is what makes re-splitting incremental. While an answer streams,
+ * this function is called on every frame with a string that is only ever longer
+ * at the end — and re-scanning the whole document each time is work proportional
+ * to the answer so far, sixty times a second. On a short reply that is
+ * invisible; on a long one, on the mid-range Android this product is built for,
+ * it is the difference between text that flows and text that hitches.
+ *
+ * Appending can only affect the final segment, because a boundary is a blank
+ * line (or a fence close) that has already been seen. So a caller holding the
+ * previous result can re-split `text.slice(lastStart)` and concatenate — see
+ * `Markdown.tsx`.
+ */
+export function splitSegmentsFrom(text: string): { segments: string[]; lastStart: number } {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const segments: string[] = [];
+  //: Character offset of the first line of the segment being accumulated.
+  const starts: number[] = [];
+  let curStart = 0;
+  let offset = 0;
   let cur: string[] = [];
   let fence: string | null = null;
 
   const flush = () => {
     if (cur.length) {
       segments.push(cur.join("\n"));
+      starts.push(curStart);
       cur = [];
     }
+  };
+  //: Record where a segment starts, the first time a line lands in it.
+  const take = (line: string) => {
+    if (!cur.length) curStart = offset;
+    cur.push(line);
+    offset += line.length + 1; // +1 for the newline `split` removed
+  };
+  //: A line that opens no segment still advances the cursor. Without this every
+  //: blank line would shift every later segment's recorded start.
+  const skip = (line: string) => {
+    offset += line.length + 1;
   };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
     if (fence) {
-      cur.push(line);
+      take(line);
       if (new RegExp(`^\\s*${fence}`).test(line)) fence = null;
       continue;
     }
     const f = FENCE_RE.exec(line);
     if (f) {
-      cur.push(line);
+      take(line);
       fence = f[2][0] === "`" ? "`{3,}" : "~{3,}";
       continue;
     }
@@ -319,6 +354,7 @@ export function splitSegments(text: string): string[] {
       while (j < lines.length && lines[j].trim() === "") j++;
       if (j >= lines.length) {
         flush();
+        skip(line);
         continue;
       }
       const next = lines[j];
@@ -330,14 +366,19 @@ export function splitSegments(text: string): string[] {
 
       if ((curStartsList && (nextIsList || nextIndented)) || (curIsQuote && nextIsQuote)) {
         cur.push("");
+        skip(line);
         continue;
       }
       flush();
+      skip(line);
       continue;
     }
 
-    cur.push(line);
+    take(line);
   }
   flush();
-  return segments;
+  return {
+    segments,
+    lastStart: starts.length ? starts[starts.length - 1] : 0,
+  };
 }

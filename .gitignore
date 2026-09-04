@@ -25,3 +25,7 @@ render-service/dist/
 .DS_Store
 Thumbs.db
 frontend/tsconfig.tsbuildinfo
+
+# Local runtime state (workspaces, sqlite, storage)
+var/
+logs.txt

@@ -1,0 +1,75 @@
+# Development overrides. Docker Compose loads this file automatically on top of
+# docker-compose.yml, so `docker compose up` picks it up with no extra flags and
+# a deployment that only ships docker-compose.yml is unaffected.
+#
+# WHY THIS EXISTS
+# ---------------
+# The backend image COPYs the source in at build time, so every one-line change
+# to a prompt, a tool description or an orchestration rule meant a full image
+# rebuild before it could be tried. That is a minute of waiting per edit, which
+# is enough to change how you work: you batch up changes, test them together,
+# and lose track of which one broke things.
+#
+# Bind-mounting the source and running uvicorn with --reload turns that minute
+# into about a second. Dependencies still come from the image — only the
+# application code is mounted — so this never diverges from what is built.
+services:
+  backend:
+    volumes:
+      - ./backend/app:/app/app
+      # Tests too, so the suite can be run against the mounted source
+      # rather than whatever was baked into the image.
+      - ./backend/tests:/app/tests
+      - backend_var:/app/var
+      - /var/run/docker.sock:/var/run/docker.sock
+      - workspaces:/app/var/workspaces
+    environment:
+      # Docker Desktop on Windows/macOS does not propagate inotify events across
+      # a bind mount, so the file watcher never fires and --reload silently does
+      # nothing — you edit, nothing happens, and you conclude the change was
+      # wrong rather than unloaded. Polling is the only thing that works here.
+      WATCHFILES_FORCE_POLLING: "true"
+    # Seeding is skipped here: the database already exists after the first boot,
+    # and re-running the seeder on every reload is noise.
+    command: >
+      sh -c "python -m app.seed.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --reload --reload-dir /app/app"
+
+  frontend:
+    # `next dev` against the mounted source, for the same reason as the backend:
+    # the production image bakes a compiled .next, so every UI change otherwise
+    # costs a full rebuild before it can be looked at. node_modules is kept as an
+    # anonymous volume so the image's installed dependencies are not shadowed by
+    # the (absent) host directory.
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/tsconfig.json:/app/tsconfig.json
+      - ./frontend/next.config.mjs:/app/next.config.mjs
+      - ./frontend/tailwind.config.ts:/app/tailwind.config.ts
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs
+      - ./frontend/next-env.d.ts:/app/next-env.d.ts
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Same reason as the backend: without polling, webpack never notices an
+      # edit to a bind-mounted file.
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
+    command: ["npm", "run", "dev"]
+
+  render:
+    # Same reasoning as the backend: lib/*.js is the code most often adjusted
+    # while tuning what the model is allowed to emit, and rebuilding an image
+    # that inlines 6MB of Babylon to change a lint rule is not a dev loop.
+    # node_modules stays in the image; only the service source is mounted.
+    volumes:
+      - ./render-service/server.js:/app/server.js
+      - ./render-service/lib:/app/lib
+      - ./render-service/package.json:/app/package.json
+
+volumes:
+  workspaces:

@@ -61,5 +61,7 @@ on groups and search.
 ## Always
 
 Say in prose what the graph shows, which cluster matters, and what the reader
-should notice. Then `verify_artifact`. A graph the reader has to interpret
+should notice. (The graph is opened in a real browser for you before it is
+shown, so a broken one comes back as a failed call — repair it with
+`update_visual` rather than rebuilding it.) A graph the reader has to interpret
 unaided is a picture of your notes, not an answer.

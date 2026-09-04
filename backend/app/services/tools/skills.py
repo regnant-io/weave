@@ -55,6 +55,7 @@ def _read_skill(ctx: ToolContext, inp: dict) -> dict:
 def register_skill_tools(reg: ToolRegistry) -> None:
     reg.register(Tool(
         name="list_skills",
+        parallel_safe=True,
         description=(
             "List the skills available to you: worked procedures for the tasks "
             "students and researchers actually bring, and for getting the most out "
@@ -73,6 +74,7 @@ def register_skill_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="read_skill",
+        parallel_safe=True,
         description=(
             "Load a skill's full procedure by name. YOU MUST READ A SKILL BEFORE "
             "FOLLOWING IT — the name and description tell you almost nothing, and "

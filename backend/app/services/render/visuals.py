@@ -14,6 +14,22 @@ the model having to restate the whole thing.
 Layout:
     visuals/{project_id}/{visual_id}.html   the rendered artifact
     visuals/{project_id}/{visual_id}.json   {title, kind, spec, tool, created_at}
+    visuals/{project_id}/{visual_id}.src.json  the bulky inputs, kept apart
+
+WHY THE SOURCE IS A SEPARATE FILE
+
+Two of the things that make a visual are large: a Babylon scene is hundreds of
+lines of code, and its meshes and textures travel with it as data URLs. Putting
+those in the metadata sidecar looks tidier and is quietly disastrous, because
+`listing()` reads EVERY sidecar in the project to answer `list_visuals` -- a
+question that only needs titles. One 20MB scene would make listing five visuals
+a 20MB read.
+
+So the sidecar stays small and structured, and the bulk lives in its own key
+that is fetched only when something actually needs to edit the visual. That is
+what makes repair-by-editing possible at all: to change one line of a broken
+scene the model has to be able to see the other lines, and before this the only
+copy of them was inside the rendered HTML.
 """
 from __future__ import annotations
 
@@ -43,8 +59,18 @@ def meta_key(project_id: str, visual_id: str) -> str:
     return f"{PREFIX}/{_safe(project_id)}/{_safe(visual_id)}.json"
 
 
-def save(project_id: str, visual_id: str, html: str, meta: dict) -> dict:
-    """Persist (or overwrite) a visual and its spec sidecar."""
+def source_key(project_id: str, visual_id: str) -> str:
+    return f"{PREFIX}/{_safe(project_id)}/{_safe(visual_id)}.src.json"
+
+
+def save(project_id: str, visual_id: str, html: str, meta: dict,
+         source: dict | None = None) -> dict:
+    """Persist (or overwrite) a visual, its spec sidecar and its source.
+
+    `source` holds whatever is too big for the sidecar -- scene code, page HTML,
+    inlined assets. It is written only when supplied, so a caller that has
+    nothing bulky to store leaves no extra key behind.
+    """
     hk = html_key(project_id, visual_id)
     storage.put_bytes(hk, html.encode("utf-8"))
     record = {
@@ -54,7 +80,27 @@ def save(project_id: str, visual_id: str, html: str, meta: dict) -> dict:
         **meta,
     }
     storage.put_bytes(meta_key(project_id, visual_id), json.dumps(record).encode("utf-8"))
+    if source:
+        storage.put_bytes(source_key(project_id, visual_id),
+                          json.dumps(source).encode("utf-8"))
     return {"key": hk, "record": record}
+
+
+def load_source(project_id: str, visual_id: str) -> dict:
+    """The bulky inputs that produced this visual, or {}.
+
+    This is what makes editing possible rather than regenerating. A model asked
+    to fix one broken line in a scene it wrote twenty minutes ago has no memory
+    of the other four hundred; without the source the only thing it can do is
+    write the whole thing again, which reliably reintroduces a different fault.
+    """
+    sk = source_key(project_id, visual_id)
+    if not storage.exists(sk):
+        return {}
+    try:
+        return json.loads(storage.get_bytes(sk).decode("utf-8")) or {}
+    except (ValueError, OSError):
+        return {}
 
 
 def load_html(project_id: str, visual_id: str) -> str:
@@ -105,6 +151,7 @@ def delete(project_id: str, visual_id: str) -> bool:
     existed = storage.exists(hk) or storage.exists(meta_key(project_id, visual_id))
     storage.delete(hk)
     storage.delete(meta_key(project_id, visual_id))
+    storage.delete(source_key(project_id, visual_id))
     return existed
 
 

@@ -32,7 +32,7 @@ import { renderCustom } from "./lib/custom.js";
 import { renderBabylon } from "./lib/babylon.js";
 import { renderGraph } from "./lib/graph.js";
 import { renderHtmlPage } from "./lib/htmlpage.js";
-import { lintHtml } from "./lib/js.js";
+import { lintHtml, svgHasContent } from "./lib/js.js";
 import { renderDeck } from "./lib/deck.js";
 import { applyTheme } from "./lib/vegaTheme.js";
 
@@ -139,6 +139,32 @@ app.post("/chart", async (req, res) => {
       : themed;
     const view = new vega.View(vega.parse(vgSpec), { renderer: "none" });
     const svg = await view.toSVG();
+    /*
+      REFUSE TO RETURN AN EMPTY CHART.
+
+      A Vega-Lite spec can be valid, compile cleanly, render without a single
+      warning, and produce an SVG with nothing in it -- an empty `data.values`,
+      a filter that matches no rows, a field name that does not exist in the
+      data so every mark is dropped. Every layer then reports success: the spec
+      parsed, the view rendered, the file was written, the tool returned "ok",
+      and the user is shown a blank rectangle where a chart should be.
+
+      Nothing upstream can detect this, because from the outside a blank chart
+      and a real one are both "an SVG". Here is the only place that can look at
+      the pixels, so this is where the question gets asked. A 400 with a
+      specific reason is something the model repairs; a blank image is
+      something it congratulates itself on.
+    */
+    if (!svgHasContent(svg)) {
+      return res.status(400).json({
+        error:
+          "the chart rendered with no marks on it -- the spec is valid but it draws " +
+          "nothing. The usual causes are an empty `data.values`, a field name in " +
+          "`encoding` that does not exist in the data (check the spelling and the " +
+          "case), or a `transform` filter that excludes every row. Check the data " +
+          "and the field names against each other and try again.",
+      });
+    }
     if (format === "png") {
       // Rasterise SVG -> PNG in-process (resvg, Rust). No headless browser needed.
       const png = new Resvg(svg, { fitTo: { mode: "width", value: 1200 } })

@@ -68,6 +68,10 @@ class OtpCode(Base):
     code_hash: Mapped[str] = mapped_column(String(128))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Wrong guesses against THIS code. A six-digit code with an unlimited
+    #: number of attempts is not a secret; it is a formality that takes a script
+    #: about a minute to walk through.
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -199,6 +203,12 @@ class Message(Base):
     citations: Mapped[list] = mapped_column(JSON, default=list)  # surfaced source refs
     artifacts: Mapped[list] = mapped_column(JSON, default=list)  # charts/decks/pdfs/3d
     images: Mapped[list] = mapped_column(JSON, default=list)     # top web-search images
+    # The plan this turn worked to: {goal, steps:[{n,title,status,note}], checks}.
+    # Empty for turns that did not need one (a greeting is not planned). Stored
+    # so a reloaded conversation shows what was attempted and what was ticked
+    # off — without it the ledger the user watched during the turn vanishes on
+    # refresh, which is exactly how a progress display teaches people to ignore it.
+    plan: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped[Project] = relationship(back_populates="messages")

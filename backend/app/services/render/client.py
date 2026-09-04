@@ -109,7 +109,7 @@ class RenderClient:
     # opaque-origin iframe rather than by us vetting the code.
 
     def _visual(self, endpoint: str, payload: dict, *, project_id: str, visual_id: str,
-                title: str, tool: str, spec: dict) -> dict:
+                title: str, tool: str, spec: dict, source: dict | None = None) -> dict:
         from . import visuals
 
         r = self._httpx.post(f"{self._base()}{endpoint}", json=payload, timeout=45)
@@ -129,7 +129,7 @@ class RenderClient:
         saved = visuals.save(project_id, visual_id, body["html"], {
             "title": title, "kind": body.get("kind") or body.get("mode") or tool,
             "tool": tool, "spec": spec,
-        })
+        }, source=source)
         return {
             "status": "ok",
             "visual_id": visual_id,
@@ -170,12 +170,14 @@ class RenderClient:
                visual_id: str | None = None) -> dict:
         from . import visuals
         vid = visual_id or visuals.new_id()
-        spec = {"code": code, "html": html, "libs": libs or []}
+        # The code and markup are the BULK, so they live in the source blob and
+        # the sidecar keeps only what `list_visuals` needs to know.
         return self._visual("/custom",
                             {"code": code, "html": html, "title": title,
                              "theme": theme, "libs": libs or []},
                             project_id=project_id, visual_id=vid, title=title,
-                            tool="render_custom", spec=spec)
+                            tool="render_custom", spec={"libs": libs or []},
+                            source={"code": code, "html": html})
 
     def three_visual(self, scene: dict, *, project_id: str, title: str = "3D view",
                      theme: str = "dark", visual_id: str | None = None) -> dict:
@@ -197,7 +199,7 @@ class RenderClient:
         """
         from . import visuals
         vid = visual_id or visuals.new_id()
-        spec = {"code": code, "controls": controls, "libs": libs or [],
+        spec = {"controls": controls, "libs": libs or [],
                 "assets": sorted((assets or {}).keys())}
         return self._visual(
             "/babylon",
@@ -205,6 +207,10 @@ class RenderClient:
              "assets": assets or {}, "controls": controls, "libs": libs or []},
             project_id=project_id, visual_id=vid, title=title,
             tool="create_3d_experience", spec=spec,
+            # Assets are kept alongside the code so a repair does not have to
+            # re-upload a mesh the model no longer has. They are already inlined
+            # in the rendered page; this is the only copy anything can EDIT.
+            source={"code": code, "assets": assets or {}, "subtitle": subtitle},
         )
 
     def graph(self, spec: dict, *, project_id: str, title: str = "Knowledge graph",
@@ -238,7 +244,8 @@ class RenderClient:
         return self._visual(
             "/html", {"html": html, "title": title, "strict": strict},
             project_id=project_id, visual_id=vid, title=title,
-            tool="create_html_page", spec={"bytes": len(html)},
+            tool="create_html_page", spec={"bytes": len(html), "strict": bool(strict)},
+            source={"html": html},
         )
 
     def verify_html(self, html: str) -> dict:

@@ -1,8 +1,8 @@
 "use client";
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import type { Artifact } from "@/lib/types";
-import { parseBlocks, splitSegments, type Align, type Blk } from "@/lib/markdown/blocks";
+import { parseBlocks, splitSegmentsFrom, type Align, type Blk } from "@/lib/markdown/blocks";
 import { parseInline, type Inline } from "@/lib/markdown/inline";
 import { IcoCheck, IcoCopy } from "@/components/ui/icons";
 
@@ -251,6 +251,45 @@ const Segment = memo(
   (a, b) => a.content === b.content && a.onOpenArtifact === b.onOpenArtifact,
 );
 
+/**
+ * Split the document into segments, re-scanning only what can have changed.
+ *
+ * `splitSegments` is O(length of the answer so far), and while text is
+ * streaming it is called on every frame. On a short reply that is free; on a
+ * long one it is a full re-scan of a growing document sixty times a second,
+ * which on the mid-range Android this product is built for is the difference
+ * between text that flows and text that hitches — and it gets worse the longer
+ * the answer runs, which is exactly the wrong direction.
+ *
+ * Appending can only affect the FINAL segment: a boundary is a blank line or a
+ * closed fence, and both are already in the text behind it. So when the new
+ * text starts with the old text, everything before the last segment is reused
+ * verbatim and only the tail is re-split. A non-append — an edit, a retry, a
+ * steer that clears the answer — falls back to a full scan, which is correct
+ * and rare.
+ */
+function useSegments(text: string): string[] {
+  const cache = useRef<{ text: string; segments: string[]; lastStart: number } | null>(null);
+
+  return useMemo(() => {
+    const prev = cache.current;
+    if (prev && text.length > prev.text.length && text.startsWith(prev.text)) {
+      const head = prev.segments.slice(0, -1);
+      const tail = splitSegmentsFrom(text.slice(prev.lastStart));
+      const segments = [...head, ...tail.segments];
+      cache.current = {
+        text,
+        segments,
+        lastStart: prev.lastStart + tail.lastStart,
+      };
+      return segments;
+    }
+    const fresh = splitSegmentsFrom(text);
+    cache.current = { text, segments: fresh.segments, lastStart: fresh.lastStart };
+    return fresh.segments;
+  }, [text]);
+}
+
 function MarkdownInner({
   text,
   streaming,
@@ -260,7 +299,7 @@ function MarkdownInner({
   streaming?: boolean;
   onOpenArtifact?: (a: Artifact) => void;
 }) {
-  const segments = useMemo(() => splitSegments(text), [text]);
+  const segments = useSegments(text);
   const last = segments.length - 1;
 
   return (

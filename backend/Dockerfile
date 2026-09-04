@@ -8,9 +8,22 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System libs matplotlib/pandas need at runtime.
+# System libs matplotlib/pandas need at runtime + Docker CLI for workspace execution
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
+    curl \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CLI (not the daemon, just the client to talk to host's Docker)
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

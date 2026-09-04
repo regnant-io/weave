@@ -9,14 +9,21 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import get_db
 from .models import User
-from .ratelimit import TokenBucketLimiter
+from .ratelimit import build_limiter
 from .security import decode_access_token
 
 # Chat/analysis and sandbox executions are rate-limited on separate buckets;
 # sandbox is stricter because it is the most expensive/dangerous call (8 / 5.3).
-chat_limiter = TokenBucketLimiter(settings.rate_limit_chat_per_min)
-sandbox_limiter = TokenBucketLimiter(settings.rate_limit_sandbox_per_min)
-anon_limiter = TokenBucketLimiter(settings.rate_limit_anon_per_min)
+#
+# `build_limiter` returns a Redis-backed bucket when WEAVE_REDIS_URL is set and
+# a per-process one otherwise. That distinction matters as soon as the API runs
+# with more than one worker: per-process buckets multiply the configured limit
+# by the worker count, silently. See ratelimit.py.
+chat_limiter = build_limiter(settings.rate_limit_chat_per_min, namespace="weave:rl:chat")
+sandbox_limiter = build_limiter(settings.rate_limit_sandbox_per_min,
+                                namespace="weave:rl:sandbox")
+anon_limiter = build_limiter(settings.rate_limit_anon_per_min, namespace="weave:rl:anon")
+auth_limiter = build_limiter(settings.rate_limit_auth_per_min, namespace="weave:rl:auth")
 
 
 def get_current_user(
@@ -79,6 +86,37 @@ def enforce_sandbox_limit(request: Request, user: User = Depends(get_current_use
             headers={"Retry-After": str(int(retry) + 1)},
         )
     return user
+
+
+def enforce_auth_limit(request: Request) -> None:
+    """Throttle the credential endpoints, by CLIENT ADDRESS.
+
+    These were the only routes in the application with no limit of any kind, and
+    they are the only ones where calling repeatedly is the attack:
+
+      * `/auth/login` — password guessing, unbounded. Worse than the usual case
+        because verification is scrypt: each attempt costs the SERVER 64MB and
+        real CPU, so an attacker who is not even trying to get in can exhaust
+        the box by trying.
+      * `/auth/otp/verify` — a six-digit code has a million values and a
+        ten-minute life. Unlimited guesses make that arithmetic, not luck.
+      * `/auth/otp/request` — every call sends an SMS that somebody pays for,
+        and writes a row nobody deletes.
+      * `/auth/register` — account creation as a spam primitive.
+
+    Keyed on the client address rather than on the account, deliberately. Keying
+    on the account would let an attacker lock a real user out of their own login
+    by failing on their behalf, which converts a brute-force defence into a
+    denial-of-service tool.
+    """
+    key = _client_key(request, None)
+    allowed, retry = auth_limiter.allow(key)
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many attempts — wait a moment and try again",
+            headers={"Retry-After": str(int(retry) + 1)},
+        )
 
 
 def get_admin_user(user: User = Depends(get_current_user)) -> User:

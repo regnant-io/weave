@@ -158,6 +158,11 @@ class MemoryService:
         for m in reversed(rows):
             if m.role not in {"user", "assistant"}:
                 continue
+            # An empty assistant row is the placeholder of a turn that died
+            # before it wrote anything. Feeding "" back to the model as a prior
+            # answer teaches it that empty replies are acceptable here.
+            if m.role == "assistant" and not (m.content_en or m.content_sw or "").strip():
+                continue
             content = (m.content_sw if language == "sw" else m.content_en) or ""
             if not content.strip():
                 continue

@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type {
   Artifact,
   Citation,
@@ -8,13 +17,13 @@ import type {
   Effort,
   Language,
   Message,
+  Plan,
   WebImage,
 } from "@/lib/types";
 import type { ServicePrefs } from "@/lib/services";
 import { DEFAULT_SERVICES } from "@/lib/services";
 import type { AskUserRequest, Block, ChatTurn, StepBlock } from "@/lib/chatTypes";
 import {
-  isArtifactBlock,
   isAsk,
   isStep,
   isText,
@@ -29,8 +38,9 @@ import Composer from "./Composer";
 import InlineArtifact from "./InlineArtifact";
 import LiveBar from "./LiveBar";
 import Markdown from "./Markdown";
+import PlanRail from "./PlanRail";
 import SteerBar from "./SteerBar";
-import StepChip from "./StepChip";
+import StepGroup from "./StepGroup";
 import TurnRail from "./TurnRail";
 import { readingLine, summaryForResult, titleForTool } from "./stepTitles";
 import { useSmoothStream } from "./useSmoothStream";
@@ -111,6 +121,12 @@ function fromHistory(messages: Message[], language: Language): ChatTurn[] {
       images: m.images ?? [],
       artifacts,
       pending: false,
+      // A plan the turn worked to is provenance, so it replays with the rest of
+      // the transcript rather than existing only in the live stream.
+      plan:
+        m.plan && "steps" in m.plan && Array.isArray(m.plan.steps) && m.plan.steps.length
+          ? (m.plan as Plan)
+          : undefined,
       createdAt: Date.parse(m.created_at) || Date.now(),
     } satisfies ChatTurn;
   });
@@ -118,6 +134,50 @@ function fromHistory(messages: Message[], language: Language): ChatTurn[] {
 
 let uid = 0;
 const nextId = (p: string) => `${p}-${Date.now().toString(36)}-${uid++}`;
+
+/**
+ * Where a running turn is remembered across a page load.
+ *
+ * A refresh mid-turn used to lose the answer even though the server was still
+ * writing it: the transcript came back from the database without the turn that
+ * had not finished yet, and the work continued invisibly until it was
+ * cancelled. Recording the turn against its thread means the reloaded page can
+ * ask for it back.
+ *
+ * sessionStorage, not localStorage: this is about one tab's view of one turn.
+ * A second tab has its own connection, and a value surviving the browser being
+ * closed would only ever point at a turn that is long gone.
+ */
+const liveKey = (projectId: string, threadId?: string) =>
+  `weave:live:${projectId}:${threadId ?? "default"}`;
+
+function rememberLiveTurn(projectId: string, threadId: string | undefined, id: string, seq: number) {
+  try {
+    sessionStorage.setItem(liveKey(projectId, threadId), JSON.stringify({ id, seq }));
+  } catch {
+    /* private mode / storage disabled — resume is an optimisation, not a requirement */
+  }
+}
+
+function forgetLiveTurn(projectId: string, threadId?: string) {
+  try {
+    sessionStorage.removeItem(liveKey(projectId, threadId));
+  } catch {
+    /* as above */
+  }
+}
+
+function recallLiveTurn(projectId: string, threadId?: string): { id: string; seq: number } | null {
+  try {
+    const raw = sessionStorage.getItem(liveKey(projectId, threadId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.id === "string" && typeof parsed?.seq === "number") return parsed;
+  } catch {
+    /* corrupt value: treat as absent */
+  }
+  return null;
+}
 
 /* --------------------------------------------------------------------- main */
 
@@ -161,6 +221,20 @@ export default function ChatClient({
    * the first second of a turn rather than only once tokens appear.
    */
   const [steerTurn, setSteerTurn] = useState<string | null>(null);
+  /**
+   * The dev server the assistant currently has running, if any.
+   *
+   * Held on the CLIENT rather than on a turn, because a server outlives the
+   * turn that started it — the container keeps running between turns, which is
+   * the whole point of it being persistent.
+   */
+  const [previewUrl, setPreviewUrl] = useState("");
+  //: A transient explanation of why this turn behaved unusually — rate limited,
+  //: answered by the offline fallback. Cleared when the next turn starts.
+  const [notice, setNotice] = useState<string | null>(null);
+  //: Whether an app has ever appeared this session. Used to auto-open the panel
+  //: exactly once, so a user who closes it is not fighting us.
+  const previewSeen = useRef(false);
   /** Transient message from the steering path ("noted for the next turn"). */
   const [steerNote, setSteerNote] = useState<string | null>(null);
   /** Set when history had to be trimmed to fit the model's window. */
@@ -168,11 +242,17 @@ export default function ChatClient({
 
   // right-hand panels (independent surfaces, several may be open)
   const dock = usePanelDock();
+  // Pulled out so the callbacks below depend on a stable function rather than
+  // on the dock object, which is a prop-identity dependency of every turn.
+  const { openPanel } = dock;
   const [menuOpen, setMenuOpen] = useState(false);
 
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  /** `streaming` as a ref, for effects that must read it without re-running. */
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
   const lastUserText = useRef("");
   /** Id of the step currently receiving substeps. */
   const activeStep = useRef<string | null>(null);
@@ -188,6 +268,26 @@ export default function ChatClient({
   const seenArtifacts = useRef(new Set<string>());
   const threadRef = useRef<string | undefined>(threadId);
   threadRef.current = threadId;
+  /**
+   * The turn currently running ON THE SERVER, and how far into it we have read.
+   *
+   * The server no longer ties a turn's life to the connection watching it, so a
+   * dropped stream is a lost view rather than lost work. Keeping the turn's id
+   * and the sequence number of the last event we actually received is what lets
+   * us ask for the rest of it: `?after=<seq>` replays from the next event, so
+   * nothing is printed twice and nothing is missed.
+   */
+  const liveTurn = useRef<{ id: string; seq: number } | null>(null);
+  /**
+   * Set when a `done` or `error` event arrives.
+   *
+   * The transport closing is NOT the same as the turn ending, and this is the
+   * only thing that tells them apart. Without it, a stream cut by a proxy looks
+   * exactly like a stream the server closed because it had finished, so the
+   * client would either reconnect forever to a completed turn or give up on a
+   * running one.
+   */
+  const turnDone = useRef(false);
 
   const scroller = useStickToBottom<HTMLDivElement>();
 
@@ -218,6 +318,92 @@ export default function ChatClient({
     setRolled(null);
     setTrimmed(false);
   }, [threadId]);
+
+  /*
+    PICK UP A TURN THAT WAS RUNNING WHEN THE PAGE RELOADED.
+
+    Refreshing mid-turn used to lose the answer even though the server was still
+    writing it. The transcript came back from the database, which by definition
+    does not contain a turn that has not finished, so the page looked idle while
+    work continued invisibly until the server gave up on it. Anyone who has hit
+    that once learns not to refresh, and then not to start anything long.
+
+    The turn's id and read position survive in sessionStorage, so the reloaded
+    page can ask for the rest of it. Two things make this safe to attempt
+    optimistically: a turn this server no longer has returns 404, and a
+    resume that has fallen off the back of the event buffer returns
+    `resume_gap` — both of which land the user exactly where they already were.
+  */
+  useEffect(() => {
+    if (streamingRef.current) return;
+    const pending = recallLiveTurn(projectId, threadId);
+    if (!pending) return;
+
+    let cancelled = false;
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    (async () => {
+      // Probe before showing anything. A stale entry — the turn finished while
+      // the page was gone, or it was running on a different worker — must not
+      // leave an empty assistant bubble on screen.
+      let res: Response;
+      try {
+        res = await fetch(
+          `/api/chat/resume/${encodeURIComponent(pending.id)}?after=${pending.seq}`,
+          { signal: ac.signal },
+        );
+      } catch {
+        forgetLiveTurn(projectId, threadId);
+        return;
+      }
+      if (cancelled) return;
+      if (!res.ok || !res.body) {
+        forgetLiveTurn(projectId, threadId);
+        return;
+      }
+
+      liveTurn.current = { id: pending.id, seq: pending.seq };
+      turnDone.current = false;
+      setStreaming(true);
+      // The turn is mid-answer, so it needs somewhere to land. Anything it
+      // already streamed before the reload is in the events being replayed.
+      setTurns((prev) =>
+        prev[prev.length - 1]?.role === "assistant" && prev[prev.length - 1]?.pending
+          ? prev
+          : [...prev, blankAssistant()],
+      );
+      setNotice(
+        language === "sw"
+          ? "Naendelea kufuatilia zamu iliyokuwa inaendelea."
+          : "Picking up the turn that was still running.",
+      );
+
+      try {
+        await drainStream(res.body);
+        await followUntilDone(ac);
+        stream.finish();
+        await waitFor(() => stream.pending() === 0, 4000);
+      } catch {
+        /* handled by followUntilDone; nothing useful to add here */
+      } finally {
+        const rest = stream.flushNow();
+        if (rest) appendText(rest);
+        patchLast((m) => ({ ...m, pending: false, phase: undefined }));
+        setStreaming(false);
+        forgetLiveTurn(projectId, threadId);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+    // Deliberately keyed on the CHAT, not on every dependency the body reads:
+    // this must run exactly once per chat opened, and the helpers it calls are
+    // stable for the life of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, threadId]);
 
   /* --------------------------------------------------- block mutation utils */
 
@@ -260,9 +446,10 @@ export default function ChatClient({
   // paint. `useEffect` runs after the browser has already painted the taller
   // content, so at the exact bottom every token produced a one-frame up-jump
   // followed by a catch-up. `useLayoutEffect` closes that gap entirely.
+  const keepPinned = scroller.keep;
   useLayoutEffect(() => {
-    scroller.keep();
-  }, [turns, scroller]);
+    keepPinned();
+  }, [turns, keepPinned]);
 
   /** Land a block at the end of the timeline, flushing buffered prose first. */
   const appendBlock = useCallback(
@@ -336,8 +523,16 @@ export default function ChatClient({
   );
 
   const addSub = useCallback(
-    (text: string, extra?: { url?: string; detail?: string }) => {
-      const id = ensureStep(text);
+    (text: string, extra?: { url?: string; detail?: string; stepId?: string }) => {
+      // Address the step EXPLICITLY when the server named one.
+      //
+      // Substeps used to attach to whichever step started most recently. That
+      // is the same step while tools run one at a time, and the wrong one the
+      // moment two run concurrently — the progress lines of one search would
+      // appear underneath another. The server now stamps every tool event with
+      // its own step id (see the orchestrator's `_scoped` emitter); falling
+      // back to the most recent step keeps older servers working.
+      const id = extra?.stepId ?? ensureStep(text);
       mutateStep(id, (s) => ({
         ...s,
         substeps: [
@@ -353,8 +548,14 @@ export default function ChatClient({
   );
 
   const endStep = useCallback(
-    (status: string, summary?: string, error?: string, detail?: string) => {
-      const id = activeStep.current;
+    (
+      status: string,
+      summary?: string,
+      error?: string,
+      detail?: string,
+      stepId?: string,
+    ) => {
+      const id = stepId ?? activeStep.current;
       if (!id) return;
       const rest = stream.flushNow();
       if (rest) appendText(rest);
@@ -369,22 +570,48 @@ export default function ChatClient({
           x.state === "running" ? { ...x, state: "done" as const } : x,
         ),
       }));
-      activeStep.current = null;
+      // Only clear the "most recent step" pointer if it is the step that just
+      // ended. With concurrent tools an older step can finish last, and
+      // blanking the pointer then would orphan the substeps of the one still
+      // running.
+      if (activeStep.current === id) activeStep.current = null;
     },
     [appendText, mutateStep, stream],
   );
 
   /* ---------------------------------------------------------------- actions */
 
+  /**
+   * Stop the running turn — on the server, not just on this screen.
+   *
+   * Aborting the fetch used to be enough, because closing the stream cancelled
+   * the run. It no longer does: a turn now survives a dropped connection, which
+   * is the entire point, and that makes "the socket closed" and "the user
+   * pressed Stop" two different statements. Only the second one should stop the
+   * model, and only an explicit request can say it.
+   *
+   * The order matters. Tell the server first, then abort: aborting first would
+   * cancel the very fetch that carries the instruction.
+   */
   function stop() {
+    const id = liveTurn.current?.id;
+    turnDone.current = true; // do not reconnect to something we just cancelled
+    if (id) {
+      forgetLiveTurn(projectId, threadRef.current);
+      void fetch(`/api/chat/cancel/${encodeURIComponent(id)}`, { method: "POST" }).catch(
+        () => {
+          /* best effort: the abort below still detaches this view */
+        },
+      );
+    }
     abortRef.current?.abort();
   }
 
   // Clicking generated content in the transcript opens the panel that owns
   // that kind of artifact, rather than a generic viewer.
   const openArtifact = useCallback(
-    (a: Artifact) => dock.openPanel(categorise(a)),
-    [dock],
+    (a: Artifact) => openPanel(categorise(a)),
+    [openPanel],
   );
 
   async function regenerate() {
@@ -450,33 +677,25 @@ export default function ChatClient({
     await runTurn(content, false);
   }
 
-  async function runTurn(content: string, regenerate: boolean) {
-    setStreaming(true);
-    activeStep.current = null;
-    scroller.pin();
-
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    try {
-      const res = await fetch(`/api/chat/${projectId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: ac.signal,
-        body: JSON.stringify({
-          content,
-          language,
-          dataset_id: datasetId || null,
-          thread_id: threadRef.current ?? null,
-          effort,
-          model: model || null,
-          regenerate,
-          services,
-        }),
-      });
-      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => "request failed"));
-
-      await consumeSse(res.body, (event, data) => {
+  /**
+   * Read one SSE stream to its end, applying every event to the transcript.
+   *
+   * Split out of `runTurn` so the SAME handler serves the initial POST and any
+   * number of resume connections. A reconnect that applied a different subset
+   * of events would produce a transcript that depends on how many times the
+   * network dropped, which is precisely the kind of bug nobody reproduces.
+   */
+  async function drainStream(body: ReadableStream<Uint8Array>) {
+    await consumeSse(body, (event, data) => {
+        // Record how far we have read BEFORE handling the event. If applying it
+        // throws, the next resume asks for this event again rather than
+        // skipping it — replaying one event is recoverable, losing one is not.
+        if (typeof data?.seq === "number" && liveTurn.current) {
+          liveTurn.current.seq = data.seq;
+          if (liveTurn.current.id) {
+            rememberLiveTurn(projectId, threadRef.current, liveTurn.current.id, data.seq);
+          }
+        }
         switch (event) {
           /* ---- structured step protocol (preferred) ---- */
           case "step_start":
@@ -492,10 +711,123 @@ export default function ChatClient({
             mutateStep(data.id ?? activeStep.current, (s) => ({ ...s, title: data.title || s.title }));
             break;
           case "step_sub":
-            addSub(data.text ?? "", { url: data.url, detail: data.detail });
+            addSub(data.text ?? "", {
+              url: data.url,
+              detail: data.detail,
+              stepId: data.id,
+            });
             break;
           case "step_end":
-            endStep(data.status ?? "ok", data.summary, data.error, data.detail);
+            endStep(data.status ?? "ok", data.summary, data.error, data.detail, data.id);
+            break;
+
+          /* ---- the supervised loop ---- */
+          case "plan":
+            patchLast((m) => ({
+              ...m,
+              plan: {
+                goal: data.goal ?? "",
+                steps: Array.isArray(data.steps) ? data.steps : [],
+                checks: Array.isArray(data.checks) ? data.checks : [],
+              },
+            }));
+            break;
+          case "plan_step":
+            patchLast((m) =>
+              m.plan
+                ? {
+                    ...m,
+                    plan: {
+                      ...m.plan,
+                      steps: m.plan.steps.map((s) =>
+                        s.n === data.n
+                          ? { ...s, status: data.status ?? s.status, note: data.note ?? s.note }
+                          : s,
+                      ),
+                    },
+                  }
+                : m,
+            );
+            break;
+          case "phase":
+            patchLast((m) => ({ ...m, phase: String(data.name ?? "") }));
+            break;
+
+          /* ---- a dev server the assistant started ---- */
+          case "preview": {
+            const next = String(data.url ?? "");
+            setPreviewUrl(next);
+            // Open the panel the first time an app actually exists. Building
+            // something runnable and leaving it behind a closed drawer is the
+            // same as not running it, and after that the user's own choice to
+            // close the panel is respected.
+            if (next && !previewSeen.current) {
+              previewSeen.current = true;
+              dock.open.includes("preview") || dock.toggle("preview");
+            }
+            break;
+          }
+          case "continuing":
+            // The model stopped early and is being sent back to finish. Say so
+            // in the timeline: an unexplained second burst of work reads as the
+            // assistant repeating itself.
+            appendBlock({
+              kind: "step",
+              id: nextId("cont"),
+              tool: "continue",
+              title:
+                language === "sw"
+                  ? `Bado hakijakamilika — inaendelea (${(data.gaps ?? []).length})`
+                  : `Not finished yet — continuing (${(data.gaps ?? []).length} outstanding)`,
+              detail: (data.gaps ?? []).join("\n"),
+              state: "done",
+              substeps: [],
+              artifacts: [],
+              pending: [],
+              startedAt: Date.now(),
+            } satisfies StepBlock);
+            break;
+          case "review":
+            appendBlock({
+              kind: "step",
+              id: nextId("rev"),
+              tool: "review",
+              title:
+                data.verdict === "revise"
+                  ? language === "sw"
+                    ? `Ukaguzi umepata matatizo ${(data.defects ?? []).length}`
+                    : `Review found ${(data.defects ?? []).length} problem(s)`
+                  : language === "sw"
+                    ? "Ukaguzi umepita"
+                    : "Reviewed — no problems found",
+              detail: (data.defects ?? []).join("\n"),
+              state: data.verdict === "revise" ? "error" : "done",
+              substeps: [],
+              artifacts: [],
+              pending: [],
+              startedAt: Date.now(),
+            } satisfies StepBlock);
+            break;
+
+          /* ---- artifact verification (opened in a real browser) ---- */
+          case "verify_start":
+            mutateStep(data.id ?? activeStep.current, (s) => ({
+              ...s,
+              verification: { state: "running" },
+            }));
+            break;
+          case "verify_end":
+            mutateStep(data.id ?? activeStep.current, (s) => ({
+              ...s,
+              verification: {
+                state: data.checked ? (data.ok ? "ok" : "failed") : "ok",
+                attempt: data.attempt,
+                errors: data.errors ?? [],
+                warnings: data.warnings ?? [],
+                polish: data.polish ?? [],
+                summary: data.summary ?? "",
+              },
+            }));
             break;
 
           /* ---- announced-but-not-yet-produced output ---- */
@@ -532,22 +864,26 @@ export default function ChatClient({
             );
             break;
           case "searching":
-            addSub(
-              (language === "sw" ? "Inatafuta: " : "Searching ") + (data.query ?? ""),
-            );
+            addSub((language === "sw" ? "Inatafuta: " : "Searching ") + (data.query ?? ""), {
+              stepId: data.id,
+            });
             break;
           case "search_results":
             addSub(
               language === "sw"
                 ? `Matokeo ${data.count ?? 0}`
                 : `Found ${data.count ?? 0} results`,
+              { stepId: data.id },
             );
             break;
           case "fetching":
-            addSub(readingLine(data.title ?? "", data.url ?? "", language), { url: data.url });
+            addSub(readingLine(data.title ?? "", data.url ?? "", language), {
+              url: data.url,
+              stepId: data.id,
+            });
             break;
           case "extracted":
-            mutateStep(activeStep.current, (s) => ({
+            mutateStep(data.id ?? activeStep.current, (s) => ({
               ...s,
               substeps: s.substeps.map((x, i) =>
                 i === s.substeps.length - 1 ? { ...x, state: "done" as const } : x,
@@ -562,13 +898,49 @@ export default function ChatClient({
           case "thinking":
             patchLast((m) => ({ ...m, thinking: m.thinking + (data.text ?? "") }));
             break;
+          case "turn":
+            // The server's address for this run, sent before anything else so
+            // it is known even if the connection dies on the next byte.
+            liveTurn.current = { id: String(data.turn_id ?? ""), seq: -1 };
+            if (liveTurn.current.id) {
+              rememberLiveTurn(projectId, threadRef.current, liveTurn.current.id, -1);
+            }
+            break;
+          case "resume_gap":
+            // Too much was missed to splice the stream back together. Saying so
+            // and reloading beats showing an answer with an unmarked hole in
+            // the middle of it.
+            setNotice(
+              language === "sw"
+                ? "Muunganisho ulikatika kwa muda mrefu. Pakia upya mazungumzo kuona jibu kamili."
+                : "The connection was lost for too long to continue watching. Reload the chat to see the finished answer.",
+            );
+            break;
           case "meta":
             if (data.message_id) patchLast((m) => ({ ...m, id: data.message_id }));
             if (data.steerable && data.message_id) setSteerTurn(String(data.message_id));
             break;
           case "answer_start":
             // Any tool still open belongs to the phase before the answer.
-            if (activeStep.current) endStep("ok");
+            // Close every one of them, not just the most recent: with
+            // concurrent tools there can legitimately be several running, and
+            // leaving one spinning forever is how a finished turn keeps
+            // pretending it is still working.
+            patchBlocks((blocks) =>
+              blocks.map((b) =>
+                isStep(b) && b.state === "running"
+                  ? {
+                      ...b,
+                      state: "done" as const,
+                      endedAt: Date.now(),
+                      substeps: b.substeps.map((x) =>
+                        x.state === "running" ? { ...x, state: "done" as const } : x,
+                      ),
+                    }
+                  : b,
+              ),
+            );
+            activeStep.current = null;
             break;
           case "images":
             patchLast((m) => ({ ...m, images: data.images ?? [] }));
@@ -577,8 +949,9 @@ export default function ChatClient({
             const a = data as Artifact;
             // Rendered inline in the timeline AND recorded on the step, so the
             // panel's grouped view still lists it.
-            if (activeStep.current) {
-              mutateStep(activeStep.current, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
+            const owner = (data as { id?: string }).id ?? activeStep.current;
+            if (owner) {
+              mutateStep(owner, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
             }
             addArtifact(a);
             break;
@@ -661,6 +1034,14 @@ export default function ChatClient({
             );
             break;
 
+          /* ---- something the user needs to know about this turn ---- */
+          case "notice":
+            // Rate limits and fallbacks. Surfaced in the timeline rather than
+            // as a toast: it explains the shape of THIS answer, so it has to
+            // stay attached to it when the transcript is read back later.
+            setNotice(String(data.text ?? ""));
+            break;
+
           /* ---- context lifecycle ---- */
           case "context_trimmed":
             // Say it out loud. Silently dropping the start of a conversation is
@@ -679,6 +1060,8 @@ export default function ChatClient({
             break;
 
           case "done":
+            turnDone.current = true;
+            forgetLiveTurn(projectId, threadRef.current);
             // The server rolls to a successor thread when this one filled the
             // model's window; follow it, or the next turn would be written into
             // a chat the model can no longer read in full.
@@ -687,13 +1070,116 @@ export default function ChatClient({
             }
             break;
           case "error":
+            turnDone.current = true;
+            forgetLiveTurn(projectId, threadRef.current);
             patchLast((m) => ({ ...m, pending: false, error: true }));
             appendText(`\n\n⚠ ${data.message ?? "error"}`);
             break;
           default:
             break;
         }
+    });
+  }
+
+  /**
+   * Keep reattaching to the live turn until the server says it is over.
+   *
+   * Backoff is short and the ceiling is low on purpose. The thing being waited
+   * for is a network that has just come back, not a server that is down: if it
+   * has not come back within about a minute the turn's own detach grace has
+   * expired anyway and the server has cancelled it, so retrying past that point
+   * is spending the user's battery to learn nothing.
+   */
+  async function followUntilDone(ac: AbortController) {
+    const BACKOFF_MS = [400, 900, 2000, 4000, 8000, 12000];
+    let attempt = 0;
+
+    while (!turnDone.current && !ac.signal.aborted) {
+      const live = liveTurn.current;
+      // No turn id means the server never got far enough to name one, so there
+      // is nothing to reattach to.
+      if (!live?.id) return;
+      if (attempt >= BACKOFF_MS.length) {
+        setNotice(
+          language === "sw"
+            ? "Muunganisho umepotea. Pakia upya kuona jibu likikamilika."
+            : "Lost the connection to this turn. Reload to see how it finished.",
+        );
+        return;
+      }
+
+      await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+      if (turnDone.current || ac.signal.aborted) return;
+      attempt += 1;
+
+      try {
+        const res = await fetch(
+          `/api/chat/resume/${encodeURIComponent(live.id)}?after=${live.seq}`,
+          { signal: ac.signal },
+        );
+        if (res.status === 404) return; // the server no longer has this turn
+        if (!res.ok || !res.body) continue;
+        await drainStream(res.body);
+        // A clean read that reached `done` ends the loop through the condition
+        // above; one that did not means the transport dropped again, so the
+        // next iteration reconnects. Reset the backoff, because a stream that
+        // delivered events is evidence the network is working.
+        attempt = 0;
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        // Fall through to the next attempt with a longer wait.
+      }
+    }
+  }
+
+  /**
+   * Run a turn, and keep watching it across a dropped connection.
+   *
+   * THE DISTINCTION THIS DRAWS
+   *
+   * A stream can end for two very different reasons, and treating them the same
+   * way is what made a network blip look like a failed turn. The user pressing
+   * Stop is an ABORT: the turn is over and should be. The transport failing —
+   * a tunnel restarting, a phone moving from wifi to mobile data, a proxy
+   * timing out — says nothing about the turn, which is still running on the
+   * server and still doing the work.
+   *
+   * So: abort ends everything, and a transport failure reconnects to the same
+   * turn from the last event that was actually received. `consumeSse` returning
+   * normally is a third case — the server closed the stream cleanly — which
+   * only happens when the turn has finished or the connection was closed at the
+   * far end, and is distinguished by whether a `done` or `error` event arrived.
+   */
+  async function runTurn(content: string, regenerate: boolean) {
+    setStreaming(true);
+    setNotice(null);
+    activeStep.current = null;
+    liveTurn.current = null;
+    turnDone.current = false;
+    scroller.pin();
+
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    try {
+      const res = await fetch(`/api/chat/${projectId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: ac.signal,
+        body: JSON.stringify({
+          content,
+          language,
+          dataset_id: datasetId || null,
+          thread_id: threadRef.current ?? null,
+          effort,
+          model: model || null,
+          regenerate,
+          services,
+        }),
       });
+      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => "request failed"));
+      await drainStream(res.body);
+      await followUntilDone(ac);
 
       // Let the smoother land the tail naturally rather than dumping it.
       stream.finish();
@@ -707,10 +1193,28 @@ export default function ChatClient({
         appendText(`\n\n⚠ ${(err as Error).message}`);
       }
     } finally {
-      if (activeStep.current) endStep("ok");
+      // Close every step still marked running, not only the most recent one:
+      // a turn can end with several concurrent tools open (or with one left
+      // open by an aborted stream), and a chip that spins forever is the
+      // clearest possible way to tell the user a finished turn is still going.
+      patchBlocks((blocks) =>
+        blocks.map((b) =>
+          isStep(b) && b.state === "running"
+            ? {
+                ...b,
+                state: "done" as const,
+                endedAt: Date.now(),
+                substeps: b.substeps.map((x) =>
+                  x.state === "running" ? { ...x, state: "done" as const } : x,
+                ),
+              }
+            : b,
+        ),
+      );
+      activeStep.current = null;
       const rest = stream.flushNow();
       if (rest) appendText(rest);
-      patchLast((m) => ({ ...m, pending: false }));
+      patchLast((m) => ({ ...m, pending: false, phase: undefined }));
       abortRef.current = null;
       setStreaming(false);
       // The turn is over, so there is nothing left to redirect.
@@ -757,17 +1261,36 @@ export default function ChatClient({
 
   /* ------------------------------------------------------------ derived UI */
 
+  /*
+    EVERYTHING BELOW IS DERIVED FROM THE WHOLE TRANSCRIPT, AND NONE OF IT IS
+    URGENT.
+
+    `payload`, `counts`, `railTurns` and `contextUsed` each walk every turn in
+    the conversation. Computed from `turns` directly they ran on every streamed
+    chunk — sixty times a second, over a transcript that only grows — to update
+    a panel badge, a rail label and a context gauge, none of which anyone reads
+    while text is arriving. On a long chat that is the single largest per-token
+    cost in this component, and it is spent on the least important pixels.
+
+    `useDeferredValue` lets React render the growing text at normal priority and
+    recompute these once the burst settles. The numbers lag by a frame or two
+    during a stream and are exact the moment it stops, which is the correct
+    trade for a badge.
+  */
+  const settledTurns = useDeferredValue(turns);
+
   const payload = useMemo(
     () => ({
-      artifacts: turns.flatMap(turnArtifacts),
-      images: turns.flatMap((t) => t.images) as WebImage[],
-      citations: turns.flatMap((t) => t.citations) as Citation[],
+      previewUrl,
+      artifacts: settledTurns.flatMap(turnArtifacts),
+      images: settledTurns.flatMap((t) => t.images) as WebImage[],
+      citations: settledTurns.flatMap((t) => t.citations) as Citation[],
       datasets,
       // The canvas panel loads its own document rather than reading from the
       // turn stream, so it needs the project it belongs to.
       projectId,
     }),
-    [turns, datasets, projectId],
+    [settledTurns, datasets, projectId, previewUrl],
   );
 
   const counts = useMemo(() => panelCounts(payload), [payload]);
@@ -776,9 +1299,9 @@ export default function ChatClient({
   // Same chars/token ratio the server budgets with, so the gauge and the actual
   // trimming decision never disagree.
   const contextUsed = useMemo(() => {
-    const chars = turns.reduce((n, t) => n + turnText(t).length, 0);
+    const chars = settledTurns.reduce((n, t) => n + turnText(t).length, 0);
     return Math.ceil(chars / 3.6);
-  }, [turns]);
+  }, [settledTurns]);
 
   const markAnswered = useCallback((id: string) => {
     setTurns((prev) =>
@@ -795,12 +1318,12 @@ export default function ChatClient({
 
   const railTurns = useMemo(
     () =>
-      turns.map((t) => ({
+      settledTurns.map((t) => ({
         id: t.id,
         role: t.role,
         label: (turnText(t) || "…").slice(0, 90),
       })),
-    [turns],
+    [settledTurns],
   );
 
   // Track which turn is in view for the rail.
@@ -916,9 +1439,18 @@ export default function ChatClient({
           */}
           <div
             className="pad-chrome-top mx-auto w-full min-w-0 max-w-chat px-4"
-            style={{ paddingBottom: "calc(11rem + var(--safe-bottom) + var(--kb-inset))" }}
+            /*
+              Cleared against the composer's MEASURED height (published as
+              --composer-h, which already includes the safe area and any bar
+              stacked above the input), not a constant. The constant was 11rem,
+              correct only for a one-line input.
+            */
+            style={{
+              paddingBottom:
+                "calc(var(--composer-h, 9.5rem) + 1.75rem + var(--kb-inset))",
+            }}
           >
-            {empty && <EmptyState language={language} mode={mode} />}
+            {empty && <EmptyState language={language} mode={mode} onPick={setInput} />}
             {turns.map((turn, i) =>
               turn.role === "user" ? (
                 <UserTurn
@@ -945,6 +1477,8 @@ export default function ChatClient({
                 />
               ),
             )}
+
+            {notice && <Notice tone="warn" text={notice} />}
 
             {trimmed && !rolled && (
               <Notice
@@ -985,35 +1519,54 @@ export default function ChatClient({
           language={language}
         />
 
-        {/* scroll to bottom — only when detached */}
+        {/* Back to the bottom — only when detached.
+            While a turn is still writing, this is not a navigation control but
+            a REJOIN control: the answer is growing somewhere the reader cannot
+            see, and a bare arrow does not say that. The label appears only
+            while streaming, so a user scrolling back through a finished
+            transcript gets the quiet arrow and nothing to read. */}
         <button
           onClick={() => scroller.pin("smooth")}
           aria-label={language === "sw" ? "Nenda chini" : "Scroll to bottom"}
-          /* Rides above the composer, so it tracks the keyboard too. */
-          style={{ bottom: "calc(8rem + var(--safe-bottom) + var(--kb-inset))" }}
-          className={`absolute left-1/2 z-30 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-border bg-surface text-fg-muted shadow-soft transition-all duration-slow ease-expo hover:border-accent-line hover:text-fg ${
+          /* Rides above the composer, so it tracks both the keyboard and a
+             composer that has grown (a long draft, the steering bar). */
+          style={{ bottom: "calc(var(--composer-h, 9.5rem) + 0.6rem + var(--kb-inset))" }}
+          className={`absolute left-1/2 z-30 flex h-9 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-surface px-3 shadow-soft transition-all duration-slow ease-expo ${
+            streaming
+              ? "border-accent-line text-accent hover:bg-accent-soft"
+              : "border-border text-fg-muted hover:border-accent-line hover:text-fg"
+          } ${
             scroller.pinned
               ? "pointer-events-none translate-y-3 scale-90 opacity-0"
               : "translate-y-0 scale-100 opacity-100"
           }`}
         >
           <IcoArrowDown size={16} />
+          {streaming && (
+            <span className="text-[11.5px] font-medium">
+              {language === "sw" ? "Bado inaandika" : "Still writing"}
+            </span>
+          )}
         </button>
 
-        {/* Redirect the model while it is still working. Only while a turn is
-            live, and directly above the composer — where the user's hands
-            already are when they see it going the wrong way. */}
-        {streaming && steerTurn && (
-          <SteerBar language={language} note={steerNote} onSteer={sendSteer} />
-        )}
-
-        {/* Live voice, ambient listening and screen sharing. Collapsed to a
-            single button until started — a chat that permanently shows
-            microphone controls implies the microphone is already doing
-            something. */}
-        {!streaming && <LiveBar projectId={projectId} language={language} />}
-
         <Composer
+          /*
+            Both of these are handed to the composer rather than rendered beside
+            it. As siblings they sat in normal flow at the bottom of this
+            column, underneath an absolutely-positioned composer at the same
+            coordinates — so the bar for redirecting a running turn and the
+            entry point to voice and screen sharing were both painted over and
+            unreachable. Inside the overlay they are visible, they sit exactly
+            where the user's hands already are, and their height is included in
+            the measurement the transcript pads against.
+          */
+          above={
+            streaming && steerTurn ? (
+              <SteerBar language={language} note={steerNote} onSteer={sendSteer} />
+            ) : !streaming ? (
+              <LiveBar projectId={projectId} language={language} />
+            ) : null
+          }
           input={input}
           setInput={setInput}
           onSend={() => send()}
@@ -1049,7 +1602,22 @@ export default function ChatClient({
 
 /* -------------------------------------------------------------------- turns */
 
-function UserTurn({
+/*
+  MEMOISED, AND THE REASON MATTERS.
+
+  `patchLast` copies the turns array but replaces only the last element, so
+  every earlier turn keeps its object identity across a streamed chunk. With
+  these components memoised, a token therefore re-renders exactly one turn
+  instead of the entire conversation — which is what makes the text arrive
+  smoothly in a chat that has been going for an hour rather than progressively
+  more slowly.
+
+  This only holds while the props are stable. `onOpenArtifact`, `onAnswered`
+  and `register` are all `useCallback`s over stable dependencies; if you add a
+  prop here, give it the same treatment or you have quietly turned memoisation
+  off for the whole transcript.
+*/
+const UserTurn = memo(function UserTurn({
   turn,
   language,
   onEdit,
@@ -1119,9 +1687,9 @@ function UserTurn({
       )}
     </div>
   );
-}
+});
 
-function AssistantTurn({
+const AssistantTurn = memo(function AssistantTurn({
   turn,
   language,
   streaming,
@@ -1139,22 +1707,75 @@ function AssistantTurn({
   register: (id: string, el: HTMLElement | null) => void;
 }) {
   const nothingYet = turn.blocks.length === 0 && !turn.thinking;
+  // Computed once. Calling `groupBlocks` again inside the map to answer
+  // "is this the last entry" would walk the whole timeline on every entry, on
+  // every render, during streaming.
+  const grouped = groupBlocks(turn.blocks);
 
   return (
     <div ref={(el) => register(turn.id, el)} data-turn-id={turn.id} className="animate-rise mb-2">
+      {turn.plan && (
+        <PlanRail plan={turn.plan} language={language} live={turn.pending} />
+      )}
+
       {turn.thinking && <Reasoning text={turn.thinking} active={turn.pending} language={language} />}
 
       {/* The block timeline: prose, work, questions and generated output,
-          interleaved in the order they actually happened. */}
-      {turn.blocks.map((b, i) => {
-        if (isText(b)) {
-          return b.text.trim() ? (
-            <Markdown
-              key={b.id}
-              text={b.text}
-              streaming={streaming && i === turn.blocks.length - 1}
+          interleaved in the order they actually happened.
+
+          Adjacent steps are handed to StepGroup TOGETHER rather than rendered
+          one by one. Grouping is the only thing that changes; the ordering is
+          untouched, because a group ends the moment anything that is not a step
+          appears. A run of twelve consecutive lookups becomes one line the
+          reader can skip past, while a step-then-prose-then-step sequence still
+          reads as three separate things, which is what it is. */}
+      {grouped.map((entry, i) => {
+        // WHERE THE WORK ENDS AND THE ANSWER BEGINS.
+        //
+        // A user turn is introduced by "You" over a hairline. An assistant turn
+        // had nothing: after five step chips the prose simply started, at the
+        // same indent and with the same gap as everything above it, so a reader
+        // scanning back through a long transcript had no landmark for the part
+        // they actually wanted. This draws the same rule before the first prose
+        // that FOLLOWS work — not before a turn that opens with prose, where
+        // there is nothing to separate it from and a label would be noise.
+        const answerStarts =
+          entry.kind === "block" &&
+          isText(entry.block) &&
+          entry.block.text.trim().length > 0 &&
+          grouped.slice(0, i).some((e) => e.kind === "steps") &&
+          !grouped.slice(0, i).some((e) => e.kind === "block" && isText(e.block) &&
+            e.block.text.trim().length > 0);
+
+        const marker = answerStarts ? (
+          <div key="answer-rule" className="mb-2 mt-5 flex items-center gap-2">
+            <span className="eyebrow">{language === "sw" ? "Jibu" : "Answer"}</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        ) : null;
+
+        if (entry.kind === "steps") {
+          return (
+            <StepGroup
+              key={entry.key}
+              steps={entry.steps}
+              language={language}
               onOpenArtifact={onOpenArtifact}
             />
+          );
+        }
+        const b = entry.block;
+        const isLast = i === grouped.length - 1;
+        if (isText(b)) {
+          return b.text.trim() ? (
+            <div key={b.id}>
+              {marker}
+              <Markdown
+                text={b.text}
+                streaming={streaming && isLast}
+                onOpenArtifact={onOpenArtifact}
+              />
+            </div>
           ) : null;
         }
         if (isAsk(b)) {
@@ -1167,25 +1788,27 @@ function AssistantTurn({
             />
           );
         }
-        if (isArtifactBlock(b)) {
-          return (
-            <InlineArtifact
-              key={b.id}
-              artifact={b.artifact}
-              language={language}
-              onOpen={onOpenArtifact}
-            />
-          );
-        }
-        return <StepChip key={b.id} step={b} language={language} onOpenArtifact={onOpenArtifact} />;
+        return (
+          <InlineArtifact
+            key={b.id}
+            artifact={b.artifact}
+            language={language}
+            onOpen={onOpenArtifact}
+          />
+        );
       })}
 
       {/* No prebuilt loader. Just an honest, unbounded presence indicator that
           says "still here" without implying a duration. */}
-      {turn.pending && nothingYet && (
+      {turn.pending && (nothingYet || turn.phase === "planning" || turn.phase === "reviewing") && (
         <div className="flex items-center gap-2 py-1">
           <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-accent" />
           <span className="h-px w-8 bg-border" />
+          {turn.phase && (
+            <span className="text-2xs uppercase tracking-widest text-fg-faint">
+              {phaseLabel(turn.phase, language)}
+            </span>
+          )}
         </div>
       )}
 
@@ -1202,6 +1825,64 @@ function AssistantTurn({
       )}
     </div>
   );
+});
+
+/**
+ * Collapse runs of ADJACENT step blocks into single entries.
+ *
+ * Everything else passes through untouched and in order, so this cannot change
+ * what the transcript says — only how many boxes it is drawn in. A group ends
+ * at the first block that is not a step, which is what keeps prose written
+ * between two tool calls separating them on screen the way it separated them in
+ * time.
+ */
+type Grouped =
+  | { kind: "steps"; key: string; steps: StepBlock[] }
+  | { kind: "block"; block: Exclude<Block, StepBlock> };
+
+function groupBlocks(blocks: Block[]): Grouped[] {
+  const out: Grouped[] = [];
+  let run: StepBlock[] = [];
+
+  const flush = () => {
+    if (!run.length) return;
+    out.push({ kind: "steps", key: `g-${run[0].id}`, steps: run });
+    run = [];
+  };
+
+  for (const b of blocks) {
+    if (isStep(b)) {
+      run.push(b);
+      continue;
+    }
+    flush();
+    out.push({ kind: "block", block: b });
+  }
+  flush();
+  return out;
+}
+
+/**
+ * What the supervisor is doing between bursts of visible work.
+ *
+ * Planning and reviewing are model calls whose output is deliberately NOT
+ * streamed — they are scaffolding, not the answer. Without a label the reader
+ * sees ten silent seconds and concludes the thing has hung.
+ */
+function phaseLabel(phase: string, language: Language): string {
+  const sw: Record<string, string> = {
+    planning: "inapanga",
+    working: "inafanya kazi",
+    reviewing: "inakagua kazi",
+    repairing: "inarekebisha",
+  };
+  const en: Record<string, string> = {
+    planning: "planning",
+    working: "working",
+    reviewing: "checking its work",
+    repairing: "fixing what the check found",
+  };
+  return (language === "sw" ? sw : en)[phase] ?? phase;
 }
 
 function Reasoning({
@@ -1306,19 +1987,136 @@ function Sources({ citations, language }: { citations: Citation[]; language: Lan
   );
 }
 
-function EmptyState({ language, mode }: { language: Language; mode: string }) {
+/**
+ * Openings offered on an empty chat.
+ *
+ * Each one is a real capability that nobody discovers by looking at a text box.
+ * A new user's model of this product is "a chat window", and every day they
+ * hold that model is a day they do not upload a dataset, do not ask for
+ * something they can drag, and do not find out that it will build and run
+ * software. A blank page with a tagline does nothing to change that.
+ *
+ * Written as things a person would actually type, in the first person, not as
+ * feature names. "Build me a simulation of…" teaches the capability by being an
+ * example of using it; "Interactive simulations" teaches a menu.
+ */
+const OPENINGS: Record<
+  "student" | "researcher",
+  { sw: string; en: string; hint: [string, string] }[]
+> = {
+  student: [
+    {
+      sw: "Nifafanulie [dhana] kwa mfano wa Kitanzania, kisha unipe swali la kujipima.",
+      en: "Explain [a concept] with a Tanzanian example, then give me one question to test myself.",
+      hint: ["kufundisha", "teaching"],
+    },
+    {
+      sw: "Nitengenezee uigaji ninaoweza kucheza nao ili nielewe [dhana].",
+      en: "Build me something I can drag a slider on so I can feel how [X] works.",
+      hint: ["uigaji", "simulation"],
+    },
+    {
+      sw: "Nipe maswali ya mazoezi ya mtihani kuhusu [mada], kisha uyasahihishe.",
+      en: "Set me exam-style practice on [topic], then mark it honestly.",
+      hint: ["mtihani", "exam"],
+    },
+    {
+      sw: "Nisaidie kupanga ratiba ya marudio hadi mtihani wangu tarehe […].",
+      en: "Help me plan revision between now and my exam on [date].",
+      hint: ["ratiba", "planning"],
+    },
+  ],
+  researcher: [
+    {
+      sw: "Nimepakia data yangu — ichunguze, kisha uniambie tatizo lililopo ndani yake.",
+      en: "I have uploaded my data — profile it, then tell me what is wrong with it.",
+      hint: ["data", "analysis"],
+    },
+    {
+      sw: "Nifanyie mapitio ya maandiko kuhusu [mada] na unionyeshe pengo lililopo.",
+      en: "Review the literature on [topic] and show me where the gap is.",
+      hint: ["maandiko", "literature"],
+    },
+    {
+      sw: "Nijengee ramani ya dhana inayoonyesha jinsi tafiti hizi zinavyohusiana.",
+      en: "Map how these studies relate to each other so I can see the argument.",
+      hint: ["ramani", "graph"],
+    },
+    {
+      sw: "Jenga na uendeshe programu inayochakata faili zangu za uwandani.",
+      en: "Build and actually run a script that processes my field data files.",
+      hint: ["programu", "software"],
+    },
+  ],
+};
+
+function EmptyState({
+  language,
+  mode,
+  onPick,
+}: {
+  language: Language;
+  mode: string;
+  onPick: (text: string) => void;
+}) {
+  const sw = language === "sw";
+  const openings = OPENINGS[mode === "researcher" ? "researcher" : "student"];
+
   return (
-    <div className="flex min-h-[52vh] flex-col items-center justify-center text-center">
+    /* The wordmark and the floating chat switcher are both centred, so without
+       this clearance they land on each other on an empty chat — the one screen
+       where there is no text to fade under the rail and hide the collision. */
+    <div
+      className="flex flex-col items-center justify-center"
+      style={{
+        minHeight: "52vh",
+        paddingTop: "calc(var(--float-top) + var(--float-h) + 1.25rem)",
+      }}
+    >
       <WeaveMark size="lg" className="text-fg" duration={2600} />
-      <p className="mt-6 max-w-sm font-read text-[15px] italic leading-relaxed text-fg-muted">
+      <p className="mt-6 max-w-sm text-center font-read text-[15px] italic leading-relaxed text-fg-muted">
         {mode === "researcher"
-          ? language === "sw"
+          ? sw
             ? "Hali ya mtafiti — majibu ya moja kwa moja yenye rejea."
             : "Researcher mode — direct answers, strictly cited."
-          : language === "sw"
+          : sw
             ? "Hali ya mwanafunzi — mwongozo hatua kwa hatua."
             : "Student mode — guided, step by step."}
       </p>
+
+      <div className="mt-9 w-full max-w-lg">
+        <div className="eyebrow mb-2.5 flex items-center gap-2">
+          <span>{sw ? "Jaribu" : "Try"}</span>
+          <span className="h-px flex-1 bg-border" />
+        </div>
+        <ul className="space-y-px">
+          {openings.map((o) => {
+            const text = sw ? o.sw : o.en;
+            return (
+              <li key={o.en}>
+                {/*
+                  Fills the composer rather than sending. Every one of these has
+                  a bracket in it that only the user can fill, and sending it
+                  verbatim would ask the assistant about "[topic]" — which is
+                  both useless and a small lesson that the suggestions do not
+                  work.
+                */}
+                <button
+                  onClick={() => onPick(text)}
+                  className="group flex w-full items-center gap-3 border-l-2 border-border py-2 pl-3 pr-2 text-left transition-all duration-fast ease-soft hover:border-accent hover:bg-surface-2/50"
+                >
+                  <span className="min-w-0 flex-1 font-read text-[14.5px] leading-snug text-fg-muted transition-colors duration-fast group-hover:text-fg">
+                    {text}
+                  </span>
+                  <span className="eyebrow flex-shrink-0 opacity-0 transition-opacity duration-fast group-hover:opacity-100">
+                    {sw ? o.hint[0] : o.hint[1]}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
     </div>
   );
 }

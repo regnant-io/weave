@@ -101,6 +101,12 @@ export function renderSimulation({ spec = {}, title = "Simulation", theme = "lig
       xmax: Number(spec.view?.xmax ?? spec.x?.max ?? 10),
       ymin: Number(spec.view?.ymin ?? -1),
       ymax: Number(spec.view?.ymax ?? 10),
+      // Whether the y-window was CHOSEN or defaulted. A default window is
+      // almost always wrong for a parameterised simulation: the whole point is
+      // that dragging a slider changes the shape of the answer, and a fixed
+      // window means half the slider range draws a curve that leaves the top of
+      // the chart. Recorded here so the page can fit the window to the data.
+      autoY: spec.view?.ymin === undefined && spec.view?.ymax === undefined,
     },
     readouts: (spec.readouts || []).slice(0, 6).map((r) => ({
       label: String(r.label ?? ""),
@@ -166,7 +172,12 @@ var W=0,H=0,DPR=1;
 function resize(){
   DPR = Math.min(2, window.devicePixelRatio||1);
   var rect = cv.getBoundingClientRect();
-  W = Math.max(320, rect.width|0); H = Math.round(W*0.58);
+  W = Math.max(320, rect.width|0);
+  // Fill the room the artifact frame actually gives us. A fixed 0.58 aspect
+  // ratio left a third of the panel empty below the chart on every desktop
+  // viewport, which reads as an unfinished layout rather than a deliberate one.
+  var avail = (window.innerHeight || 640) - rect.top - 28;
+  H = Math.max(260, Math.min(Math.round(W*0.95), Math.round(avail)));
   cv.width = W*DPR; cv.height = H*DPR; cv.style.height = H+'px';
   ctx.setTransform(DPR,0,0,DPR,0,0);
   draw();
@@ -301,9 +312,45 @@ function updateReadouts(){
   });
 }
 
+/**
+ * Fit the y-window to what is actually being drawn.
+ *
+ * Only when the spec did not choose one. A projectile launched at 45 degrees
+ * and 50 m/s peaks around 64m; the default window stops at 10, so the curve
+ * left the top of the chart and the simulation looked broken while being
+ * arithmetically perfect. Refitting on every parameter change is what makes the
+ * sliders worth dragging.
+ */
+function fitY(){
+  if(!V.autoY) return;
+  var lo=Infinity, hi=-Infinity, n=CFG.x.samples;
+  var saved = scope[CFG.x.name];
+  curves.forEach(function(cc){
+    for(var i=0;i<=n;i++){
+      var xv = V.xmin + (V.xmax-V.xmin)*i/n;
+      scope[CFG.x.name] = xv;
+      var yv = cc.f(scope);
+      if(isFinite(yv)){ if(yv<lo) lo=yv; if(yv>hi) hi=yv; }
+    }
+  });
+  scope[CFG.x.name] = saved;
+  bodies.forEach(function(bb){
+    var yv = bb.fy(scope);
+    if(isFinite(yv)){ if(yv<lo) lo=yv; if(yv>hi) hi=yv; }
+  });
+  if(!isFinite(lo) || !isFinite(hi)) return;
+  if(hi - lo < 1e-9){ hi = lo + 1; }
+  var pad = (hi - lo) * 0.12;
+  V.ymin = lo - pad;
+  V.ymax = hi + pad;
+  // Don't invent ground below zero for a quantity that never goes negative:
+  // a height axis starting at -8m reads as an error.
+  if(lo >= 0) V.ymin = 0;
+}
+
 function draw(){
   if(CFG.mode==='bar'){ drawBars(); }
-  else { axes(); drawField(); drawCurves(); drawBodies(); }
+  else { fitY(); axes(); drawField(); drawCurves(); drawBodies(); }
   updateReadouts();
 }
 
