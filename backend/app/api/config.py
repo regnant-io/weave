@@ -1,10 +1,12 @@
 """Runtime config + model discovery + artifact serving."""
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from ..config import settings
-from ..deps import get_current_user
+from ..deps import get_admin_user, get_current_user
 from ..models import User
 from ..runtime import EFFORT_SPEC, current, set_ollama
 from ..schemas import OllamaConfig
@@ -23,7 +25,8 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
     from ..services.orchestration.llm import OllamaEngine, get_engine
     engine = get_engine()
     ollama = engine if getattr(engine, "name", "") == "ollama" else None
-    if ollama is None:
+    offline_only = settings.force_offline_llm or settings.llm_backend.lower() == "offline"
+    if ollama is None and not offline_only:
         try:
             ollama = OllamaEngine()
         except Exception:  # noqa: BLE001 - no Ollama configured; empty picker
@@ -89,12 +92,22 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
 
 
 @router.get("/ollama")
-def get_ollama(_user: User = Depends(get_current_user)) -> dict:
+def get_ollama(_user: User = Depends(get_admin_user)) -> dict:
     return current()
 
 
 @router.post("/ollama")
-def set_ollama_config(body: OllamaConfig, _user: User = Depends(get_current_user)) -> dict:
+def set_ollama_config(body: OllamaConfig, _user: User = Depends(get_admin_user)) -> dict:
+    if settings.is_deployed:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "runtime model-host changes are disabled when deployed; update the environment",
+        )
+    if body.host:
+        parsed = urlparse(body.host)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                "Ollama host must be an http(s) URL without credentials")
     set_ollama(host=body.host, model=body.model)
     return current()
 
@@ -113,16 +126,15 @@ _MIME_BY_EXT = {
 
 
 @router.get("/artifacts/{key:path}")
-def get_artifact(key: str, sig: str = "") -> Response:
+def get_artifact(key: str, sig: str = "", exp: int = 0) -> Response:
     """Serve a stored artifact. Requires a valid HMAC signature (sig) so URLs
     can't be forged or enumerated; served without a session so <img>/<iframe>
     can load it directly."""
     from ..security import verify_path
-    if not verify_path(key, sig):
+    if not verify_path(key, sig, exp):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid signature")
     if not storage.exists(key):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found")
-    data = storage.get_bytes(key)
     ext = "." + key.rsplit(".", 1)[-1].lower() if "." in key else ""
     mime = _MIME_BY_EXT.get(ext, "application/octet-stream")
     # `private`, not `public`. The signature in the URL is the capability, so a
@@ -130,5 +142,25 @@ def get_artifact(key: str, sig: str = "") -> Response:
     # work under a key anyone holding that URL can replay. Browser caching --
     # which is what actually matters for an iframe reloading a 3D scene -- is
     # unaffected.
-    return Response(content=data, media_type=mime,
-                    headers={"Cache-Control": "private, max-age=86400"})
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+    if mime == "text/html":
+        # Iframe sandboxing disappears when a user opens the artifact in a new
+        # tab. A CSP sandbox is carried by the response itself, so generated
+        # code keeps an opaque origin and cannot call the authenticated BFF in
+        # either presentation. Artifacts are self-contained by contract.
+        headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts allow-downloads allow-pointer-lock; default-src 'none'; "
+            "script-src 'unsafe-inline' 'unsafe-eval' blob:; style-src 'unsafe-inline'; "
+            "img-src data: blob:; font-src data:; media-src data: blob:; "
+            "worker-src blob:; connect-src data: blob:; frame-src 'none'; object-src 'none'"
+        )
+    elif mime == "image/svg+xml":
+        headers["Content-Security-Policy"] = (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        )
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(storage.iter_bytes(key), media_type=mime, headers=headers)

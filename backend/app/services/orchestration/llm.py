@@ -14,6 +14,7 @@ The active engine is chosen at startup and exposed via get_engine().
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -1026,6 +1027,36 @@ class OfflineEngine:
         return head + body + charts
 
     def _generic_help(self, user_text: str, sw: bool, mode: str) -> str:
+        question = user_text.lower()
+        # Keep the no-service fallback useful for common statistics lessons.
+        # These are stable definitions, not fabricated local facts.
+        if "median" in question:
+            return (
+                "Mediani ni thamani ya katikati baada ya kupanga data kwa mpangilio. "
+                "Wastani hupatikana kwa kujumlisha thamani zote na kugawanya kwa idadi yake; "
+                "kwa hiyo wastani huathiriwa zaidi na thamani zilizopitiliza."
+                if sw else
+                "The median is the middle value after ordering the data. The mean is the "
+                "sum of all values divided by their count, so extreme values affect the mean more."
+            )
+        if "wastani" in question or re.search(r"\bmean\b", question):
+            return (
+                "Wastani ni jumla ya thamani zote ikigawanywa kwa idadi ya thamani. "
+                "Kwa mfano, 2, 4 na 6 zina jumla 12; ukigawanya kwa 3 unapata wastani 4."
+                if sw else
+                "The mean is the sum of all values divided by the number of values. "
+                "For example, 2, 4, and 6 sum to 12; dividing by 3 gives a mean of 4."
+            )
+        if "regression" in question or "urejeleaji" in question:
+            return (
+                "Urejeleaji (regression) ni mbinu ya kukadiria uhusiano kati ya kigezo cha "
+                "matokeo na kigezo kimoja au zaidi cha maelezo. Mgawo huonyesha mwelekeo "
+                "na ukubwa wa uhusiano, pamoja na kutokuwa na uhakika kwake."
+                if sw else
+                "Regression estimates the relationship between an outcome and one or more "
+                "explanatory variables. Its coefficients describe the direction and size "
+                "of that relationship together with its uncertainty."
+            )
         if sw:
             return (
                 "Nipo hapa kukusaidia na masomo na utafiti kwa Kiswahili na Kiingereza. "

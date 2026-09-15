@@ -1,22 +1,76 @@
 """Admin / ops dashboard API (architecture 4.2 /admin, §7.4 ingestion, §8.4 audit).
 
-Gated to admin/institutional users. Surfaces the operational data the platform
+Gated to explicit admin users. Surfaces the operational data the platform
 already records (sandbox audit log, source library / ingestion status) and lets
 an operator trigger ingestion.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import get_admin_user
-from ..models import (AnalysisRun, CrawlPage, CrawlSeed, Dataset, Message, Project,
-                      SandboxAudit, Source, SourceChunk, User)
+from ..models import (AdminInvitation, AnalysisRun, CrawlPage, CrawlSeed, Dataset,
+                      JobRecord, Message, OutboxEvent, Project, SandboxAudit,
+                      Source, SourceChunk, User)
+from ..schemas import AdminInviteCreate
+from ..security import hash_refresh_token, new_refresh_token
 from ..tasks import dispatch
 
 router = APIRouter()
+
+
+@router.post("/invitations", status_code=201)
+def create_admin_invitation(body: AdminInviteCreate, db: Session = Depends(get_db),
+                            admin: User = Depends(get_admin_user)) -> dict:
+    if not body.email and not body.phone:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "email or phone is required")
+    raw = new_refresh_token()
+    invite = AdminInvitation(
+        token_hash=hash_refresh_token(raw), email=body.email, phone=body.phone,
+        invited_by=admin.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=body.expires_in_hours),
+    )
+    db.add(invite)
+    db.commit()
+    return {"id": invite.id, "token": raw, "expires_at": invite.expires_at}
+
+
+@router.get("/jobs")
+def jobs(limit: int = 100, db: Session = Depends(get_db),
+         _admin: User = Depends(get_admin_user)) -> list[dict]:
+    rows = db.query(JobRecord).order_by(JobRecord.created_at.desc()).limit(min(limit, 500)).all()
+    return [{"id": r.id, "kind": r.kind, "owner_id": r.owner_id,
+             "project_id": r.project_id, "status": r.status,
+             "attempts": r.attempts, "error": r.error,
+             "updated_at": r.updated_at} for r in rows]
+
+
+@router.get("/metrics")
+def operational_metrics(db: Session = Depends(get_db),
+                        _admin: User = Depends(get_admin_user)) -> dict:
+    from ..metrics import snapshot
+    jobs_by_state = dict(db.query(JobRecord.status, func.count()).group_by(JobRecord.status).all())
+    outbox_by_state = dict(db.query(OutboxEvent.status, func.count()).group_by(OutboxEvent.status).all())
+    return {"runtime": snapshot(), "jobs": jobs_by_state, "outbox": outbox_by_state}
+
+
+@router.post("/outbox/{event_id}/retry")
+def retry_outbox(event_id: str, db: Session = Depends(get_db),
+                 _admin: User = Depends(get_admin_user)) -> dict:
+    event = db.get(OutboxEvent, event_id)
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "outbox event not found")
+    if event.status == "delivered":
+        return {"job_id": None, "status": "already_delivered"}
+    event.status = "pending"
+    db.add(event)
+    db.commit()
+    return {"job_id": dispatch("weave.deliver_outbox", event.id), "status": "queued"}
 
 
 def _seed_out(db: Session, s: CrawlSeed) -> dict:
@@ -75,8 +129,9 @@ def trigger_ingest(body: dict, db: Session = Depends(get_db), _admin: User = Dep
     """Ingest a URL now (creates the Source + chunks) or re-ingest an existing source."""
     from ..services.ingestion import get_ingestion
     if body.get("source_id"):
-        job = dispatch("weave.ingest_source", body["source_id"])
-        return {"queued": job, "source_id": body["source_id"]}
+        job = dispatch("weave.ingest_source", body["source_id"],
+                       job_owner_id=_admin.id)
+        return {"job_id": job, "source_id": body["source_id"]}
     url = body.get("url")
     if not url:
         return {"error": "provide url or source_id"}
@@ -194,8 +249,8 @@ def run_seed(seed_id: str, db: Session = Depends(get_db),
     seed.last_error = ""
     db.add(seed)
     db.commit()
-    handle = dispatch("weave.crawl_seed", seed_id)
-    return {"started": True, "mode": handle, "seed_id": seed_id,
+    handle = dispatch("weave.crawl_seed", seed_id, job_owner_id=_admin.id)
+    return {"started": True, "job_id": handle, "seed_id": seed_id,
             "seed": _seed_out(db, seed)}
 
 

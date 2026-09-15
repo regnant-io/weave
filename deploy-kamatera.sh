@@ -53,7 +53,8 @@ fi
 
 # Configure ngrok
 echo "🔑 Configuring ngrok..."
-ngrok config add-authtoken 3H4wuqzRY3EcfGMJwif0rPscF4I_6h93bQynFGPkb7yRgSpc3
+: "${NGROK_AUTHTOKEN:?Set NGROK_AUTHTOKEN before running this script}"
+ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 
 # Setup app directory
 APP_DIR="/opt/weave"
@@ -64,70 +65,50 @@ sudo chown -R $USER:$USER $APP_DIR
 # Clone repository
 echo "📥 Cloning repository..."
 cd $APP_DIR
+REPO_URL="${WEAVE_REPOSITORY_URL:-https://github.com/regnant-io/weave.git}"
 if [ -d ".git" ]; then
     echo "Repository exists, pulling latest..."
-    git fetch origin
-    git reset --hard origin/master
+    git pull --ff-only
 else
-    git clone https://gitlab.com/daudi.abinallah/weave.git .
+    git clone "$REPO_URL" .
 fi
 
 # Verify clone
 if [ ! -f "docker-compose.yml" ]; then
     echo "❌ Error: docker-compose.yml not found"
-    echo "Repository may be incomplete. Check: https://gitlab.com/daudi.abinallah/weave"
+    echo "Repository may be incomplete. Check: $REPO_URL"
     exit 1
 fi
 
 echo "✅ Repository ready"
 
-# Create backend directory and .env
+# Create the root Compose environment.  Compose does not automatically pass a
+# backend/.env file into the backend container, so the old script generated
+# secrets that the running service never read.
 echo "⚙️  Configuring backend..."
-mkdir -p $APP_DIR/backend
-cat > $APP_DIR/backend/.env << 'EOF'
-DATABASE_URL=postgresql://weave:weave_secure_pass@postgres:5432/weave
-POSTGRES_USER=weave
-POSTGRES_PASSWORD=weave_secure_pass
-POSTGRES_DB=weave
-JWT_SECRET=$(openssl rand -hex 32)
-JWT_ALGORITHM=HS256
-JWT_EXPIRE_MINUTES=10080
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-LLM_MODEL=llama3.2:3b
-EMBEDDING_MODEL=nomic-embed-text
-CLICKHOUSE_URL=http://clickhouse:8123
-CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-MINIO_BUCKET=weave
-QDRANT_URL=http://qdrant:6333
-QDRANT_API_KEY=
-BROWSERLESS_URL=http://browserless:3000
-RENDER_SERVICE_URL=http://render:8080
-GOTENBERG_URL=http://gotenberg:3000
-SEARXNG_URL=http://searxng:8080
-ENVIRONMENT=production
-API_PREFIX=/api/v1
-CORS_ORIGINS=http://localhost:3000,https://*.ngrok-free.app
-ADMIN_PHONE=+255700000000
-ADMIN_EMAIL=admin@weave.local
-RATE_LIMIT_PER_MINUTE=60
-OTP_SECRET=$(openssl rand -hex 16)
-OTP_EXPIRE_SECONDS=300
-SANDBOX_BACKEND=host
-SANDBOX_TIMEOUT=30
+WEAVE_SECRET="$(openssl rand -hex 32)"
+POSTGRES_SECRET="$(openssl rand -hex 24)"
+cat > $APP_DIR/.env << EOF
+WEAVE_ENVIRONMENT=production
+WEAVE_DEBUG=false
+WEAVE_SECRET_KEY=$WEAVE_SECRET
+WEAVE_DATABASE_URL=postgresql+psycopg://weave:$POSTGRES_SECRET@postgres:5432/weave
+POSTGRES_PASSWORD=$POSTGRES_SECRET
+WEAVE_REDIS_URL=redis://redis:6379/0
+WEAVE_CORS_ORIGINS=["http://localhost:3000"]
+WEAVE_OLLAMA_HOST=http://host.docker.internal:11434
+WEAVE_OLLAMA_MODEL=llama3.2:3b
+WEAVE_OLLAMA_USE_EMBEDDINGS=true
+WEAVE_OLLAMA_EMBED_MODEL=nomic-embed-text
+WEAVE_SEARXNG_URL=http://searxng:8080
+WEAVE_BROWSERLESS_URL=http://browserless:3000
+WEAVE_RENDER_URL=http://render:3100
+WEAVE_GOTENBERG_URL=http://gotenberg:3000
+WEAVE_CLICKHOUSE_URL=http://clickhouse:8123
+WEAVE_ANALYSIS_EXECUTION_ENABLED=false
+WEAVE_WORKSPACE_ENABLED=false
 EOF
-
-# Create frontend directory and .env
-echo "⚙️  Configuring frontend..."
-mkdir -p $APP_DIR/frontend
-cat > $APP_DIR/frontend/.env.local << 'EOF'
-WEAVE_API_BASE=http://backend:8000
-NEXT_PUBLIC_API_BASE=http://localhost:8000
-NEXT_TELEMETRY_DISABLED=1
-EOF
+chmod 600 $APP_DIR/.env
 
 # Install Ollama
 echo "🤖 Installing Ollama..."
@@ -152,11 +133,11 @@ echo "✅ Models ready"
 # Build images
 echo "🏗️  Building Docker images..."
 cd $APP_DIR
-sudo docker-compose build
+sudo docker-compose -f docker-compose.yml build
 
 # Start services
 echo "🚀 Starting services..."
-sudo docker-compose --profile deep up -d
+sudo docker-compose -f docker-compose.yml --profile deep up -d
 
 # Wait for startup
 echo "⏳ Waiting for services..."
@@ -165,7 +146,7 @@ sleep 30
 # Check status
 echo ""
 echo "📊 Service status:"
-sudo docker-compose ps
+sudo docker-compose -f docker-compose.yml ps
 
 # Start ngrok
 echo ""
@@ -185,9 +166,9 @@ Server IP: $(curl -s ifconfig.me)
 Directory: $APP_DIR
 
 Commands:
-- View logs: cd $APP_DIR && sudo docker-compose logs -f
-- Restart: cd $APP_DIR && sudo docker-compose restart
-- Stop: cd $APP_DIR && sudo docker-compose down
+- View logs: cd $APP_DIR && sudo docker-compose -f docker-compose.yml logs -f
+- Restart: cd $APP_DIR && sudo docker-compose -f docker-compose.yml restart
+- Stop: cd $APP_DIR && sudo docker-compose -f docker-compose.yml down
 - Get ngrok URL: curl -s http://localhost:4040/api/tunnels | grep -o 'https://[^"]*ngrok-free.app' | head -1
 EOF
 
@@ -197,10 +178,11 @@ echo "✅ Deployment Complete!"
 echo "=========================================="
 echo ""
 echo "🌐 Frontend: $NGROK_URL"
-echo "🔧 Backend API: http://localhost:8000"
-echo "📚 API Docs: http://localhost:8000/docs"
+echo "🔧 Backend API (server loopback): http://127.0.0.1:8001"
+echo "⚠️  Live voice/canvas sockets require a TLS reverse proxy; see DEPLOY.md"
+echo "📚 API docs are disabled in production"
 echo ""
-echo "📝 Logs: sudo docker-compose logs -f"
+echo "📝 Logs: sudo docker-compose -f docker-compose.yml logs -f"
 echo "📄 Info: cat $APP_DIR/deployment-info.txt"
 echo ""
 echo "🎉 Weave is running!"

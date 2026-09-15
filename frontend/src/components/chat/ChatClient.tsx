@@ -32,7 +32,7 @@ import {
 } from "@/lib/chatTypes";
 import { contextFor, fetchCatalog, type ModelCatalog } from "@/lib/models";
 import PanelDock, { usePanelDock } from "./panels/PanelDock";
-import { categorise, PANEL_META, PANEL_ORDER, panelCounts, type PanelId } from "./panels/panels";
+import { categorise, PANEL_META, PANEL_ORDER, panelCounts } from "./panels/panels";
 import AskUserCard from "./AskUserCard";
 import Composer from "./Composer";
 import InlineArtifact from "./InlineArtifact";
@@ -470,11 +470,25 @@ export default function ChatClient({
    */
   const addArtifact = useCallback(
     (a: Artifact) => {
-      if (!a?.url || seenArtifacts.current.has(a.url)) return;
+      if (!a?.url) return;
+      if (seenArtifacts.current.has(a.url)) {
+        // Repair edits keep the same capability URL. A later event is therefore
+        // an updated verification state, not a duplicate to discard. Replacing
+        // the existing block also lets InlineArtifact's memo comparison redraw
+        // the badge and preview without inserting a second card.
+        patchBlocks((blocks) =>
+          blocks.map((block) =>
+            block.kind === "artifact" && block.artifact.url === a.url
+              ? { ...block, artifact: { ...block.artifact, ...a } }
+              : block,
+          ),
+        );
+        return;
+      }
       seenArtifacts.current.add(a.url);
       appendBlock({ kind: "artifact", id: nextId("art"), artifact: a });
     },
-    [appendBlock],
+    [appendBlock, patchBlocks],
   );
 
   const mutateStep = useCallback(
@@ -763,7 +777,7 @@ export default function ChatClient({
             // close the panel is respected.
             if (next && !previewSeen.current) {
               previewSeen.current = true;
-              dock.open.includes("preview") || dock.toggle("preview");
+              if (!dock.open.includes("preview")) dock.toggle("preview");
             }
             break;
           }

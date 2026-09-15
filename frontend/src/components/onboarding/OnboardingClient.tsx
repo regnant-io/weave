@@ -1,7 +1,6 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
 import type { Language, Mode } from "@/lib/types";
 import type { ServiceId, ServicePrefs } from "@/lib/services";
 import WeaveMark from "@/components/brand/WeaveMark";
@@ -72,7 +71,6 @@ export default function OnboardingClient({
   initialLanguage: Language;
   initialServices: ServicePrefs;
 }) {
-  const router = useRouter();
   const [step, setStep] = useState(0);
   const [language, setLanguage] = useState<Language>(initialLanguage);
   const [mode, setMode] = useState<Mode>("student");
@@ -136,6 +134,10 @@ export default function OnboardingClient({
     if (!res.ok) throw new Error(`could not save your preferences (${res.status})`);
   }
 
+  function navigateWithFreshCookies(path: string) {
+    window.location.assign(new URL(path, window.location.origin));
+  }
+
   function next() {
     if (step < STEPS.length - 1) setStep(step + 1);
   }
@@ -159,8 +161,10 @@ export default function OnboardingClient({
       if (!res.ok) throw new Error(await res.text().catch(() => "could not create project"));
       const data = await res.json().catch(() => ({}));
       const pid = data?.id ?? data?.project?.id;
-      router.push(pid ? `/app/chat/${pid}` : "/app/projects");
-      router.refresh();
+      // Force a document request after the preference response writes its
+      // routing cookie. A client transition may consume an RSC route prefetched
+      // before that cookie existed and bounce straight back to onboarding.
+      navigateWithFreshCookies(pid ? `/app/chat/${pid}` : "/app/projects");
     } catch (e) {
       // Onboarding must never trap the user. If project creation fails we still
       // saved their preferences, so let them into the app and surface why.
@@ -355,13 +359,13 @@ export default function OnboardingClient({
           {/*
             AWAIT the save before navigating.
 
-            This used to fire `savePrefs` and `router.push` in the same tick.
+            This used to fire `savePrefs` and navigation in the same tick.
             `savePrefs` is what writes the `weave_onboarded` cookie, and the
             route being pushed to is gated on that cookie — so the navigation
             raced the fetch, lost, and the gate sent the user straight back to
-            onboarding. Clicking Skip did nothing at all, forever, with no error
-            anywhere: the request succeeded, it just landed after the decision
-            that depended on it.
+            onboarding. We now await the cookie response and use a document
+            navigation so a prefetched RSC response cannot carry the old cookie
+            snapshot. Clicking Skip must always cross the routing gate once.
           */}
           <button
             onClick={async () => {
@@ -370,8 +374,7 @@ export default function OnboardingClient({
               setError("");
               try {
                 await savePrefs({ language, mode, services, onboarded: true });
-                router.push("/app/projects");
-                router.refresh();
+                navigateWithFreshCookies("/app/projects");
               } catch (e) {
                 setError((e as Error).message);
                 setBusy(false);

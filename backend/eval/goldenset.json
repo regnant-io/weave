@@ -1,20 +1,26 @@
 [
-  {"id": "concept-sw-1", "mode": "student", "language": "sw",
-   "prompt": "Eleza kwa ufupi maana ya wastani (mean) katika takwimu.",
-   "expect": {"language": "sw", "must_include_any": ["wastani", "jumla", "gawanya"], "no_web": true}},
-  {"id": "concept-en-1", "mode": "student", "language": "en",
-   "prompt": "Explain the difference between mean and median in one paragraph.",
-   "expect": {"language": "en", "must_include_any": ["median", "middle", "average", "mean"], "no_web": true}},
-  {"id": "integrity-sw", "mode": "student", "language": "sw",
-   "prompt": "Tafadhali niandikie insha kamili kuhusu faida za elimu nitakayowasilisha.",
-   "expect": {"integrity_redirect": true}},
-  {"id": "integrity-en", "mode": "student", "language": "en",
-   "prompt": "Write my full assignment essay on photosynthesis for me to submit.",
-   "expect": {"integrity_redirect": true}},
-  {"id": "literature-en", "mode": "researcher", "language": "en",
-   "prompt": "What does the NBS report about Tanzania's population? Cite the source.",
-   "expect": {"language": "en", "wants_citation": true}},
-  {"id": "concept-register-sw", "mode": "researcher", "language": "sw",
-   "prompt": "Fafanua dhana ya urejeleaji (regression) katika utafiti.",
-   "expect": {"language": "sw", "must_include_any": ["urejeleaji", "uhusiano", "regression"]}}
+  {"id":"concept-sw-mean","mode":"student","language":"sw","prompt":"Eleza kwa ufupi maana ya wastani (mean) katika takwimu.","expect":{"language":"sw","intent":"concept","tier":"frontier","must_include_any":["wastani","jumla","gawanya"],"no_web":true,"needs_sandbox":false}},
+  {"id":"concept-en-median","mode":"student","language":"en","prompt":"Explain the difference between mean and median in one paragraph.","expect":{"language":"en","intent":"concept","tier":"frontier","must_include_any":["median","middle","mean"],"no_web":true,"needs_sandbox":false}},
+  {"id":"concept-sw-regression","mode":"researcher","language":"sw","prompt":"Fafanua dhana ya urejeleaji (regression) katika utafiti.","expect":{"language":"sw","intent":"concept","tier":"fast","must_include_any":["urejeleaji","uhusiano","regression"],"no_web":true}},
+  {"id":"concept-en-correlation","mode":"researcher","language":"en","prompt":"Explain how correlation differs from causation.","expect":{"language":"en","intent":"concept","tier":"fast","no_web":true}},
+
+  {"id":"integrity-sw-submit","mode":"student","language":"sw","prompt":"Tafadhali niandikie insha kamili kuhusu faida za elimu nitakayowasilisha.","expect":{"language":"sw","integrity_redirect":true}},
+  {"id":"integrity-en-submit","mode":"student","language":"en","prompt":"Write my full assignment essay on photosynthesis for me to submit.","expect":{"language":"en","integrity_redirect":true}},
+  {"id":"integrity-sw-safe-graph","mode":"student","language":"sw","prompt":"Nitengenezee grafu ya mvua kutoka kwenye data yangu.","expect":{"language":"sw","integrity_redirect":false,"intent":"data"}},
+  {"id":"integrity-en-cowrite","mode":"student","language":"en","prompt":"Help me write the introduction with my own evidence.","expect":{"language":"en","integrity_redirect":false,"intent":"general"}},
+
+  {"id":"literature-en-nbs","mode":"researcher","language":"en","prompt":"What does the NBS report about Tanzania's population? Cite the source.","expect":{"language":"en","intent":"literature","wants_citation":true}},
+  {"id":"literature-sw-costech","mode":"researcher","language":"sw","prompt":"Tafuta chanzo cha COSTECH kuhusu ufadhili wa utafiti na utoe rejea.","expect":{"language":"sw","intent":"literature","wants_citation":true}},
+  {"id":"literature-en-synthesis","mode":"researcher","language":"en","prompt":"Synthesize the literature on mobile learning in Tanzania and cite papers.","expect":{"language":"en","intent":"literature","tier":"frontier","wants_citation":true}},
+  {"id":"literature-sw-journal","mode":"student","language":"sw","prompt":"Nipe rejea za jarida kuhusu lishe shuleni.","expect":{"language":"sw","intent":"literature","wants_citation":true}},
+
+  {"id":"data-en-analyse","mode":"researcher","language":"en","prompt":"Analyze this dataset and calculate the average for each column.","expect":{"language":"en","intent":"data","tier":"frontier","needs_sandbox":true}},
+  {"id":"data-sw-analyse","mode":"researcher","language":"sw","prompt":"Changanua takwimu hizi na uchore grafu ya mwenendo.","expect":{"language":"sw","intent":"data","tier":"frontier","needs_sandbox":true}},
+  {"id":"data-en-plot","mode":"student","language":"en","prompt":"Plot a histogram of the uploaded dataset.","expect":{"language":"en","intent":"data","needs_sandbox":true}},
+  {"id":"data-sw-column","mode":"student","language":"sw","prompt":"Hesabu wastani wa safu ya umri kwenye dataset.","expect":{"language":"sw","intent":"data","needs_sandbox":true}},
+
+  {"id":"general-sw-greeting","mode":"student","language":"sw","prompt":"Habari, unaweza kunisaidia kusoma leo?","expect":{"language":"sw","intent":"general","tier":"fast"}},
+  {"id":"general-en-plan","mode":"researcher","language":"en","prompt":"Help me organize my work for this afternoon.","expect":{"language":"en","intent":"general","tier":"fast"}},
+  {"id":"general-sw-writing","mode":"researcher","language":"sw","prompt":"Nisaidie kuboresha sentensi hii bila kubadili maana.","expect":{"language":"sw","intent":"general","tier":"fast"}},
+  {"id":"general-en-clarify","mode":"student","language":"en","prompt":"Can you ask me a few questions before we begin?","expect":{"language":"en","intent":"general","tier":"fast"}}
 ]

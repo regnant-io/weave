@@ -13,7 +13,6 @@ export function ArtifactView({ a, language }: { a: Artifact; language: Language 
     // own gridlines and makes a transparent PNG look dirty. Plain surface.
     return (
       <div className="relative border border-border bg-surface-2 p-2">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={a.url}
           alt={a.name}
@@ -34,10 +33,9 @@ export function ArtifactView({ a, language }: { a: Artifact; language: Language 
       <iframe
         src={a.url}
         title={a.name}
-        /* Generated pages are self-contained and must not reach the parent
-           document or the network. allow-scripts WITHOUT allow-same-origin puts
-           the page in an opaque origin. */
-        sandbox="allow-scripts"
+        /* Never add allow-same-origin: the opaque origin is the boundary that
+           prevents generated code from reaching the authenticated app. */
+        sandbox="allow-scripts allow-pointer-lock allow-downloads"
         loading="lazy"
         className="h-[72vh] w-full border border-border bg-white"
       />
@@ -127,7 +125,6 @@ export function ArtifactGrid({
           style={{ animationDelay: `${Math.min(i, 8) * 28}ms` }}
         >
           {a.mime.startsWith("image/") ? (
-            // eslint-disable-next-line @next/next/no-img-element
             <img
               src={a.url}
               alt={a.name}

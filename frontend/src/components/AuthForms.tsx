@@ -97,10 +97,9 @@ export function RegisterForm({ language, initialMode }: { language: Language; in
       setError(data.error ?? "Registration failed");
       return;
     }
-    // Straight to onboarding, not to the dashboard. Middleware would redirect
-    // there anyway; going directly saves a round trip and, more importantly,
-    // removes the frame in which the app shell paints behind the redirect.
-    router.push("/onboarding");
+    // Registration creates an authenticated but unverified account. Confirming
+    // the phone promotes it to the capability tier that may run expensive tools.
+    router.push(`/auth/verify-otp?phone=${encodeURIComponent(phone)}&next=/onboarding`);
     router.refresh();
   }
 
@@ -134,8 +133,9 @@ export function RegisterForm({ language, initialMode }: { language: Language; in
 
 export function OtpForm({ language }: { language: Language }) {
   const router = useRouter();
-  const next = safeNext(useSearchParams()?.get("next"));
-  const [phone, setPhone] = useState("");
+  const params = useSearchParams();
+  const next = safeNext(params?.get("next"));
+  const [phone, setPhone] = useState(params?.get("phone")?.slice(0, 32) || "");
   const [code, setCode] = useState("");
   const [sent, setSent] = useState(false);
   const [devCode, setDevCode] = useState<string | null>(null);

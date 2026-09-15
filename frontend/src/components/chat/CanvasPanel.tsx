@@ -57,6 +57,7 @@ export default function CanvasPanel({
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Mirrors `canvas` for use inside socket callbacks without re-subscribing. */
   const canvasRef = useRef<Canvas | null>(null);
+  const canvasId = canvas?.id;
 
   useEffect(() => {
     canvasRef.current = canvas;
@@ -83,13 +84,13 @@ export default function CanvasPanel({
 
   /* -------------------------------------------------------------- socket */
   useEffect(() => {
-    if (!canvas?.id) return;
+    if (!canvasId) return;
     let ws: WebSocket | null = null;
     let closed = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
 
     async function connect() {
-      const socket = await openSocket(`/ws/canvas/${canvas!.id}`);
+      const socket = await openSocket(`/ws/canvas/${canvasId}`);
       if (!socket || closed) {
         socket?.close();
         return;
@@ -138,7 +139,7 @@ export default function CanvasPanel({
       if (retry) clearTimeout(retry);
       ws?.close();
     };
-  }, [canvas?.id]);
+  }, [canvasId]);
 
   /* ---------------------------------------------------------------- save */
   const save = useCallback(

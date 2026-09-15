@@ -1,115 +1,51 @@
-# ✅ Weave System Status - ALL FIXED!
+# Weave system status
 
-## 🎉 All Services Running
+Last audited: 2026-09-14.
 
-```
-✅ weave-backend-1      - FastAPI backend (with Docker CLI)
-✅ weave-frontend-1     - Next.js frontend
-✅ weave-searxng-1      - Web search engine
-✅ weave-browserless-1  - Headless Chrome
-✅ weave-render-1       - Render service
-✅ weave-minio-1        - Object storage
-✅ weave-qdrant-1       - Vector database
-✅ weave-clickhouse-1   - Analytics warehouse
-✅ weave-gotenberg-1    - PDF generation
-```
+## Verified in this workspace
 
-## ✅ Backend Health Check
+- Backend tests, authorization regressions, and clean Alembic upgrade/downgrade pass.
+- Frontend ESLint, TypeScript, Next.js production build, and Playwright desktop/
+  Pixel 7 auth, route-gate, upload, admin-denial, logout, multi-chat, repaired
+  artifact, and hydration journeys pass without external font access.
+- Render-service limit and contract tests plus its browser bundle build pass.
+- The 20-case bilingual orchestration evaluation passes. The eight-query live
+  Postgres pgvector benchmark records 100% recall@6, 9.0 ms p50, and 117.3 ms p95.
+- Frontend/render npm audits and the pinned Python dependency audit report no known
+  production vulnerabilities. Bandit has no high-severity result.
+- Secret scanning, production image digest enforcement, shell syntax, SBOM jobs,
+  static Compose/YAML checks, and the pinned runtime Trivy gate pass. Backend,
+  frontend, and renderer images have zero fixable high/critical findings.
+- A clean production-shaped Docker stack passed migrations, pgvector index checks,
+  backup/restore, MinIO storage, Celery execution, Redis replay across API restart,
+  readiness, and an HTTPS/WSS browser-protocol journey through Caddy.
+- The repeatable stream-disconnect drill resumed 109 exact-cursor events without a
+  gap or duplicate through the live Redis/Celery stack.
 
-- **Status:** OK
-- **LLM Engine:** Ollama
-- **Tools Available:** 46 tools
-- **Web Search:** ✅ Enabled
-- **Render Service:** ✅ Enabled
-- **Gotenberg:** ✅ Enabled
-- **Workspace:** ✅ **FULLY OPERATIONAL**
+## Implemented production paths
 
-## ✅ Workspace Execution FIXED
+- Alembic migrations, Postgres pgvector/HNSW plus full-text GIN, Redis-backed live
+  turns and rate limits, Celery jobs with retry/dead-letter state, durable upload
+  idempotency, webhook dedupe, transactional outbox, and S3-compatible storage.
+- Fifteen-minute access tokens, rotating refresh-token families, server logout,
+  single-use admin invitations, explicit admin authorization, and fail-closed channel
+  verification.
+- One-origin Caddy TLS/WebSocket routing, Postgres backup/restore scripts, bounded
+  rendering/PDF/crawling, expiring artifact capabilities, and a signed remote
+  analysis-runner client contract.
 
-**Problem:** Docker CLI was missing in backend container
+## Deployment gates
 
-**Solution:** Added Docker CLI to backend Dockerfile
+- Deploy and attack-test the isolated analysis runner. Deploy developer workspaces
+  on a separate host before enabling either production execution capability.
+- Repeat the local restore and public TLS/WebSocket evidence on the target staging
+  origin; execute the Redis/Celery worker-loss drill and provider S3 lifecycle check.
+- Run the retrieval benchmark on representative Postgres content and renderer/PDF
+  load tests under container resource limits.
+- Revoke the historical ngrok credential and coordinate Git-history cleanup.
+- Apply registry admission scanning to promoted images; optional deep/voice images
+  must be pinned and pass the same gate before production use.
+- Complete Kiswahili user task sessions; institutional SSO awaits real IdP rules.
 
-**Result:**
-- ✅ Docker CLI installed (v29.7.2)
-- ✅ Docker socket accessible
-- ✅ Can see host containers
-- ✅ Workspace enabled
-- ✅ Network enabled
-- ✅ 2GB RAM, 2 CPUs configured
-
-## 🚀 What Works Now
-
-### All 46 Tools Available
-- ✅ `workspace_exec` - Run commands (npm, pip, tests)
-- ✅ `workspace_*` - All 10 workspace tools
-- ✅ `web_search` - Live web search
-- ✅ `deep_research` - Iterative research
-- ✅ `generate_visual` - Charts
-- ✅ `create_3d_experience` - 3D scenes
-- ✅ `generate_deck` - Presentations
-- ✅ `run_analysis` - Data analysis
-- ✅ All other tools
-
-### The AI Can Now
-- 📦 Install npm/pip packages
-- 🏗️ Build complete applications
-- 🧪 Run tests
-- 🌐 Search the web
-- 📊 Create visualizations
-- 🎮 Build 3D games
-- 📄 Generate presentations
-- 📦 Package downloadable artifacts
-
-## 🔧 What Was Fixed
-
-1. **Backend Dockerfile** - Added Docker CLI installation
-2. **Image rebuilt** - From 800MB to 1.25GB (includes Docker)
-3. **Backend restarted** - Using new image with Docker CLI
-4. **All services up** - Deep profile fully operational
-
-## 📍 Access Points
-
-- **Frontend:** http://localhost:3000
-- **Backend API:** http://localhost:8001
-- **API Docs:** http://localhost:8001/docs
-- **Health Check:** http://localhost:8001/health
-- **SearXNG:** http://localhost:8888
-
-## 🔑 Credentials
-
-**Phone:** +255700000001  
-**Password:** weave-demo-123  
-**Admin Access:** ✅ Yes (institutional trust tier)
-
-## 🎯 Quick Test
-
-```powershell
-# Test workspace
-docker compose exec backend docker --version
-# Result: Docker version 29.7.2, build a7dcaa6
-
-# Test health
-Invoke-RestMethod http://localhost:8001/health
-# Result: 46 tools available
-
-# Test workspace status
-# (requires login token)
-# Result: enabled=true, network=true
-```
-
-## 📊 System Metrics
-
-- **Total Containers:** 9 running
-- **Total Tools:** 46 available
-- **Backend Image:** 1.25GB
-- **Workspace Image:** 445MB
-- **Network:** All services connected
-
----
-
-**Status:** 🟢 ALL SYSTEMS OPERATIONAL
-
-**Last Updated:** 2026-08-10
-
-**Everything is fixed and fully functional!**
+See `AUDIT.md`, `ROADMAP.md`, `ORCHESTRATION.md`, and `DEPLOY.md` for evidence,
+control flow, and operating steps.

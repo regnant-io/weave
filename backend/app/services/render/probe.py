@@ -32,8 +32,8 @@ not actionable; "createScene did not return a BABYLON.Scene" is.
 
 Failure of the PROBE ITSELF is never treated as failure of the artifact. If
 Browserless is not configured or is down, `available` is False and the caller
-falls back to the static lint — degrading to the old behaviour rather than
-blocking delivery of work that is probably fine.
+falls back to static lint. The caller releases that output without claiming it
+was runtime-verified.
 """
 from __future__ import annotations
 

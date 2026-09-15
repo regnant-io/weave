@@ -1,4 +1,4 @@
-"""The artifact gate: nothing ships until it has been opened.
+"""The artifact gate: runtime proof is never confused with static lint.
 
 THE PROBLEM THIS SOLVES
 -----------------------
@@ -18,12 +18,15 @@ So this module makes it obligatory, and takes it away from the model's
 discretion entirely. Every artifact-producing tool call is intercepted:
 
   1. The artifact is NOT released into the transcript when the tool returns.
-  2. It is linted statically and then EXECUTED in a real browser.
+  2. It is linted statically and then EXECUTED in a real browser when the
+     configured browser pool is available.
   3. If it is broken, the tool result the model receives is not "ok" — it is a
      numbered list of what went wrong and an instruction to fix it. The model
      cannot proceed to its summary believing the work is done, because from
      where it sits, the tool failed.
-  4. Only a clean artifact is released to the user.
+  4. A clean artifact is released to the user. If browser execution was
+     unavailable, it is released as explicitly unverified rather than carrying
+     a false verification badge.
 
 REPAIR BUDGET, AND WHY REPAIR MEANS EDIT
 ----------------------------------------
@@ -85,6 +88,7 @@ class Verdict:
     """The outcome of gating one tool call."""
 
     checked: bool = False           # did we actually get to run a check
+    runtime_checked: bool = False   # did the browser probe execute the page
     ok: bool = True
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -209,8 +213,9 @@ class ArtifactGate:
             except Exception as exc:  # noqa: BLE001 - never block on a critique
                 log.debug("visual critique failed: %s", exc)
 
-        return Verdict(
+        verdict = Verdict(
             checked=True,
+            runtime_checked=run.available,
             ok=ok,
             visual_id=str(result.get("visual_id") or tool_input.get("visual_id") or ""),
             errors=errors,
@@ -221,11 +226,20 @@ class ArtifactGate:
             duration_ms=duration,
             polish_notes=polish_notes,
             summary=(
-                ("renders clean · polishing" if polish_notes else "renders clean") if ok
+                (("renders clean · polishing" if polish_notes else "renders clean")
+                 if run.available else "static checks passed · browser execution unavailable") if ok
                 else f"{len(errors)} problem{'s' if len(errors) != 1 else ''}"
                      f" · attempt {attempt}/{MAX_REPAIRS}"
             ),
         )
+        from ...metrics import observe
+        state = ("failed" if not verdict.ok else
+                 "runtime" if verdict.runtime_checked else "static_only")
+        observe("verification", tool_name, state, verdict.duration_ms,
+                attempts=float(verdict.attempt),
+                errors=float(len(verdict.errors)),
+                warnings=float(len(verdict.warnings)))
+        return verdict
 
     # -- shaping the model's view of the failure ---------------------------
 
@@ -244,7 +258,8 @@ class ArtifactGate:
 
         out = dict(result)
         out["verification"] = {
-            "ran": True,
+            "static_ran": True,
+            "ran": verdict.runtime_checked,
             "ok": verdict.ok,
             "errors": verdict.errors,
             "warnings": verdict.warnings,
@@ -269,8 +284,13 @@ class ArtifactGate:
 
         if verdict.ok:
             out["status"] = "ok"
-            out["verified"] = True
-            if verdict.warnings:
+            out["verified"] = verdict.runtime_checked
+            if not verdict.runtime_checked:
+                out["note"] = (
+                    "Static checks passed, but browser execution was unavailable. "
+                    "The artifact has not been runtime-verified."
+                )
+            elif verdict.warnings:
                 out["note"] = ("It opens and renders. Worth a look before you move on: "
                                + "; ".join(verdict.warnings[:3]))
             else:

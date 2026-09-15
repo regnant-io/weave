@@ -1,44 +1,8 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { getLanguage, getTheme, isAuthed } from "@/lib/session";
 import AppShell from "@/components/shell/AppShell";
 import BootProbe from "@/components/BootProbe";
-
-/*
-  Type stack, self-hosted by next/font (no third-party request at runtime, no
-  FOUT).
-
-  This was an editorial pairing — Instrument Serif for display, Fraunces for the
-  answer column. It has been replaced wholesale with a single grotesque plus a
-  true monospace. The serifs gave the product a magazine voice it was not
-  actually speaking in: Weave is a working instrument for students and
-  researchers, and it should read like precise machinery, not like a feature
-  article. One neutral typeface carrying display, reading and UI also means the
-  three never disagree about the rhythm of a line.
-
-    display / read / ui — Geist. Engineered, tight, neutral; built for
-      interfaces, and calm enough at 16-17px to hold a long Kiswahili paragraph.
-    mono — JetBrains Mono. Designed for reading code at small sizes: tall
-      x-height, unmistakable 0/O and 1/l/I, and it carries the eyebrows, step
-      chips, figures and code blocks that give the UI its instrument feel.
-
-  `adjustFontFallback` is left on (default) so the fallback metrics are matched
-  and there is no layout shift when the webfont lands.
-*/
-const geist = Geist({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-ui-src",
-  fallback: ["ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "sans-serif"],
-});
-const jetbrains = JetBrains_Mono({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-mono-src",
-  style: ["normal", "italic"],
-  fallback: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
-});
 
 export const metadata: Metadata = {
   title: "Weave",
@@ -62,15 +26,11 @@ export const viewport: Viewport = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const [language, authed, theme] = await Promise.all([getLanguage(), isAuthed(), getTheme()]);
   const htmlThemeAttr = theme === "light" || theme === "dark" ? theme : undefined;
-  // Display and read are the same face as UI now, so one variable feeds all
-  // three roles in globals.css rather than three families feeding four.
-  const fontVars = `${geist.variable} ${jetbrains.variable}`;
   const isProduction = process.env.NODE_ENV === "production";
 
   return (
     <html
       lang={language}
-      className={fontVars}
       {...(htmlThemeAttr ? { "data-theme": htmlThemeAttr } : {})}
       /*
         The blocking script below intentionally mutates <html> before React

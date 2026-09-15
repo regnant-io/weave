@@ -793,6 +793,24 @@ class Agent:
 
     def _execute(self, name: str, args: dict) -> dict:
         """Intercept loop-control calls; pass everything else through."""
+        # Tool schemas constrain well-behaved model output; they are not an
+        # execution boundary.  Some providers occasionally emit a remembered
+        # tool name that was present on an earlier pass.  Re-check the current
+        # surface here so an artifact plan cannot write to the workspace (and a
+        # workspace plan cannot invoke a heavyweight renderer) by hallucinating
+        # a tool call that was deliberately removed from this pass.
+        offered = {str(t.get("name") or "") for t in self._tools_with_loop_control()}
+        if name not in offered:
+            result = {
+                "status": "rejected",
+                "error": (
+                    f"Tool `{name}` is not available on the current "
+                    f"{self.plan.surface or 'turn'} surface. Re-plan before changing surfaces."
+                ),
+            }
+            self.tool_events.append({"name": name, "input": args, "result": result})
+            self._progress_marker += 1
+            return result
         if name == "update_plan":
             return self._apply_plan_update(args or {})
         if name == "submit_plan":

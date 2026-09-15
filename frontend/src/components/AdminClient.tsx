@@ -6,11 +6,19 @@ import CrawlerPanel from "./admin/CrawlerPanel";
 type Stats = Record<string, number>;
 type Source = { id: string; title: string; url: string | null; source_type: string; chunks: number; predatory_flag: boolean; ingested_at: string | null };
 type Audit = { id: string; status: string; code_hash: string; execution_time_ms: number; created_at: string | null };
+type Job = { id: string; kind: string; status: string; attempts: number; error: string; updated_at: string | null };
+type Metrics = {
+  runtime: Record<string, { count?: number; duration_ms_sum?: number }>;
+  jobs: Record<string, number>;
+  outbox: Record<string, number>;
+};
 
 export default function AdminClient() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
@@ -22,6 +30,8 @@ export default function AdminClient() {
     setStats(await s.json().catch(() => null));
     setSources(await fetch("/api/admin/sources").then((r) => r.json()).catch(() => []));
     setAudit(await fetch("/api/admin/audit?limit=25").then((r) => r.json()).catch(() => []));
+    setJobs(await fetch("/api/admin/jobs?limit=25").then((r) => r.json()).catch(() => []));
+    setMetrics(await fetch("/api/admin/metrics").then((r) => r.json()).catch(() => null));
   }
   useEffect(() => { load(); }, []);
 
@@ -53,6 +63,53 @@ export default function AdminClient() {
           </div>
         ))}
       </div>
+
+      {/* durable control-plane health */}
+      <section className="border border-border bg-surface p-5">
+        <h2 className="mb-3 text-sm font-semibold">Operations</h2>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          {Object.entries(metrics?.jobs ?? {}).map(([state, count]) => (
+            <div key={`job-${state}`} className="border border-border p-3">
+              <div className="text-xl font-semibold">{count}</div>
+              <div className="text-xs text-fg-muted">jobs · {state}</div>
+            </div>
+          ))}
+          {Object.entries(metrics?.outbox ?? {}).map(([state, count]) => (
+            <div key={`outbox-${state}`} className="border border-border p-3">
+              <div className="text-xl font-semibold">{count}</div>
+              <div className="text-xs text-fg-muted">delivery · {state}</div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="text-left text-xs uppercase text-fg-faint">
+              <tr><th className="py-1 pr-3">Job</th><th className="pr-3">State</th><th className="pr-3">Attempts</th><th>Last error</th></tr>
+            </thead>
+            <tbody>
+              {jobs.map((j) => (
+                <tr key={j.id} className="border-t border-border">
+                  <td className="py-1.5 pr-3 font-mono text-xs">{j.kind.replace("weave.", "")}</td>
+                  <td className={j.status === "succeeded" ? "pr-3 text-ok" : j.status === "dead_letter" || j.status === "failed" ? "pr-3 text-danger" : "pr-3 text-warn"}>{j.status}</td>
+                  <td className="pr-3">{j.attempts}</td>
+                  <td className="max-w-[24rem] truncate text-xs text-fg-muted" title={j.error}>{j.error || "—"}</td>
+                </tr>
+              ))}
+              {jobs.length === 0 && <tr><td colSpan={4} className="py-3 text-fg-faint">No background jobs yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {metrics && Object.keys(metrics.runtime).length > 0 && (
+          <details className="mt-4 border-t border-border pt-3">
+            <summary className="cursor-pointer text-xs font-medium text-fg-muted">Runtime counters ({Object.keys(metrics.runtime).length})</summary>
+            <div className="mt-2 grid gap-1 font-mono text-xs text-fg-muted">
+              {Object.entries(metrics.runtime).map(([name, value]) => (
+                <div key={name}>{name}: {value.count ?? 0} calls · {Math.round(value.duration_ms_sum ?? 0)} ms total</div>
+              ))}
+            </div>
+          </details>
+        )}
+      </section>
 
       {/* ingest */}
       <section className=" border border-border bg-surface p-5">

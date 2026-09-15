@@ -39,9 +39,15 @@ function renderInline(nodes: Inline[], onOpenArtifact?: (a: Artifact) => void): 
       case "del":
         return <del key={i}>{renderInline(n.c, onOpenArtifact)}</del>;
       case "img":
-        return <InlineImage key={i} src={n.src} alt={n.alt} onOpen={onOpenArtifact} />;
+        return safeUrl(n.src, true) ? (
+          <InlineImage key={i} src={n.src} alt={n.alt} onOpen={onOpenArtifact} />
+        ) : (
+          <span key={i}>{n.alt || "image"}</span>
+        );
       case "link": {
-        const isArtifact = n.href.startsWith("/api/artifact/");
+        const href = safeUrl(n.href, false);
+        if (!href) return <span key={i}>{renderInline(n.c, onOpenArtifact)}</span>;
+        const isArtifact = href.startsWith("/api/artifact/");
         if (isArtifact && onOpenArtifact) {
           return (
             <button
@@ -50,9 +56,9 @@ function renderInline(nodes: Inline[], onOpenArtifact?: (a: Artifact) => void): 
               onClick={() =>
                 onOpenArtifact({
                   name: flattenText(n.c) || "Artifact",
-                  mime: guessMime(n.href),
+                  mime: guessMime(href),
                   bytes: 0,
-                  url: n.href,
+                  url: href,
                 })
               }
               className="text-accent underline decoration-accent-line underline-offset-2 transition-colors duration-fast hover:decoration-accent"
@@ -62,7 +68,7 @@ function renderInline(nodes: Inline[], onOpenArtifact?: (a: Artifact) => void): 
           );
         }
         return (
-          <a key={i} href={n.href} title={n.title} target="_blank" rel="noopener noreferrer">
+          <a key={i} href={href} title={n.title} target="_blank" rel="noopener noreferrer">
             {renderInline(n.c, onOpenArtifact)}
           </a>
         );
@@ -71,6 +77,18 @@ function renderInline(nodes: Inline[], onOpenArtifact?: (a: Artifact) => void): 
         return null;
     }
   });
+}
+
+/** Model output is data. Only schemes that make sense in rendered prose may
+ * become browser navigation or image requests. */
+function safeUrl(raw: string, image: boolean): string | null {
+  const value = String(raw || "").trim();
+  const compact = value.replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
+  if (!compact) return null;
+  if (compact.startsWith("/api/artifact/")) return value;
+  if (compact.startsWith("https://") || compact.startsWith("http://")) return value;
+  if (!image && (compact.startsWith("mailto:") || compact.startsWith("#"))) return value;
+  return null;
 }
 
 function flattenText(nodes: Inline[]): string {
@@ -108,6 +126,7 @@ function InlineImage({
       alt={alt}
       loading="lazy"
       decoding="async"
+      referrerPolicy="no-referrer"
       onError={() => setFailed(true)}
       onClick={() =>
         onOpen?.({ name: alt || "Image", mime: guessMime(src), bytes: 0, url: src })

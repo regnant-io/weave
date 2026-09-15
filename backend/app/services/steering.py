@@ -37,11 +37,14 @@ holding down a key keep one worker thread generating forever.
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+from ..config import settings
 
 log = logging.getLogger("weave.steering")
 
@@ -110,6 +113,30 @@ class SteeringBroker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._turns: dict[str, SteerableTurn] = {}
+        self._redis = None
+        if settings.redis_url:
+            try:
+                import redis
+                self._redis = redis.Redis.from_url(settings.redis_url, decode_responses=True,
+                                                    socket_timeout=2)
+                self._redis.ping()
+            except Exception as exc:  # noqa: BLE001
+                if settings.is_deployed:
+                    raise RuntimeError("Redis is required for durable steering") from exc
+                log.warning("Redis unavailable; steering is process-local: %s", exc)
+                self._redis = None
+
+    @staticmethod
+    def _meta(turn_id: str) -> str:
+        return f"weave:steer:{turn_id}:meta"
+
+    @staticmethod
+    def _queue(turn_id: str) -> str:
+        return f"weave:steer:{turn_id}:queue"
+
+    @staticmethod
+    def _signal(turn_id: str) -> str:
+        return f"weave:steer:{turn_id}:signal"
 
     def _sweep(self) -> None:
         now = time.monotonic()
@@ -118,6 +145,16 @@ class SteeringBroker:
             self._turns.pop(key, None)
 
     def register(self, *, turn_id: str, user_id: str, project_id: str) -> SteerableTurn:
+        if self._redis is not None:
+            self._redis.delete(self._queue(turn_id), self._signal(turn_id))
+            self._redis.hset(self._meta(turn_id), mapping={
+                "user_id": user_id or "", "project_id": project_id or "",
+                "live": "1", "restarts": "0", "created_at": str(time.time()),
+            })
+            self._redis.expire(self._meta(turn_id), STALE_SECONDS)
+            return SteerableTurn(turn_id=turn_id, user_id=user_id or "",
+                                 project_id=project_id or "",
+                                 event=_RedisSteerEvent(self._redis, self._signal(turn_id)))
         turn = SteerableTurn(turn_id=turn_id, user_id=user_id or "",
                              project_id=project_id or "")
         with self._lock:
@@ -129,6 +166,11 @@ class SteeringBroker:
         return turn
 
     def finish(self, turn_id: str) -> None:
+        if self._redis is not None:
+            self._redis.hset(self._meta(turn_id), "live", "0")
+            for key in (self._meta(turn_id), self._queue(turn_id), self._signal(turn_id)):
+                self._redis.expire(key, 300)
+            return
         with self._lock:
             turn = self._turns.pop(turn_id, None)
         if turn is not None:
@@ -143,6 +185,18 @@ class SteeringBroker:
         text = (text or "").strip()[:MAX_STEER_CHARS]
         if not text:
             return False
+        if self._redis is not None:
+            meta = self._redis.hgetall(self._meta(turn_id))
+            if not meta or meta.get("live") != "1" or (
+                    meta.get("user_id") and user_id and meta["user_id"] != user_id):
+                return False
+            self._redis.rpush(self._queue(turn_id), json.dumps(
+                {"text": text, "kind": kind, "at": time.time()}, separators=(",", ":"),
+            ))
+            self._redis.expire(self._queue(turn_id), STALE_SECONDS)
+            if int(meta.get("restarts", 0)) < MAX_RESTARTS:
+                self._redis.set(self._signal(turn_id), "1", ex=STALE_SECONDS)
+            return True
         with self._lock:
             turn = self._turns.get(turn_id)
             if turn is None or not turn.live:
@@ -160,6 +214,13 @@ class SteeringBroker:
 
     def drain(self, turn_id: str) -> list[dict]:
         """Take everything queued for this turn and re-arm the event."""
+        if self._redis is not None:
+            pipe = self._redis.pipeline()
+            pipe.lrange(self._queue(turn_id), 0, -1)
+            pipe.delete(self._queue(turn_id))
+            pipe.delete(self._signal(turn_id))
+            rows, _, _ = pipe.execute()
+            return [json.loads(row) for row in rows]
         with self._lock:
             turn = self._turns.get(turn_id)
             if turn is None:
@@ -170,11 +231,17 @@ class SteeringBroker:
         return items
 
     def pending(self, turn_id: str) -> bool:
+        if self._redis is not None:
+            return bool(self._redis.llen(self._queue(turn_id)))
         with self._lock:
             turn = self._turns.get(turn_id)
             return bool(turn and turn.queue)
 
     def note_restart(self, turn_id: str) -> int:
+        if self._redis is not None:
+            if not self._redis.exists(self._meta(turn_id)):
+                return MAX_RESTARTS
+            return int(self._redis.hincrby(self._meta(turn_id), "restarts", 1))
         with self._lock:
             turn = self._turns.get(turn_id)
             if turn is None:
@@ -183,16 +250,38 @@ class SteeringBroker:
             return turn.restarts
 
     def restarts_left(self, turn_id: str) -> int:
+        if self._redis is not None:
+            value = self._redis.hget(self._meta(turn_id), "restarts")
+            return MAX_RESTARTS - (int(value) if value is not None else MAX_RESTARTS)
         with self._lock:
             turn = self._turns.get(turn_id)
             return MAX_RESTARTS - (turn.restarts if turn else MAX_RESTARTS)
 
     def get(self, turn_id: str) -> SteerableTurn | None:
+        if self._redis is not None:
+            meta = self._redis.hgetall(self._meta(turn_id))
+            if not meta or meta.get("live") != "1":
+                return None
+            return SteerableTurn(
+                turn_id=turn_id, user_id=meta.get("user_id", ""),
+                project_id=meta.get("project_id", ""),
+                restarts=int(meta.get("restarts", 0)),
+                event=_RedisSteerEvent(self._redis, self._signal(turn_id)),
+            )
         with self._lock:
             return self._turns.get(turn_id)
 
     def live_for(self, user_id: str) -> list[dict]:
         """Turns this user could steer — lets a reconnecting client re-attach."""
+        if self._redis is not None:
+            out = []
+            for key in self._redis.scan_iter(match="weave:steer:*:meta", count=100):
+                meta = self._redis.hgetall(key)
+                if meta.get("live") == "1" and meta.get("user_id") == user_id:
+                    turn_id = key.removeprefix("weave:steer:").removesuffix(":meta")
+                    out.append({"turn_id": turn_id, "project_id": meta.get("project_id", ""),
+                                "restarts_left": MAX_RESTARTS - int(meta.get("restarts", 0))})
+            return out
         with self._lock:
             return [
                 {"turn_id": t.turn_id, "project_id": t.project_id,
@@ -200,6 +289,21 @@ class SteeringBroker:
                 for t in self._turns.values()
                 if t.live and t.user_id == user_id
             ]
+
+
+class _RedisSteerEvent:
+    def __init__(self, client, key: str) -> None:
+        self.client = client
+        self.key = key
+
+    def is_set(self) -> bool:
+        return bool(self.client.get(self.key))
+
+    def set(self) -> None:
+        self.client.set(self.key, "1", ex=STALE_SECONDS)
+
+    def clear(self) -> None:
+        self.client.delete(self.key)
 
 
 _broker: SteeringBroker | None = None
