@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...config import settings
 from ...db import release as release_db
 from ...models import Dataset, Message, Project
 from ..analysis import get_analysis_service
@@ -182,8 +183,21 @@ class Orchestrator:
                     })
                 live.finish(error=error, result=meta)
 
-        threading.Thread(target=worker, daemon=True,
-                         name="weave-turn-" + turn_id[:8]).start()
+        if settings.redis_url:
+            # The producer belongs to a Celery worker, while every API worker
+            # can follow the Redis event log. A dying HTTP worker therefore
+            # cannot kill the turn or strand its resume cursor.
+            from ...tasks import dispatch
+            job_id = dispatch(
+                "weave.run_stream_turn", turn_id, project_id, user_id, user_text,
+                language, dataset_id, effort, model, regenerate,
+                services_pref, thread_id, channel, frames,
+                job_owner_id=user_id, job_project_id=project_id,
+            )
+            live.emit("job", {"job_id": job_id, "kind": "chat_turn"})
+        else:
+            threading.Thread(target=worker, daemon=True,
+                             name="weave-turn-" + turn_id[:8]).start()
 
         yield from self._follow(live, from_seq=0, first_event={
             "event": "turn",
@@ -246,6 +260,8 @@ class Orchestrator:
         thread_id: str | None = None, channel: str = "chat",
         frames: list[str] | None = None, assistant_message_id: str | None = None,
     ) -> tuple[Message, dict]:
+        import time
+        turn_started = time.monotonic()
         engine = get_engine()
 
         # 0. resolve the thread this turn belongs to, and the REAL context window
@@ -325,9 +341,10 @@ class Orchestrator:
         db.commit()
 
         # -- capability bus: registry + per-turn context ----------------------
-        trust = getattr(getattr(project, "user", None), "trust_tier", "verified") or "verified"
-        services = {"analysis": self.analysis, "retrieval": self.retrieval,
-                    "memory": self.memory}
+        trust = getattr(getattr(project, "user", None), "trust_tier", "anonymous") or "anonymous"
+        services = {"retrieval": self.retrieval, "memory": self.memory}
+        if settings.analysis_execution_enabled:
+            services["analysis"] = self.analysis
         web = get_web_search()
         if web.enabled:
             services["websearch"] = web
@@ -374,6 +391,7 @@ class Orchestrator:
         forced = {k for k, v in (services_pref or {}).items() if v}
         tool_schemas = registry.schemas(mode=project.mode, trust=trust, services=services,
                                         intent=route.intent, force=forced)
+        ctx.allowed_tools = frozenset(t["name"] for t in tool_schemas)
 
         # meta up front so the client has the message id immediately
         _emit("meta", {"message_id": assistant_msg.id, "intent": route.intent,
@@ -537,6 +555,7 @@ class Orchestrator:
                     "id": step_id,
                     "tool": name,
                     "checked": verdict.checked,
+                    "runtime_checked": verdict.runtime_checked,
                     "ok": verdict.ok,
                     "attempt": verdict.attempt,
                     "max_attempts": MAX_REPAIRS,
@@ -559,7 +578,7 @@ class Orchestrator:
                         # does not need a dozen live WebGL contexts at once.
                         if preview:
                             art["preview"] = preview
-                        art["verified"] = verdict.ok
+                        art["verified"] = verdict.ok and verdict.runtime_checked
                         if not verdict.ok:
                             art["defects"] = verdict.errors[:4]
                         _emit("artifact", art)
@@ -622,6 +641,7 @@ class Orchestrator:
                 mode=project.mode, trust=trust, services=services,
                 intent=route.intent, force=forced,
             )
+            ctx.allowed_tools = frozenset(t["name"] for t in tool_schemas)
 
         # 6b. Retrieval-before-generation, extended to the web (Principle 3): only
         # for LITERATURE intent ("what does the research/web say"). Concept
@@ -755,9 +775,15 @@ class Orchestrator:
                     return "restart"
 
                 agent.on_pass_end = _after_pass
+                # Calls made before generation (currently the automatic
+                # retrieval-before-generation deep research pass) already live
+                # in the outer audit list.  Agent.run owns its own list for the
+                # model-driven calls, so preserve the prefix before the shared
+                # executor starts appending duplicates to the outer list.
+                pre_generation_tool_events = list(tool_events)
                 run = agent.run()
                 answer = run.text
-                tool_events = run.tool_events
+                tool_events = pre_generation_tool_events + run.tool_events
                 tier_used = run.tier_used
                 turn_plan = run.plan.to_json() if run.plan else None
                 engine_streamed = bool(getattr(engine, "streams", False))
@@ -766,6 +792,12 @@ class Orchestrator:
                     assistant_msg.id, run.stopped_because, run.passes,
                     run.review_rounds, len(tool_events),
                 )
+                from ...metrics import observe
+                observe("agent", str(getattr(engine, "name", "unknown")),
+                        run.stopped_because, 0,
+                        passes=float(run.passes),
+                        repair_rounds=float(run.review_rounds),
+                        tool_calls=float(len(tool_events)))
             except Exception as exc:  # noqa: BLE001
                 # Remote LLM (Ollama/Anthropic) failed after retries -> degrade to
                 # the offline engine so the turn still completes rather than 500s.
@@ -779,6 +811,8 @@ class Orchestrator:
                 # is to wait a minute and ask again.
                 log.warning("LLM engine '%s' failed (%s); falling back to offline",
                             getattr(engine, "name", "?"), exc)
+                from ...metrics import observe
+                observe("model", str(getattr(engine, "name", "unknown")), "fallback", 0)
                 from .llm import QuotaExhausted
                 if isinstance(exc, QuotaExhausted):
                     # Relay the provider's own words. They name the account and
@@ -900,6 +934,12 @@ class Orchestrator:
             "context_used": thread.token_estimate,
             "history_trimmed": history_trimmed,
         }
+        from ...metrics import observe
+        observe("turn", route.intent, "completed",
+                (time.monotonic() - turn_started) * 1000,
+                context_tokens=float(thread.token_estimate or 0),
+                tool_calls=float(len(tool_events)),
+                grounded=1.0 if grounded else 0.0)
         return assistant_msg, meta
 
     @staticmethod
@@ -966,7 +1006,7 @@ class Orchestrator:
         for why deriving from what the client was actually sent is the only way
         history and the live transcript stay identical.
         """
-        from ...security import sign_path
+        from ...security import artifact_url
         arts: list[dict] = []
         for e in tool_events:
             for f in e.get("result", {}).get("output_files", []) or []:
@@ -976,7 +1016,7 @@ class Orchestrator:
                 arts.append({
                     "name": f.get("name"), "mime": f.get("mime", "application/octet-stream"),
                     "bytes": f.get("bytes", 0), "tool": e.get("name"),
-                    "url": f"/api/artifact/{key}?sig={sign_path(key)}",
+                    "url": artifact_url(key),
                 })
         return arts
 

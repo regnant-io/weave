@@ -17,7 +17,7 @@ so it always starts.
 ## 1. Shape of the system
 
 ```
-Next.js 15 frontend (App Router, SSR-first, bilingual, low-bandwidth aware)
+Next.js 16 frontend (App Router, SSR-first, bilingual, low-bandwidth aware)
         │  cookie session → server routes proxy to the API
         ▼
 FastAPI backend

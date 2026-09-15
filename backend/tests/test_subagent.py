@@ -59,6 +59,23 @@ def test_delegate_only_gets_read_only_tools():
     assert "delegate" not in offered
 
 
+def test_delegate_rejects_a_hallucinated_write_call_at_execution():
+    """Schema filtering is guidance; the executor is the security boundary."""
+    engine = _Engine(calls=[("workspace_write", {"path": "x", "content": "bad"})])
+    reached_parent: list[str] = []
+
+    out = subagent.run_delegate(
+        engine=engine,
+        tools=_tools("web_search", "workspace_write"),
+        tool_executor=lambda name, _args: reached_parent.append(name) or {"status": "ok"},
+        emit=lambda _k, _d: None,
+        task="Look up one fact",
+    )
+
+    assert out["status"] == "ok"
+    assert reached_parent == []
+
+
 def test_delegate_reports_its_finding_and_its_sources():
     engine = _Engine(
         reply="Coverage was 61% in 2022.",

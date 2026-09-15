@@ -20,6 +20,7 @@ Backends:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import shutil
 import subprocess
@@ -95,8 +96,8 @@ class SandboxManager:
                 stderr="Rejected by static pre-check:\n- " + "\n- ".join(pre.violations),
             )
 
-        if self.backend == "firecracker":  # pragma: no cover - prod path
-            return self._run_firecracker(code, dataset_path, heavy, memory_mb, code_hash)
+        if self.backend in {"remote", "firecracker"}:  # pragma: no cover - prod path
+            return self._run_remote(code, dataset_path, heavy, memory_mb, code_hash)
         return self._run_subprocess(code, dataset_path, heavy, memory_mb, code_hash)
 
     # -- subprocess backend ---------------------------------------------------
@@ -237,13 +238,79 @@ class SandboxManager:
 
     # -- firecracker backend (production) ------------------------------------
 
-    def _run_firecracker(self, *args, **kwargs) -> SandboxResult:  # pragma: no cover
-        raise NotImplementedError(
-            "Firecracker backend: boot a warm microVM from the pool, attach a "
-            "read-only COW block device for the dataset, inject runner.py over the "
-            "control-plane vsock, enforce cgroup/jailer limits, then destroy the VM. "
-            "The runner.py harness and this SandboxResult contract are identical to "
-            "the subprocess backend — only transport changes."
+    def _run_remote(self, code: str, dataset_path: Path | None, heavy: bool,
+                    memory_mb: int | None, code_hash: str) -> SandboxResult:  # pragma: no cover
+        """Call the isolated runner control plane with a signed, scoped job.
+
+        The remote service owns gVisor/Firecracker, read-only mounts, egress
+        denial, cgroups, PID limits and destruction. The API holds no Docker
+        socket and accepts only the bounded result contract below.
+        """
+        if not settings.analysis_runner_url or not settings.analysis_runner_secret:
+            return SandboxResult(status="unavailable", code_hash=code_hash,
+                                 stderr="isolated analysis runner is not configured")
+        import base64
+        import secrets
+        import httpx
+        timestamp = str(int(time.time()))
+        nonce = secrets.token_hex(16)
+        dataset_hash = ""
+        dataset_bytes = b""
+        if dataset_path is not None:
+            dataset_bytes = Path(dataset_path).read_bytes()
+            dataset_hash = hashlib.sha256(dataset_bytes).hexdigest()
+        limits = {
+            "timeout_seconds": settings.sandbox_heavy_timeout_seconds if heavy
+                               else settings.sandbox_timeout_seconds,
+            "memory_mb": memory_mb or settings.sandbox_memory_mb,
+            "max_output_bytes": settings.sandbox_output_max_bytes,
+            "max_output_files": settings.sandbox_max_output_files,
+            "network": False,
+        }
+        signed = "\n".join((timestamp, nonce, code_hash, dataset_hash,
+                              json.dumps(limits, sort_keys=True, separators=(",", ":"))))
+        signature = hmac.new(settings.analysis_runner_secret.encode(), signed.encode(),
+                             hashlib.sha256).hexdigest()
+        try:
+            response = httpx.post(
+                settings.analysis_runner_url.rstrip("/") + "/v1/runs",
+                data={"code": code, "limits": json.dumps(limits), "nonce": nonce,
+                      "timestamp": timestamp, "code_hash": code_hash,
+                      "dataset_hash": dataset_hash},
+                files=({"dataset": (Path(dataset_path).name, dataset_bytes)}
+                       if dataset_path is not None else None),
+                headers={"X-Weave-Signature": signature},
+                timeout=limits["timeout_seconds"] + 15,
+            )
+            response.raise_for_status()
+            raw = response.json()
+        except Exception as exc:
+            return SandboxResult(status="error", code_hash=code_hash,
+                                 stderr=f"isolated runner failed: {exc}")
+        outputs: list[OutputFile] = []
+        total = 0
+        for item in (raw.get("output_files") or [])[:settings.sandbox_max_output_files]:
+            try:
+                data = base64.b64decode(item.get("data_b64", ""), validate=True)
+            except Exception:
+                continue
+            total += len(data)
+            if total > settings.sandbox_output_max_bytes:
+                break
+            outputs.append(OutputFile(name=Path(str(item.get("name", "output"))).name,
+                                      data_b64=base64.b64encode(data).decode(),
+                                      mime=str(item.get("mime", "application/octet-stream"))[:100],
+                                      bytes=len(data)))
+        return SandboxResult(
+            status=str(raw.get("status", "error")),
+            stdout=str(raw.get("stdout", ""))[:200_000],
+            stderr=str(raw.get("stderr", ""))[:200_000],
+            output_files=outputs,
+            execution_time_ms=max(0, int(raw.get("execution_time_ms", 0))),
+            peak_memory_kb=max(0, int(raw.get("peak_memory_kb", 0))),
+            violations=[str(v)[:500] for v in (raw.get("violations") or [])[:20]],
+            code_hash=code_hash,
+            result_hash=str(raw.get("result_hash", ""))[:64],
         )
 
 

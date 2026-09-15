@@ -16,32 +16,51 @@ Mode = Literal["student", "researcher"]
 
 # --- auth ---
 class RegisterRequest(BaseModel):
-    phone: str = Field(..., examples=["+255700000000"])
-    password: str = Field(..., min_length=8)
-    email: str | None = None
+    phone: str = Field(..., min_length=5, max_length=32, examples=["+255700000000"])
+    password: str = Field(..., min_length=8, max_length=256)
+    email: str | None = Field(default=None, max_length=320)
     role: Literal["student", "researcher", "both"] = "student"
     preferred_language: Language = "sw"
     institution_id: str | None = None
 
 
 class LoginRequest(BaseModel):
-    phone: str
-    password: str
+    phone: str = Field(..., min_length=5, max_length=32)
+    password: str = Field(..., min_length=1, max_length=256)
 
 
 class OtpRequestBody(BaseModel):
-    phone: str
+    phone: str = Field(..., min_length=5, max_length=32)
 
 
 class OtpVerifyBody(BaseModel):
-    phone: str
-    code: str
+    phone: str = Field(..., min_length=5, max_length=32)
+    code: str = Field(..., pattern=r"^\d{6}$")
 
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str | None = None
     token_type: str = "bearer"
     user: "UserOut"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=256)
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str | None = Field(default=None, min_length=32, max_length=256)
+
+
+class AdminInviteAccept(BaseModel):
+    token: str = Field(..., min_length=32, max_length=256)
+
+
+class AdminInviteCreate(BaseModel):
+    email: str | None = Field(default=None, max_length=320)
+    phone: str | None = Field(default=None, max_length=32)
+    expires_in_hours: int = Field(default=24, ge=1, le=168)
 
 
 class UserOut(BaseModel):
@@ -67,18 +86,18 @@ class UserPrefsIn(BaseModel):
 
 # --- projects ---
 class ProjectCreate(BaseModel):
-    title: str
+    title: str = Field(..., min_length=1, max_length=200)
     mode: Mode = "student"
 
 
 class HypothesisIn(BaseModel):
-    text_sw: str = ""
-    text_en: str = ""
+    text_sw: str = Field(default="", max_length=20_000)
+    text_en: str = Field(default="", max_length=20_000)
     status: Literal["open", "supported", "refuted"] = "open"
 
 
 class ProjectUpdate(BaseModel):
-    title: str | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=200)
     mode: Mode | None = None
 
 
@@ -95,11 +114,11 @@ class ProjectOut(BaseModel):
 
 # --- threads (chats within a project) ---
 class ThreadCreate(BaseModel):
-    title: str = ""
+    title: str = Field(default="", max_length=200)
 
 
 class ThreadUpdate(BaseModel):
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=200)
     status: Literal["active", "archived"] | None = None
 
 
@@ -119,10 +138,10 @@ class ThreadOut(BaseModel):
 
 # --- shared project memory ---
 class MemoryEntryIn(BaseModel):
-    key: str
-    content: str
+    key: str = Field(..., min_length=1, max_length=200)
+    content: str = Field(..., min_length=1, max_length=50_000)
     kind: Literal["fact", "decision", "preference", "finding", "question", "artifact"] = "fact"
-    importance: int = 3
+    importance: int = Field(default=3, ge=1, le=5)
 
 
 class MemoryEntryOut(BaseModel):
@@ -154,12 +173,13 @@ class DatasetOut(BaseModel):
     column_profile: dict[str, Any]
     size_bytes: int
     status: str
+    job_id: str | None = None
     uploaded_at: datetime
 
 
 # --- messages / chat ---
 class MessageCreate(BaseModel):
-    content: str
+    content: str = Field(..., min_length=1, max_length=200_000)
     language: Language = "sw"
     dataset_id: str | None = None
     # Which chat inside the project this turn belongs to. Omitted -> the
@@ -167,11 +187,11 @@ class MessageCreate(BaseModel):
     thread_id: str | None = None
     stream: bool = True
     effort: Literal["spool", "weave", "tapestry"] = "weave"
-    model: str | None = None  # optional Ollama model override for this turn
+    model: str | None = Field(default=None, max_length=200)  # optional model override
     regenerate: bool = False   # reuse last user turn, drop the previous answer
     # Services the user switched on in the composer ({"web_search": true, ...}).
     # An explicit toggle outranks the intent router's guess for this turn.
-    services: dict[str, bool] | None = None
+    services: dict[str, bool] | None = Field(default=None, max_length=20)
 
 
 class OllamaConfig(BaseModel):
@@ -198,7 +218,7 @@ class MessageOut(BaseModel):
 # --- analysis ---
 class AnalysisRunRequest(BaseModel):
     dataset_id: str
-    code: str
+    code: str = Field(..., min_length=1, max_length=200_000)
     heavy: bool = False
 
 
@@ -234,7 +254,7 @@ class LibrarySearchResponse(BaseModel):
 
 # --- citations ---
 class CitationCheckRequest(BaseModel):
-    reference: str
+    reference: str = Field(..., min_length=1, max_length=20_000)
     source_id: str | None = None
     style: Literal["APA", "Harvard", "Chicago", "IEEE"] = "APA"
 
@@ -248,10 +268,10 @@ class CitationCheckResponse(BaseModel):
 
 # --- steering: redirecting a turn that is still running ---
 class SteerIn(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=20_000)
     #: "redirect" (change direction), "focus" (go deeper on this), "skip" (drop
     #: what you are doing). Purely a UI label — the model receives the text.
-    kind: str = "redirect"
+    kind: Literal["redirect", "focus", "skip"] = "redirect"
 
 
 # --- collaborative canvas ---
@@ -273,9 +293,9 @@ class CanvasPatchIn(BaseModel):
     on a stale revision rather than overwriting whatever landed in between — see
     services/canvas.py.
     """
-    content: str
-    base_revision: int
-    title: str | None = None
+    content: str = Field(..., max_length=2_000_000)
+    base_revision: int = Field(..., ge=0)
+    title: str | None = Field(default=None, max_length=200)
 
 
 TokenResponse.model_rebuild()

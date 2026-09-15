@@ -15,6 +15,7 @@ from ..security import hash_password
 from ..services.analysis import get_analysis_service
 from ..services.retrieval import get_retrieval_service
 from ..storage import storage
+from ..config import settings
 
 DEMO_PHONE = "+255700000001"
 DEMO_PASSWORD = "weave-demo-123"
@@ -47,13 +48,15 @@ def seed() -> None:
             db.add(inst)
             db.flush()
 
-        # demo user
+        # The published demo password is useful locally and must never create a
+        # known privileged account in a deployed environment.
         user = db.query(User).filter(User.phone == DEMO_PHONE).first()
-        if not user:
+        is_deployed = settings.environment.lower() in {"production", "prod", "staging"}
+        if not user and not is_deployed:
             user = User(
                 phone=DEMO_PHONE, email="demo@weave.tz",
                 password_hash=hash_password(DEMO_PASSWORD),
-                role="both", preferred_language="sw", trust_tier="institutional",
+                role="admin", preferred_language="sw", trust_tier="institutional",
                 phone_verified=True, institution_id=inst.id,
             )
             db.add(user)
@@ -77,6 +80,13 @@ def seed() -> None:
             db.flush()
             n = retrieval.ingest_source(db, src, e["text"])
             print(f"  ingested source: {e['title'][:50]}… ({n} chunks)")
+
+        # Production still seeds the public source library, but no sample data
+        # can be attached when the local-only demo principal is absent.
+        if user is None:
+            db.commit()
+            print("Seed complete (public sources only; demo user disabled).")
+            return
 
         # sample project + dataset
         project = db.query(Project).filter(

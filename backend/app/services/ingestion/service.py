@@ -11,20 +11,35 @@ from __future__ import annotations
 
 import io
 import re
+import time
 
 from sqlalchemy.orm import Session
 
 from ...models import Source, SourceChunk
+from ...config import settings
 from ...storage import storage
 from ..retrieval import get_retrieval_service
-from ..websearch.client import _is_safe_url, _html_to_text
+from ..websearch.client import _html_to_text, _is_safe_url, _safe_get
 
 
 def _extract_pdf(data: bytes) -> str:
     try:
         from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        return "\n\n".join((page.extract_text() or "") for page in reader.pages)
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted or len(reader.pages) > settings.pdf_max_pages:
+            return ""
+        started = time.monotonic()
+        parts: list[str] = []
+        size = 0
+        for page in reader.pages:
+            if time.monotonic() - started > settings.pdf_parse_timeout_seconds:
+                return ""
+            text = page.extract_text() or ""
+            size += len(text)
+            if size > settings.pdf_max_text_chars:
+                return ""
+            parts.append(text)
+        return "\n\n".join(parts)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -41,8 +56,10 @@ class IngestionService:
         if not ok:
             return "", ""
         try:
-            r = self._httpx.get(url, timeout=30, follow_redirects=True,
-                                headers={"User-Agent": "Mozilla/5.0 (compatible; weave-ingest/1.0)"})
+            r = _safe_get(
+                self._httpx, url, timeout=30,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; weave-ingest/1.0)"},
+            )
             r.raise_for_status()
         except Exception:  # noqa: BLE001
             return "", ""

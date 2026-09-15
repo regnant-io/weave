@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..config import settings
 from ..deps import enforce_sandbox_limit
 from ..models import Dataset, Project, User
 from ..schemas import AnalysisRunOut, AnalysisRunRequest
@@ -23,6 +24,9 @@ def run_analysis(
     db: Session = Depends(get_db),
     user: User = Depends(enforce_sandbox_limit),
 ) -> AnalysisRunOut:
+    if not settings.analysis_execution_enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "analysis execution is disabled on this deployment")
     dataset = (
         db.query(Dataset).join(Project).filter(
             Dataset.id == body.dataset_id, Project.user_id == user.id

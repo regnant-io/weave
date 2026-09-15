@@ -1,0 +1,131 @@
+name: release-gates
+
+on:
+  pull_request:
+  push:
+    branches: [master, main, "codex/**", "hardening-**"]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r requirements.txt pip-audit bandit cyclonedx-bom
+        working-directory: backend
+      - run: pytest -q
+        working-directory: backend
+        env:
+          WEAVE_FORCE_OFFLINE_LLM: "true"
+      - run: python -m eval.run_eval
+        working-directory: backend
+        env:
+          WEAVE_FORCE_OFFLINE_LLM: "true"
+      - run: pip-audit -r requirements.txt
+        working-directory: backend
+      - run: bandit -r app -q -lll
+        working-directory: backend
+      - run: mkdir -p ../sbom && cyclonedx-py requirements requirements.txt -o ../sbom/python.cdx.json
+        working-directory: backend
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: python-sbom
+          path: sbom/python.cdx.json
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm audit --audit-level=low
+        working-directory: frontend
+      - run: npm run lint && npm run typecheck && npm run build
+        working-directory: frontend
+      - run: mkdir -p ../sbom && npm sbom --sbom-format cyclonedx > ../sbom/frontend.cdx.json
+        working-directory: frontend
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: frontend-sbom
+          path: sbom/frontend.cdx.json
+
+  renderer-and-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: render-service/package-lock.json
+      - run: npm ci
+        working-directory: render-service
+      - run: npm audit --audit-level=low && npm test && npm run build
+        working-directory: render-service
+      - run: mkdir -p ../sbom && npm sbom --sbom-format cyclonedx > ../sbom/renderer.cdx.json
+        working-directory: render-service
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: renderer-sbom
+          path: sbom/renderer.cdx.json
+      - run: python scripts/scan-secrets.py
+      - run: python scripts/check-image-pins.py
+      - run: docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet
+        env:
+          WEAVE_DOMAIN: weave.example.invalid
+          WEAVE_SECRET_KEY: ci-only-secret
+          POSTGRES_PASSWORD: ci-only-database-password
+          WEAVE_DATABASE_URL: postgresql+psycopg://weave:ci-only-database-password@postgres:5432/weave
+          WEAVE_S3_BUCKET: ci-placeholder-bucket
+      - run: bash -n deploy-kamatera.sh scripts/backup-postgres.sh scripts/verify-postgres-backup.sh
+
+  browser-journeys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: pip install -r requirements.txt
+        working-directory: backend
+      - run: npm ci && npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run e2e
+        working-directory: frontend
+
+  runtime-image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: docker build --provenance=false -t weave-backend:scan backend
+      - run: docker build --provenance=false -t weave-frontend:scan frontend
+      - run: docker build --provenance=false -t weave-render:scan render-service
+      - name: Reject fixable high or critical runtime CVEs
+        run: |
+          for image in weave-backend:scan weave-frontend:scan weave-render:scan; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v weave_trivy_cache:/root/.cache/ \
+              aquasec/trivy:latest@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 \
+              image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+              --exit-code 1 "$image"
+          done

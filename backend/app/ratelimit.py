@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 log = logging.getLogger("weave.ratelimit")
@@ -47,7 +48,8 @@ class TokenBucketLimiter:
     def __init__(self, rate_per_min: int, burst: int | None = None) -> None:
         self.rate = rate_per_min / 60.0  # tokens per second
         self.capacity = float(burst if burst is not None else rate_per_min)
-        self._buckets: dict[str, _Bucket] = {}
+        self._buckets: OrderedDict[str, _Bucket] = OrderedDict()
+        self._max_buckets = 100_000
         self._lock = threading.Lock()
 
     def allow(self, key: str, cost: float = 1.0) -> tuple[bool, float]:
@@ -58,6 +60,10 @@ class TokenBucketLimiter:
             if b is None:
                 b = _Bucket(tokens=self.capacity, last=now)
                 self._buckets[key] = b
+                while len(self._buckets) > self._max_buckets:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(key)
             # refill
             elapsed = now - b.last
             b.tokens = min(self.capacity, b.tokens + elapsed * self.rate)

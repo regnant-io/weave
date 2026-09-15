@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import get_db
-from .models import User
+from .models import AuthSession, User
 from .ratelimit import build_limiter
 from .security import decode_access_token
 
@@ -24,6 +24,8 @@ sandbox_limiter = build_limiter(settings.rate_limit_sandbox_per_min,
                                 namespace="weave:rl:sandbox")
 anon_limiter = build_limiter(settings.rate_limit_anon_per_min, namespace="weave:rl:anon")
 auth_limiter = build_limiter(settings.rate_limit_auth_per_min, namespace="weave:rl:auth")
+session_limiter = build_limiter(settings.rate_limit_session_per_min,
+                                namespace="weave:rl:session")
 
 
 def get_current_user(
@@ -42,6 +44,20 @@ def get_current_user(
     if payload.get("scope") == "ws":
         raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                             "this token is only valid for opening a websocket")
+    session_id = payload.get("sid")
+    if session_id:
+        session = db.get(AuthSession, str(session_id))
+        if session is None or session.user_id != payload.get("sub") or session.revoked_at:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session has been revoked")
+        expiry = session.expires_at
+        if expiry.tzinfo is None:
+            from datetime import timezone
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        from datetime import datetime, timezone
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session has expired")
+    elif settings.is_deployed:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "legacy session token rejected")
     user = db.query(User).filter(User.id == payload["sub"]).first()
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
@@ -63,7 +79,7 @@ def get_optional_user(
 def _client_key(request: Request, user: User | None) -> str:
     if user:
         return f"user:{user.id}"
-    fwd = request.headers.get("x-forwarded-for")
+    fwd = request.headers.get("x-forwarded-for") if settings.trust_proxy_headers else None
     ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
     return f"ip:{ip}"
 
@@ -119,10 +135,25 @@ def enforce_auth_limit(request: Request) -> None:
         )
 
 
+def enforce_session_limit(request: Request) -> None:
+    """Bound high-entropy refresh traffic separately from password/OTP attempts."""
+    allowed, retry = session_limiter.allow(_client_key(request, None))
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "session refresh rate limit exceeded",
+            headers={"Retry-After": str(int(retry) + 1)},
+        )
+
+
 def get_admin_user(user: User = Depends(get_current_user)) -> User:
-    """Admin/ops scope (architecture 4.2 /admin). Gated to the 'admin' role or
-    institutional trust tier for the MVP."""
-    if user.role != "admin" and user.trust_tier != "institutional":
+    """Admin/ops scope (architecture 4.2 /admin).
+
+    Institutional trust permits heavier research capabilities.  It does not
+    confer global operator rights over every user's audit data and the shared
+    source library; those rights require the explicit admin role.
+    """
+    if user.role != "admin":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "admin access required")
     return user
 

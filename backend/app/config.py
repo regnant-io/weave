@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     # would invalidate tokens on restart, so we ship a stable dev default.
     secret_key: str = "dev-insecure-change-me-in-production-please-0123456789"
     jwt_algorithm: str = "HS256"
-    access_token_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
+    access_token_ttl_seconds: int = 60 * 15
+    refresh_token_ttl_seconds: int = 60 * 60 * 24 * 30
     otp_ttl_seconds: int = 60 * 10
 
     # --- database ---
@@ -70,6 +71,10 @@ class Settings(BaseSettings):
     s3_bucket: str = "weave-datasets"
     s3_endpoint_url: str | None = None
     s3_region: str = "af-south-1"  # data-residency-aware default (architecture 10)
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: str | None = None
+    s3_key_prefix: str = "weave"
+    s3_cache_dir: str = str(DATA_DIR / "s3-cache")
 
     # --- LLM ---
     # Backend selection (see llm.get_engine):
@@ -134,6 +139,10 @@ class Settings(BaseSettings):
     websearch_max_pages: int = 4          # pages deep-read per research round
     research_max_rounds: int = 3          # iterative search->read->gap rounds
     research_max_fetch_bytes: int = 2_000_000
+    pdf_max_pages: int = 250
+    pdf_max_text_chars: int = 2_000_000
+    pdf_parse_timeout_seconds: int = 20
+    crawler_max_queued_urls: int = 2_000
 
     # --- visual / presentation rendering (self-hosted) ---
     # Node render-sandbox HTTP service (charts, Three.js, decks).
@@ -160,6 +169,8 @@ class Settings(BaseSettings):
     # --- artifact lifecycle + per-turn safety ---
     artifact_ttl_seconds: int = 60 * 60 * 24 * 3   # keep generated artifacts 3 days
     artifact_sweep_interval_seconds: int = 60 * 60
+    idempotency_ttl_seconds: int = 60 * 60 * 24
+    artifact_capability_max_future_seconds: int = 60 * 60 * 24 * 3
     max_sandbox_runs_per_turn: int = 6
     max_web_calls_per_turn: int = 12
     # The workspace container is the most expensive capability per call, and a
@@ -167,7 +178,10 @@ class Settings(BaseSettings):
     max_workspace_execs_per_turn: int = 40
 
     # --- sandbox (architecture section 8) ---
-    sandbox_backend: str = "subprocess"  # subprocess | firecracker
+    sandbox_backend: str = "subprocess"  # subprocess | remote | firecracker
+    analysis_runner_url: str | None = None
+    analysis_runner_secret: str | None = None
+    analysis_execution_enabled: bool = True
     sandbox_timeout_seconds: int = 30
     sandbox_heavy_timeout_seconds: int = 120
     sandbox_memory_mb: int = 512
@@ -178,7 +192,8 @@ class Settings(BaseSettings):
     # A persistent, network-enabled, per-project directory the model builds
     # software in. Deliberately separate from the analysis sandbox, which must
     # keep its no-network / no-filesystem guarantees around user data.
-    workspace_enabled: bool = True
+    workspace_enabled: bool = False
+    allow_workspace_in_production: bool = False
     workspace_root: str = str(DATA_DIR / "workspaces")
     workspace_image: str = os.getenv("WEAVE_WORKSPACE_IMAGE", "weave-workspace:latest")
     # Execution is containerised; without a container runtime the workspace
@@ -206,6 +221,14 @@ class Settings(BaseSettings):
     #: attacker gains something by calling them thousands of times. A person
     #: signing in mistypes their password twice, not twenty times a minute.
     rate_limit_auth_per_min: int = 8
+    # Refresh tokens have 256 bits of entropy and cannot be guessed like a
+    # password or OTP. Keep abuse bounded without sharing the tight credential
+    # bucket used during a legitimate sign-up flow.
+    rate_limit_session_per_min: int = 60
+    # Honour X-Forwarded-For only when the API is reachable exclusively through
+    # a trusted reverse proxy.  A public client can forge this header otherwise
+    # and rotate its rate-limit identity on every request.
+    trust_proxy_headers: bool = False
     #: How many wrong codes one OTP may absorb before it is burned.
     #:
     #: A six-digit code has a million values and a ten-minute life. Without a
@@ -218,6 +241,8 @@ class Settings(BaseSettings):
     # --- background jobs / cache (Redis + Celery) ---
     redis_url: str | None = os.getenv("WEAVE_REDIS_URL")   # e.g. redis://redis:6379/0
     celery_always_eager: bool = False  # run tasks inline when True or no redis
+    job_max_retries: int = 3
+    job_retry_base_seconds: int = 5
 
     # --- observability (OpenTelemetry) ---
     otel_enabled: bool = bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
@@ -232,6 +257,7 @@ class Settings(BaseSettings):
 
     # --- WhatsApp channel (architecture §11 v2) ---
     whatsapp_verify_token: str = os.getenv("WEAVE_WA_VERIFY_TOKEN", "weave-verify")
+    whatsapp_app_secret: str | None = os.getenv("WEAVE_WA_APP_SECRET")
     whatsapp_token: str | None = os.getenv("WEAVE_WA_TOKEN")
     whatsapp_phone_id: str | None = os.getenv("WEAVE_WA_PHONE_ID")
 
@@ -248,7 +274,11 @@ class Settings(BaseSettings):
                      "browserless_url", "render_service_url", "gotenberg_url",
                      "stt_url", "tts_url",
                      "clickhouse_url", "anthropic_api_key", "whatsapp_token",
-                     "whatsapp_phone_id", "at_username", "at_api_key", mode="before")
+                     "whatsapp_app_secret",
+                     "whatsapp_phone_id", "at_username", "at_api_key",
+                     "s3_endpoint_url", "s3_access_key_id", "s3_secret_access_key",
+                     "analysis_runner_url", "analysis_runner_secret",
+                     mode="before")
     @classmethod
     def _empty_to_none(cls, v):  # noqa: ANN001
         return None if (v is not None and not str(v).strip()) else v
@@ -256,6 +286,10 @@ class Settings(BaseSettings):
     @property
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")
+
+    @property
+    def is_deployed(self) -> bool:
+        return self.environment.lower() in {"production", "prod", "staging"}
 
 
 @lru_cache

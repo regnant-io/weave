@@ -15,6 +15,25 @@
 const nextConfig = {
   reactStrictMode: true,
   compress: true,
+  // Emit the traced server and only the packages it actually imports. The
+  // runtime container no longer needs the complete development dependency tree.
+  output: "standalone",
+
+  async headers() {
+    return [{
+      source: "/(.*)",
+      headers: [
+        { key: "X-Content-Type-Options", value: "nosniff" },
+        { key: "X-Frame-Options", value: "SAMEORIGIN" },
+        { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+        { key: "Strict-Transport-Security", value: "max-age=31536000" },
+        {
+          key: "Content-Security-Policy",
+          value: "base-uri 'self'; object-src 'none'; frame-ancestors 'self'",
+        },
+      ],
+    }];
+  },
   
   compiler: {
     // Remove console.log in production

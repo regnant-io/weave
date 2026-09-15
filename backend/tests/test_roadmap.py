@@ -41,11 +41,35 @@ def test_grounding_v2_passes_supported_claim():
 
 
 def test_artifact_signing_roundtrip():
+    import time
     key = "render/abc123_chart.svg"
-    sig = sign_path(key)
-    assert verify_path(key, sig)
-    assert not verify_path(key, "tampered")
-    assert not verify_path("render/other.svg", sig)
+    expiry = int(time.time()) + 60
+    sig = sign_path(key, expiry)
+    assert verify_path(key, sig, expiry)
+    assert not verify_path(key, "tampered", expiry)
+    assert not verify_path("render/other.svg", sig, expiry)
+    assert not verify_path(key, sign_path(key, 1), 1)
+
+
+def test_html_artifact_keeps_its_sandbox_when_opened_directly(app_client):
+    import time
+    from app.storage import storage
+
+    key = "render/test-direct-navigation.html"
+    storage.put_bytes(key, b"<script>document.body.textContent='ok'</script>")
+    try:
+        expiry = int(time.time()) + 60
+        response = app_client.get(
+            f"/api/v1/artifacts/{key}?exp={expiry}&sig={sign_path(key, expiry)}"
+        )
+        assert response.status_code == 200
+        csp = response.headers["content-security-policy"]
+        assert "sandbox allow-scripts" in csp
+        assert "allow-pointer-lock" in csp
+        assert "connect-src data: blob:" in csp
+        assert "connect-src 'self'" not in csp
+    finally:
+        storage.delete(key)
 
 
 def test_injection_sanitiser_strips_directives():
@@ -101,3 +125,59 @@ def test_context_window_follows_the_model_not_a_constant():
         "the context ceiling must default to 0 (no cap) so each model gets its "
         "own full window"
     )
+
+
+def test_celery_boundary_retries_then_dead_letters(monkeypatch, app_client):
+    """A failing worker task must be visible and must stop retrying."""
+    from app import tasks
+    from app.db import SessionLocal
+    from app.models import JobRecord
+
+    registered = {}
+
+    class FakeCelery:
+        def task(self, **options):
+            def register(fn):
+                registered[options["name"]] = fn
+                return fn
+            return register
+
+    class RetrySignal(Exception):
+        pass
+
+    class Request:
+        retries = 0
+
+    class FakeTask:
+        request = Request()
+
+        @staticmethod
+        def retry(*, exc, countdown):
+            assert countdown == tasks.settings.job_retry_base_seconds
+            raise RetrySignal from exc
+
+    monkeypatch.setattr(tasks, "get_celery", lambda: FakeCelery())
+
+    @tasks.job("weave.test_retry_boundary")
+    def always_fails():
+        raise RuntimeError("fixture failure")
+
+    job_id = tasks._new_job("weave.test_retry_boundary")
+    with __import__("pytest").raises(RetrySignal):
+        registered["weave.test_retry_boundary"](FakeTask(), _job_id=job_id)
+
+    db = SessionLocal()
+    try:
+        row = db.get(JobRecord, job_id)
+        assert row.status == "retrying"
+        assert row.attempts == 1
+
+        FakeTask.request.retries = tasks.settings.job_max_retries
+        with __import__("pytest").raises(RuntimeError, match="fixture failure"):
+            registered["weave.test_retry_boundary"](FakeTask(), _job_id=job_id)
+        db.expire_all()
+        row = db.get(JobRecord, job_id)
+        assert row.status == "dead_letter"
+        assert row.attempts == 2
+    finally:
+        db.close()

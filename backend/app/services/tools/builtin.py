@@ -16,7 +16,7 @@ def _emit_live(ctx: ToolContext, result: dict, tool: str) -> None:
     a chart that was finished twenty minutes earlier. Emitting here is what
     turns the announced skeleton into the real thing.
     """
-    from ...security import sign_path
+    from ...security import artifact_url
 
     for f in result.get("output_files") or []:
         key = f.get("s3_key")
@@ -27,7 +27,7 @@ def _emit_live(ctx: ToolContext, result: dict, tool: str) -> None:
             "mime": f.get("mime", "application/octet-stream"),
             "bytes": f.get("bytes", 0),
             "tool": tool,
-            "url": f"/api/artifact/{key}?sig={sign_path(key)}",
+            "url": artifact_url(key),
         })
 
 

@@ -143,6 +143,19 @@ def run_delegate(
                      "(web search, page fetch, workspace read) are available on this turn",
         }
 
+    allowed_names = {t["name"] for t in allowed}
+
+    def scoped_executor(name: str, args: dict) -> dict:
+        # The provider response is untrusted even when the schema was filtered.
+        # A hallucinated or injected function name must not fall through to the
+        # parent turn's broader executor (which may include write/exec tools).
+        if name not in allowed_names:
+            return {
+                "status": "rejected",
+                "error": f"tool {name!r} is outside the delegate's read-only scope",
+            }
+        return tool_executor(name, args)
+
     def sink(kind: str, data: dict) -> None:
         """What the user sees of a delegate's work.
 
@@ -161,7 +174,7 @@ def run_delegate(
         system=_SYSTEM,
         messages=[{"role": "user", "content": _brief(task, context, expect)}],
         tools=allowed,
-        tool_executor=tool_executor,
+        tool_executor=scoped_executor,
         emit=sink,
         # No planning round and no critic: both cost a model call each, and a
         # question small enough to delegate is small enough not to need a plan

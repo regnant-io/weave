@@ -1,4 +1,4 @@
-# iOS 15 Compatibility Fixes - Complete Summary
+ iOS 15 Compatibility Fixes - Complete Summary
 
 ## Problem
 The Weave application was crashing on iPad running iOS 15.8.8 (and other older browsers) with two critical errors:
@@ -185,9 +185,8 @@ echo "🔄 Rebuilding frontend with ALL fixes..."
 
 cd /opt/weave
 
-# Pull latest code
-git fetch origin
-git reset --hard origin/master
+# Pull latest code without deleting server-side work
+git pull --ff-only
 
 # Stop and remove old frontend
 sudo docker-compose stop frontend

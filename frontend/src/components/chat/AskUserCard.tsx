@@ -36,7 +36,7 @@ export default function AskUserCard({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const questions = request.questions ?? [];
+  const questions = useMemo(() => request.questions ?? [], [request.questions]);
 
   const answered = request.answered;
 

@@ -15,6 +15,13 @@
 # application code is mounted — so this never diverges from what is built.
 services:
   backend:
+    # The local-only Docker socket needs host-level Docker access. The base image
+    # itself runs as uid 10001; only this explicitly local override restores root.
+    user: root
+    build:
+      context: ./backend
+      args:
+        INSTALL_DOCKER_CLI: "true"
     volumes:
       - ./backend/app:/app/app
       # Tests too, so the suite can be run against the mounted source
@@ -29,6 +36,9 @@ services:
       # nothing — you edit, nothing happens, and you conclude the change was
       # wrong rather than unloaded. Polling is the only thing that works here.
       WATCHFILES_FORCE_POLLING: "true"
+      # Local development opts into the Docker-backed workspace.  The base
+      # deployment keeps it off and does not mount the host Docker socket.
+      WEAVE_WORKSPACE_ENABLED: "true"
     # Seeding is skipped here: the database already exists after the first boot,
     # and re-running the seeder on every reload is noise.
     command: >

@@ -64,7 +64,7 @@ export default function PlanRail({
   live?: boolean;
 }) {
   const t = LABELS[language] ?? LABELS.en;
-  const steps = plan.steps ?? [];
+  const steps = useMemo(() => plan.steps ?? [], [plan.steps]);
   const done = steps.filter(
     (s) => s.status === "done" || s.status === "skipped",
   ).length;
