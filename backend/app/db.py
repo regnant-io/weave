@@ -121,6 +121,10 @@ def init_db() -> None:
     """Create tables and the FTS5 index used by the Retrieval Service."""
     from . import models  # noqa: F401  (register mappers)
 
+    if settings.is_deployed:
+        _require_current_migration()
+        return
+
     Base.metadata.create_all(bind=engine)
 
     if settings.is_sqlite:
@@ -164,11 +168,37 @@ def init_db() -> None:
                 conn.execute(text(
                     "ALTER TABLE otp_codes ADD COLUMN attempts INTEGER DEFAULT 0"
                 ))
+            scols = {r[1] for r in conn.execute(text("PRAGMA table_info(source_chunks)"))}
+            if "embedding_vector" not in scols:
+                conn.execute(text(
+                    "ALTER TABLE source_chunks ADD COLUMN embedding_vector JSON"
+                ))
 
     else:
         _init_postgres()
 
     _backfill_threads()
+
+
+def _require_current_migration() -> None:
+    """Production startup is a schema check, never a schema mutation."""
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    ini = Path(__file__).resolve().parent.parent / "alembic.ini"
+    cfg = Config(str(ini))
+    scripts = ScriptDirectory.from_config(cfg)
+    expected = scripts.get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+    if current != expected:
+        raise RuntimeError(
+            f"database migration is {current or 'unversioned'}, expected {expected}; "
+            "run `alembic upgrade head` before starting Weave"
+        )
 
 
 def _init_postgres() -> None:

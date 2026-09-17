@@ -19,7 +19,7 @@ Expected output:
 - ✅ `weave-backend-1` - FastAPI backend
 - ✅ `weave-frontend-1` - Next.js frontend
 - ✅ `weave-searxng-1` - Web search metasearch engine
-- ✅ `weave-browserless-1` - Headless Chrome for web scraping
+- ✅ `weave-browserless-1` - Headless Chrome for generated-artifact verification
 - ✅ `weave-render-1` - Chart/3D/presentation rendering
 - ✅ `weave-minio-1` - Object storage
 - ✅ `weave-qdrant-1` - Vector database
@@ -52,7 +52,7 @@ Expected output:
 - `ask_user` - Interactive questions
 - `canvas_*` - Shared document editing
 
-### Developer Workspace (✅ Enabled)
+### Developer Workspace (local development only)
 - `workspace_write/read/edit/list/move/delete` - File operations
 - `workspace_exec` - Run commands (npm, pip, tests)
 - `workspace_verify` - Syntax checking
@@ -103,12 +103,15 @@ docker compose exec backend /bin/bash
 docker compose exec backend pytest
 ```
 
-## 🎯 Demo Login (Has Admin Access)
+## 🎯 Local Demo Login (Has Admin Access)
 
 **Phone:** `+255700000001`  
 **Password:** `weave-demo-123`  
 **Email:** `demo@weave.tz`  
-**Trust Tier:** `institutional` (grants admin access)
+- **Role:** `admin` (grants admin access)
+- **Trust tier:** `institutional` (capability tier; does not grant admin access)
+
+This account is not seeded in staging or production.
 
 This user can access:
 - All frontend features
@@ -142,7 +145,11 @@ docker compose logs searxng
 docker compose restart searxng
 ```
 
-### Clear everything and start fresh
+### Reset disposable local data
+
+This deletes the local Postgres and service volumes. Use it only for a disposable
+developer stack after saving anything you need.
+
 ```powershell
 docker compose down -v  # -v removes volumes
 docker compose --profile deep up --build -d
@@ -157,9 +164,11 @@ docker compose --profile deep up --build -d
 
 ## 🔐 Security Notes
 
-- **Workspace execution** (`workspace_exec`) runs containers on your host - disable with `WEAVE_WORKSPACE_ENABLED=false` if exposing to untrusted users
-- **Docker socket** is mounted for workspace - privilege escalation risk
-- **SearXNG** fetches untrusted web content - SSRF protections are in place
+- **Workspace execution** (`workspace_exec`) is enabled by the local Compose override.
+- **Docker socket** is mounted only by that development override. The base deployment keeps both disabled.
+- **SearXNG** fetches untrusted web content through bounded, redirect-aware SSRF
+  checks. Browserless arbitrary-page navigation stays disabled until its network
+  has production egress isolation.
 - **SMS OTP** logs to console in dev mode (set `WEAVE_SMS_PROVIDER` for production)
 
 ## 📊 Resource Requirements
@@ -169,7 +178,7 @@ Minimal (no deep profile):
 - RAM: 2GB
 - Disk: 5GB
 
-Full (deep profile):
+Deep search/render profile:
 - CPU: 4+ cores
 - RAM: 8GB+ (Chromium/Babylon.js are heavy)
 - Disk: 20GB+
@@ -186,4 +195,5 @@ Full (deep profile):
 8. Ask for a visualization - watch it use `generate_visual`
 9. Build something - watch it use `workspace_*` tools
 
-All 43 tools are now available to the orchestrator! 🎉
+`GET /health` shows the exact tools enabled by the services and safety settings
+in the current environment.

@@ -340,7 +340,7 @@ export default function SettingsClient({
           {health.tools && health.tools.length > 0 && (
             <div className="pt-2">
               <div className="mb-2 text-xs font-medium uppercase tracking-wide text-fg-faint">
-                {sw ? "Zana zinazopatikana" : "Available tools"} ({health.tools.length})
+                {sw ? "Zana zilizosajiliwa" : "Registered tools"} ({health.tools.length})
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {health.tools.map((tool, i) => (

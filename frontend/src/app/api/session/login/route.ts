@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { LANG_COOKIE, MODE_COOKIE, TOKEN_COOKIE } from "@/lib/session";
+import { LANG_COOKIE, MODE_COOKIE, REFRESH_COOKIE, TOKEN_COOKIE } from "@/lib/session";
 
 const API_BASE = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
 
@@ -19,7 +19,10 @@ export async function POST(req: NextRequest) {
   const out = NextResponse.json({ user: data.user });
   const secure = process.env.NODE_ENV === "production";
   out.cookies.set(TOKEN_COOKIE, data.access_token, {
-    httpOnly: true, secure, sameSite: "lax", path: "/", maxAge: 60 * 60 * 24 * 7,
+    httpOnly: true, secure, sameSite: "lax", path: "/", maxAge: 60 * 15,
+  });
+  out.cookies.set(REFRESH_COOKIE, data.refresh_token, {
+    httpOnly: true, secure, sameSite: "strict", path: "/api/session", maxAge: 60 * 60 * 24 * 30,
   });
   out.cookies.set(LANG_COOKIE, data.user.preferred_language ?? "sw", { path: "/", maxAge: 60 * 60 * 24 * 365 });
   out.cookies.set(MODE_COOKIE, data.user.role === "researcher" ? "researcher" : "student", { path: "/" });

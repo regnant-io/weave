@@ -10,11 +10,18 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text,
+    JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .config import settings
+
+if settings.is_sqlite:
+    _VECTOR_TYPE = JSON
+else:  # pragma: no cover - exercised by Postgres integration
+    from pgvector.sqlalchemy import Vector
+    _VECTOR_TYPE = Vector(settings.embedding_dim)
 
 
 def _uuid() -> str:
@@ -43,10 +50,10 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String(32), unique=True, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(String(16), default="student")  # student|researcher|both
+    role: Mapped[str] = mapped_column(String(16), default="student")  # student|researcher|both|admin
     institution_id: Mapped[str | None] = mapped_column(ForeignKey("institutions.id"), nullable=True)
     preferred_language: Mapped[str] = mapped_column(String(8), default="sw")  # sw | en
-    trust_tier: Mapped[str] = mapped_column(String(16), default="verified")  # anon|verified|institutional
+    trust_tier: Mapped[str] = mapped_column(String(16), default="anonymous")  # anonymous|verified|institutional
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     #: May the sources this user's sessions actually consult be queued for
     #: crawling into the shared library? ON by default — the library only gets
@@ -100,6 +107,9 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     citations: Mapped[list["Citation"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    canvases: Mapped[list["Canvas"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class Dataset(Base):
@@ -291,6 +301,8 @@ class Canvas(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
+    project: Mapped[Project] = relationship(back_populates="canvases")
+
 
 class CrawlSeed(Base):
     """A starting point for the crawler, plus the politeness budget for it.
@@ -377,6 +389,9 @@ class SourceChunk(Base):
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list] = mapped_column(JSON, default=list)
+    # Native indexed vector for the production path. JSON remains the portable
+    # source of truth and fallback for SQLite or a mismatched external model.
+    embedding_vector: Mapped[list | None] = mapped_column(_VECTOR_TYPE, nullable=True)
 
     source: Mapped[Source] = relationship(back_populates="chunks")
 
@@ -408,4 +423,102 @@ class SandboxAudit(Base):
     status: Mapped[str] = mapped_column(String(16))
     execution_time_ms: Mapped[int] = mapped_column(Integer, default=0)
     peak_memory_kb: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class IdempotencyRecord(Base):
+    """Durable ownership-scoped replay record for retryable mutations."""
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        UniqueConstraint("namespace", "owner_id", "project_id", "key",
+                         name="uq_idempotency_scope_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    namespace: Mapped[str] = mapped_column(String(64))
+    owner_id: Mapped[str] = mapped_column(String(32), index=True)
+    project_id: Mapped[str] = mapped_column(String(32), default="")
+    key: Mapped[str] = mapped_column(String(128))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    resource_type: Mapped[str] = mapped_column(String(32), default="")
+    resource_id: Mapped[str] = mapped_column(String(64), default="")
+    response: Mapped[dict] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class OutboxEvent(Base):
+    """A side effect committed atomically with application state."""
+    __tablename__ = "outbox_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    topic: Mapped[str] = mapped_column(String(64), index=True)
+    aggregate_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class WebhookReceipt(Base):
+    """Provider event IDs make webhook retries harmless."""
+    __tablename__ = "webhook_receipts"
+    __table_args__ = (
+        UniqueConstraint("provider", "event_id", name="uq_webhook_provider_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    provider: Mapped[str] = mapped_column(String(32))
+    event_id: Mapped[str] = mapped_column(String(128))
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="received")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class JobRecord(Base):
+    """User-visible state for background work and dead-letter diagnosis."""
+    __tablename__ = "job_records"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    owner_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    project_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    celery_task_id: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    progress: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+class AuthSession(Base):
+    """Rotating refresh-token family and server-side revocation point."""
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    family_id: Mapped[str] = mapped_column(String(32), index=True)
+    refresh_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    replaced_by_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class AdminInvitation(Base):
+    """Single-use operator grant created by an existing administrator."""
+    __tablename__ = "admin_invitations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    invited_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

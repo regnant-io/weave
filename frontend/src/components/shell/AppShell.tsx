@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect } from "react";
 import type { ThemePref } from "@/lib/session";
 import type { Language } from "@/lib/types";
 import WeaveMark from "@/components/brand/WeaveMark";
@@ -64,6 +65,21 @@ function Frame({
   const { collapsed, toggle, setMobileOpen } = useSidebar();
   // Publishes --kb-inset so bottom-anchored UI can clear the iOS keyboard.
   useViewportInsets();
+  useEffect(() => {
+    const refresh = () => fetch("/api/session/refresh", { method: "POST" }).catch(() => undefined);
+    // Refresh when a sleeping tab becomes active again. Rotating immediately
+    // on every mount races the first API request after login: the old access
+    // token can be revoked while that request is already in flight.
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    const timer = window.setInterval(refresh, 10 * 60 * 1000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(timer);
+    };
+  }, []);
 
   return (
     <div className="h-app flex overflow-hidden">

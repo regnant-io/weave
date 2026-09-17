@@ -11,9 +11,150 @@ def test_register_and_me(app_client):
     })
     assert res.status_code == 201, res.text
     token = res.json()["access_token"]
+    assert res.json()["user"]["trust_tier"] == "anonymous"
     me = app_client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert me.status_code == 200
     assert me.json()["phone"] == phone
+
+
+def test_registration_unique_constraint_race_returns_conflict():
+    """Two requests can both pass the optimistic lookup before either inserts."""
+    import pytest
+    from fastapi import HTTPException
+    from sqlalchemy.exc import IntegrityError
+
+    from app.api.auth import register
+    from app.schemas import RegisterRequest
+
+    class EmptyQuery:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return None
+
+    class RacingSession:
+        rolled_back = False
+
+        def query(self, *_args, **_kwargs):
+            return EmptyQuery()
+
+        def add(self, _row):
+            pass
+
+        def commit(self):
+            raise IntegrityError("INSERT users", {}, RuntimeError("unique"))
+
+        def rollback(self):
+            self.rolled_back = True
+
+    db = RacingSession()
+    with pytest.raises(HTTPException) as exc:
+        register(RegisterRequest(phone="+255700008888", password="password123"), db)
+    assert exc.value.status_code == 409
+    assert db.rolled_back is True
+
+
+def test_refresh_tokens_rotate_and_reuse_revokes_the_family(app_client):
+    phone = "+2557" + uuid.uuid4().hex[:8]
+    issued = app_client.post("/api/v1/auth/register", json={
+        "phone": phone, "password": "password123",
+    }).json()
+    old_refresh = issued["refresh_token"]
+    rotated = app_client.post("/api/v1/auth/refresh", json={
+        "refresh_token": old_refresh,
+    })
+    assert rotated.status_code == 200, rotated.text
+    new_access = rotated.json()["access_token"]
+    assert rotated.json()["refresh_token"] != old_refresh
+    assert app_client.get("/api/v1/auth/me", headers={
+        "Authorization": f"Bearer {new_access}",
+    }).status_code == 200
+
+    reuse = app_client.post("/api/v1/auth/refresh", json={
+        "refresh_token": old_refresh,
+    })
+    assert reuse.status_code == 401
+    assert app_client.get("/api/v1/auth/me", headers={
+        "Authorization": f"Bearer {new_access}",
+    }).status_code == 401
+
+
+def test_logout_revokes_server_session(app_client):
+    phone = "+2557" + uuid.uuid4().hex[:8]
+    token = app_client.post("/api/v1/auth/register", json={
+        "phone": phone, "password": "password123",
+    }).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    assert app_client.post("/api/v1/auth/logout", headers=headers).status_code == 200
+    assert app_client.get("/api/v1/auth/me", headers=headers).status_code == 401
+
+
+def test_logout_can_revoke_by_refresh_token_without_access(app_client):
+    phone = "+2557" + uuid.uuid4().hex[:8]
+    issued = app_client.post("/api/v1/auth/register", json={
+        "phone": phone, "password": "password123",
+    }).json()
+    response = app_client.post("/api/v1/auth/logout", json={
+        "refresh_token": issued["refresh_token"],
+    })
+    assert response.status_code == 200
+    assert app_client.post("/api/v1/auth/refresh", json={
+        "refresh_token": issued["refresh_token"],
+    }).status_code == 401
+
+
+def test_self_registration_cannot_claim_institutional_trust(app_client):
+    """An institution id is an authorisation grant and needs verification."""
+    phone = "+2557" + uuid.uuid4().hex[:8]
+    res = app_client.post("/api/v1/auth/register", json={
+        "phone": phone,
+        "password": "password123",
+        "institution_id": "claimed-without-proof",
+    })
+    assert res.status_code == 403
+
+
+def test_institutional_trust_does_not_grant_global_admin_access():
+    from fastapi import HTTPException
+    import pytest
+
+    from app.deps import get_admin_user
+    from app.models import User
+
+    user = User(phone="+255700000099", password_hash="x", role="researcher",
+                trust_tier="institutional")
+    with pytest.raises(HTTPException) as exc:
+        get_admin_user(user)
+    assert exc.value.status_code == 403
+
+
+def test_whatsapp_signature_verification(monkeypatch):
+    import hashlib
+    import hmac
+
+    from app.api.channels import _valid_whatsapp_signature
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "whatsapp_app_secret", "test-app-secret")
+    body = b'{"entry":[]}'
+    sig = "sha256=" + hmac.new(b"test-app-secret", body, hashlib.sha256).hexdigest()
+
+    assert _valid_whatsapp_signature(body, sig)
+    assert not _valid_whatsapp_signature(body + b" ", sig)
+    assert not _valid_whatsapp_signature(body, None)
+
+
+def test_whatsapp_delivery_never_logs_as_success_in_production(monkeypatch):
+    import pytest
+    from app.api.channels import _send_whatsapp
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "whatsapp_token", None)
+    monkeypatch.setattr(settings, "whatsapp_phone_id", None)
+    with pytest.raises(RuntimeError, match="outbound credentials"):
+        _send_whatsapp("255700000000", "reply")
 
 
 def test_login_wrong_password_rejected(app_client):
@@ -27,6 +168,22 @@ def test_protected_route_requires_token(app_client):
     assert app_client.get("/api/v1/projects").status_code == 401
 
 
+def test_normal_user_cannot_replace_the_global_model_host(app_client, auth_headers):
+    res = app_client.post("/api/v1/ollama", headers=auth_headers,
+                          json={"host": "https://attacker.example"})
+    assert res.status_code == 403
+
+
+def test_operator_can_provision_an_explicit_admin(db_session):
+    from app.cli import provision_admin
+
+    phone = "+2557" + uuid.uuid4().hex[:8]
+    user = provision_admin(db_session, phone, "a-long-admin-password")
+    assert user.role == "admin"
+    assert user.trust_tier == "institutional"
+    assert user.phone_verified is True
+
+
 def test_otp_flow(app_client):
     phone = "+2557" + uuid.uuid4().hex[:8]
     req = app_client.post("/api/v1/auth/otp/request", json={"phone": phone})
@@ -35,6 +192,20 @@ def test_otp_flow(app_client):
     ver = app_client.post("/api/v1/auth/otp/verify", json={"phone": phone, "code": code})
     assert ver.status_code == 200
     assert ver.json()["user"]["phone_verified"] is True
+    assert ver.json()["user"]["trust_tier"] == "verified"
+
+
+def test_production_sms_failure_does_not_log_the_otp(monkeypatch, caplog):
+    import pytest
+
+    from app.api.auth import SmsDeliveryError, _send_sms
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "sms_provider", "log")
+    with pytest.raises(SmsDeliveryError):
+        _send_sms("+255700000000", "Weave verification code: 123456")
+    assert "123456" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

@@ -8,11 +8,14 @@ boundaries (app.services.*) keep them independently extractable later.
 from __future__ import annotations
 
 import logging
+import socket
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from .api import api_router
 from .config import settings
@@ -68,6 +71,39 @@ def _preflight() -> None:
 
     if is_prod and settings.debug:
         problems.append("WEAVE_DEBUG is on in a production environment.")
+    if is_prod and settings.storage_backend != "s3":
+        problems.append("production object storage must use the durable S3 backend")
+
+    if is_prod and "*" in settings.cors_origins:
+        problems.append("WEAVE_CORS_ORIGINS may not contain '*' with credentialed requests.")
+
+    if (is_prod and settings.analysis_execution_enabled
+            and settings.sandbox_backend == "subprocess"):
+        problems.append(
+            "the subprocess analysis sandbox is not a production isolation boundary. "
+            "Set WEAVE_ANALYSIS_EXECUTION_ENABLED=false until a container/gVisor/"
+            "Firecracker backend is configured."
+        )
+    if is_prod and settings.analysis_execution_enabled and settings.sandbox_backend in {
+            "remote", "firecracker"} and not (
+                settings.analysis_runner_url and settings.analysis_runner_secret):
+        problems.append("the isolated analysis runner URL and signing secret are required")
+
+    if (is_prod and settings.workspace_enabled
+            and not settings.allow_workspace_in_production):
+        problems.append(
+            "the Docker-backed developer workspace is enabled in production. "
+            "Keep it disabled, or set WEAVE_ALLOW_WORKSPACE_IN_PRODUCTION=true "
+            "only after isolating the workspace runner from the application host."
+        )
+
+    if settings.whatsapp_app_secret or settings.whatsapp_token or settings.whatsapp_phone_id:
+        if settings.whatsapp_verify_token == "weave-verify":
+            problems.append("WEAVE_WA_VERIFY_TOKEN is still the public development default.")
+        if not settings.whatsapp_app_secret:
+            problems.append("WEAVE_WA_APP_SECRET is required to authenticate webhook POSTs.")
+        if not (settings.whatsapp_token and settings.whatsapp_phone_id):
+            problems.append("WEAVE_WA_TOKEN and WEAVE_WA_PHONE_ID are required for replies.")
 
     # SQLite in production is not a configuration, it is an accident.
     #
@@ -75,16 +111,24 @@ def _preflight() -> None:
     # moment serialise and a third waits behind both. That is invisible in
     # testing with one user and is the whole experience with a class of them --
     # and it presents as "the model is slow", which sends everyone looking in
-    # the wrong place. Loud rather than fatal: an instance already running this
-    # way should keep running while someone moves it.
+    # the wrong place. A deployed process must fail before accepting traffic.
     if settings.is_sqlite:
         msg = ("the database is SQLite, which serialises every write. Two users "
                "sending a message at the same time will queue behind each other. "
                "Set WEAVE_DATABASE_URL to a postgresql+psycopg:// URL.")
         if is_prod:
-            log.error("CAPACITY: %s", msg)
+            problems.append(msg)
         else:
             log.info("Using SQLite (development default). %s", msg)
+    elif is_prod:
+        try:
+            database_password = urlsplit(settings.database_url).password
+        except ValueError:
+            database_password = None
+        if database_password in {"weave", "postgres", "password", "changeme"}:
+            problems.append(
+                "WEAVE_DATABASE_URL contains a public or commonly guessed database password."
+            )
 
     # Rate limits that only bind inside one process are not rate limits once
     # there is more than one worker, and nothing about the running system makes
@@ -97,6 +141,8 @@ def _preflight() -> None:
             "Point WEAVE_REDIS_URL at a Redis instance before running more than "
             "one worker."
         )
+        if is_prod:
+            problems.append("WEAVE_REDIS_URL is required for durable turns and global rate limits")
 
     if problems:
         raise RuntimeError(
@@ -115,10 +161,29 @@ def _preflight() -> None:
         )
 
 
+def _database_preflight() -> None:
+    """Reject known bootstrap credentials left in a deployed database."""
+    if settings.environment.lower() not in {"production", "prod", "staging"}:
+        return
+    from .db import SessionLocal
+    from .models import User
+
+    db = SessionLocal()
+    try:
+        demo = db.query(User).filter(User.phone == "+255700000001").first()
+        if demo is not None:
+            raise RuntimeError(
+                "Refusing to start: the public demo account exists in a deployed database. "
+                "Remove or rotate it before starting Weave."
+            )
+    finally:
+        db.close()
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _preflight()
     init_db()
+    _database_preflight()
     engine = get_engine()
     _artifact_sweeper()
     log.info("Weave gateway ready [env=%s, llm=%s, sandbox=%s, workspace=%s]",
@@ -132,8 +197,9 @@ app = FastAPI(
     title="Weave API",
     version="1.0.0",
     description="Bilingual (Kiswahili/English) study + research platform for Tanzania.",
-    docs_url="/docs",
-    openapi_url=f"{settings.api_prefix}/openapi.json",
+    docs_url=None if settings.is_deployed else "/docs",
+    redoc_url=None if settings.is_deployed else "/redoc",
+    openapi_url=None if settings.is_deployed else f"{settings.api_prefix}/openapi.json",
     lifespan=lifespan,
 )
 
@@ -152,13 +218,76 @@ from .telemetry import setup_telemetry  # noqa: E402
 setup_telemetry(app)
 
 
+def _endpoint_reachable(url: str | None, timeout: float = 0.35) -> bool:
+    """Cheap availability probe for an optional, operator-configured service."""
+    if not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+        if not parsed.hostname:
+            return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((parsed.hostname, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _redis_ready() -> bool:
+    if not settings.redis_url:
+        return True
+    try:
+        import redis
+        client = redis.Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        return bool(client.ping())
+    except Exception:  # noqa: BLE001 - readiness reports false, never internals
+        return False
+
+
+def _database_ready() -> bool:
+    try:
+        from .db import engine
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return True
+    except Exception:  # noqa: BLE001 - readiness reports false, never internals
+        return False
+
+
+def _capability_status() -> tuple[dict[str, bool], dict[str, bool]]:
+    from .services.warehouse import get_warehouse
+
+    configured = {
+        "analysis_execution": settings.analysis_execution_enabled,
+        "web_search": bool(settings.searxng_url),
+        "browserless": bool(settings.browserless_url),
+        "render_service": bool(settings.render_service_url),
+        "gotenberg": bool(settings.gotenberg_url),
+        "warehouse": get_warehouse().enabled,
+        "clickhouse": bool(settings.clickhouse_url),
+    }
+    available = {
+        **configured,
+        "web_search": _endpoint_reachable(settings.searxng_url),
+        "browserless": _endpoint_reachable(settings.browserless_url),
+        "render_service": _endpoint_reachable(settings.render_service_url),
+        "gotenberg": _endpoint_reachable(settings.gotenberg_url),
+        # ClickHouse is deliberately not implemented by WarehouseService yet.
+        "clickhouse": False,
+    }
+    return available, configured
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     engine = get_engine()
     from .services.retrieval.embeddings import embedding_backend
     from .services.tools import get_registry
-    from .services.warehouse import get_warehouse
-    from .services.websearch import get_web_search
+    available, configured = _capability_status()
     return JSONResponse({
         "status": "ok",
         "environment": settings.environment,
@@ -167,15 +296,20 @@ def health() -> JSONResponse:
         "sandbox_backend": settings.sandbox_backend,
         "database": "sqlite" if settings.is_sqlite else "postgres",
         "tools": sorted(t.name for t in get_registry().all()),
-        "capabilities": {
-            "web_search": get_web_search().enabled,
-            "browserless": bool(settings.browserless_url),
-            "render_service": bool(settings.render_service_url),
-            "gotenberg": bool(settings.gotenberg_url),
-            "warehouse": get_warehouse().enabled,
-            "clickhouse": bool(settings.clickhouse_url),
-        },
+        "capabilities": available,
+        "configured_capabilities": configured,
     })
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    """Readiness for load balancers: both durable dependencies must answer."""
+    checks = {"database": _database_ready(), "redis": _redis_ready()}
+    is_ready = all(checks.values())
+    return JSONResponse(
+        {"status": "ready" if is_ready else "unavailable", "checks": checks},
+        status_code=200 if is_ready else 503,
+    )
 
 
 @app.get("/")

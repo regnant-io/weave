@@ -38,7 +38,7 @@ def _emit_artifacts(ctx: ToolContext, result: dict, title: str) -> None:
     agentic run should not make the user wait for the whole thing to finish
     before seeing a chart it produced twenty minutes ago.
     """
-    from ...security import sign_path
+    from ...security import artifact_url
 
     for f in result.get("output_files", []) or []:
         key = f.get("s3_key")
@@ -50,7 +50,7 @@ def _emit_artifacts(ctx: ToolContext, result: dict, title: str) -> None:
             "bytes": f.get("bytes", 0),
             "tool": result.get("tool", ""),
             "visual_id": result.get("visual_id"),
-            "url": f"/api/artifact/{key}?sig={sign_path(key)}",
+            "url": artifact_url(key),
         })
 
 
@@ -325,7 +325,7 @@ def _present_visual(ctx: ToolContext, inp: dict) -> dict:
 
     For long runs: "here is what the data looks like so far, I'm continuing".
     """
-    from ...security import sign_path
+    from ...security import artifact_url
     from ..render import visuals
 
     pid = _project_id(ctx)
@@ -340,7 +340,7 @@ def _present_visual(ctx: ToolContext, inp: dict) -> dict:
         "bytes": 0,
         "tool": rec.get("tool", ""),
         "visual_id": vid,
-        "url": f"/api/artifact/{key}?sig={sign_path(key)}",
+        "url": artifact_url(key),
     })
     if inp.get("note"):
         ctx.progress("step_sub", {"text": str(inp["note"])[:200]})

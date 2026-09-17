@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from . import (admin, analysis, auth, canvas, channels, citations, config,
-               datasets, interactions, library, messages, projects, stats,
+               datasets, interactions, jobs, library, messages, projects, stats,
                steering, threads, voice, workspace)
 
 api_router = APIRouter()
@@ -9,6 +9,7 @@ api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(threads.router, tags=["threads"])
 api_router.include_router(datasets.router, tags=["datasets"])
+api_router.include_router(jobs.router, tags=["jobs"])
 api_router.include_router(messages.router, tags=["messages"])
 api_router.include_router(interactions.router, tags=["interactions"])
 api_router.include_router(analysis.router, prefix="/analysis", tags=["analysis"])

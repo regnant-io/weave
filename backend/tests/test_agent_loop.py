@@ -247,6 +247,21 @@ def test_workspace_surface_keeps_its_tools():
     assert "workspace_write" in offered
 
 
+def test_surface_filter_is_rechecked_when_a_model_hallucinates_a_tool_call():
+    calls = []
+    a = _agent(
+        _Engine([("", [])]),
+        ag.LoopPolicy(plan=False, review=False),
+        tool_executor=lambda name, args: calls.append((name, args)) or {"status": "ok"},
+    )
+    a.plan = ag.Plan(goal="g", surface="artifact", steps=[ag.PlanStep(1, "build")])
+
+    result = a._execute("workspace_write", {"path": "index.html"})
+
+    assert result["status"] == "rejected"
+    assert calls == [], "a filtered tool reached the real executor"
+
+
 def test_the_surface_directive_reaches_the_model():
     a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
     a.plan = ag.Plan(goal="g", surface="artifact", steps=[ag.PlanStep(1, "build")])
@@ -286,12 +301,22 @@ def test_a_broken_artifact_comes_back_as_a_failed_tool_call():
 
 
 def test_a_verified_artifact_passes_through():
-    verdict = Verdict(checked=True, ok=True, attempt=1)
+    verdict = Verdict(checked=True, runtime_checked=True, ok=True, attempt=1)
     out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
                              verdict, "create_simulation")
     assert out["status"] == "ok"
     assert out["verified"] is True
     assert out["output_files"]
+
+
+def test_static_only_artifact_is_released_without_a_verified_claim():
+    verdict = Verdict(checked=True, runtime_checked=False, ok=True, attempt=1)
+    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
+                             verdict, "create_simulation")
+    assert out["status"] == "ok"
+    assert out["verified"] is False
+    assert out["verification"]["ran"] is False
+    assert "browser execution was unavailable" in out["note"]
 
 
 def test_after_the_budget_it_ships_with_the_defects_on_record():
@@ -559,7 +584,7 @@ def test_a_polish_note_withholds_the_artifact_and_asks_for_better():
     Releasing it and asking for a better one afterwards puts two versions in
     the transcript and leaves the reader to work out which is current.
     """
-    verdict = Verdict(checked=True, ok=True, attempt=1,
+    verdict = Verdict(checked=True, runtime_checked=True, ok=True, attempt=1,
                       polish_notes=["the trajectory is clipped at the top of the chart"])
     assert verdict.needs_polish and not verdict.released
     out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},

@@ -223,7 +223,6 @@ function ImagesBody({ images, language }: { images: WebImage[]; language: Langua
           className="group animate-rise relative block aspect-square overflow-hidden border border-border bg-surface-2"
           style={{ animationDelay: `${Math.min(i, 8) * 28}ms` }}
         >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={im.url}
             alt={im.title || "web image"}

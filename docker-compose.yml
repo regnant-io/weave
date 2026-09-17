@@ -21,7 +21,7 @@
 #   WEAVE_DATABASE_URL=sqlite:///./var/weave.db WEAVE_REDIS_URL= #     docker compose up backend frontend --build
 #
 # Optional capability tiers stay behind their profiles:
-#   --profile deep         search, headless Chrome, rendering, PDF, storage
+#   --profile deep         search, headless Chrome, rendering
 #   --profile voice        server-side speech
 #   --profile full         the Celery worker for background jobs
 #   --profile build-images build the workspace sandbox image
@@ -29,12 +29,15 @@
 services:
   backend:
     build: ./backend
+    image: weave-backend:local
     ports:
       # Host 8001 -> container 8000 (8000 on the host may be taken by another app).
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
-      WEAVE_ENVIRONMENT: dev
-      WEAVE_CORS_ORIGINS: '["http://localhost:3000"]'
+      WEAVE_ENVIRONMENT: ${WEAVE_ENVIRONMENT:-dev}
+      WEAVE_DEBUG: ${WEAVE_DEBUG:-true}
+      WEAVE_SECRET_KEY: ${WEAVE_SECRET_KEY:-dev-insecure-change-me-in-production-please-0123456789}
+      WEAVE_CORS_ORIGINS: '${WEAVE_CORS_ORIGINS:-["http://localhost:3000"]}'
       # LLM backend: auto | ollama | anthropic | offline
       WEAVE_LLM_BACKEND: ${WEAVE_LLM_BACKEND:-auto}
       # Reach an Ollama server running on the host from inside the container.
@@ -52,8 +55,8 @@ services:
       WEAVE_SEARXNG_URL: ${WEAVE_SEARXNG_URL:-}
       WEAVE_BROWSERLESS_URL: ${WEAVE_BROWSERLESS_URL:-}
       WEAVE_RENDER_URL: ${WEAVE_RENDER_URL:-}
-      WEAVE_GOTENBERG_URL: ${WEAVE_GOTENBERG_URL:-}
       WEAVE_CLICKHOUSE_URL: ${WEAVE_CLICKHOUSE_URL:-}
+      WEAVE_ANALYSIS_EXECUTION_ENABLED: ${WEAVE_ANALYSIS_EXECUTION_ENABLED:-true}
       # Optional server-side voice. Empty (the default) means the BROWSER does
       # both recognition and synthesis with the Web Speech API — no models, no
       # GPU, works on a mid-range Android. Bring these up with --profile voice
@@ -69,6 +72,7 @@ services:
       WEAVE_AT_USERNAME: ${WEAVE_AT_USERNAME:-}
       WEAVE_AT_API_KEY: ${WEAVE_AT_API_KEY:-}
       WEAVE_WA_VERIFY_TOKEN: ${WEAVE_WA_VERIFY_TOKEN:-weave-verify}
+      WEAVE_WA_APP_SECRET: ${WEAVE_WA_APP_SECRET:-}
       WEAVE_WA_TOKEN: ${WEAVE_WA_TOKEN:-}
       WEAVE_WA_PHONE_ID: ${WEAVE_WA_PHONE_ID:-}
       # Postgres + pgvector, the deployment database. Set this to a sqlite:///
@@ -83,7 +87,7 @@ services:
       # installable, results packaged as a tarball. Set to false before exposing
       # Weave to people you do not trust — every verified user can run commands
       # in a container on this host.
-      WEAVE_WORKSPACE_ENABLED: ${WEAVE_WORKSPACE_ENABLED:-true}
+      WEAVE_WORKSPACE_ENABLED: ${WEAVE_WORKSPACE_ENABLED:-false}
       WEAVE_WORKSPACE_IMAGE: ${WEAVE_WORKSPACE_IMAGE:-weave-workspace:latest}
     depends_on:
       # `service_healthy`, not just `service_started`. Postgres accepts a TCP
@@ -100,12 +104,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - backend_var:/app/var
-      # The workspace service shells out to `docker run`, so the backend needs
-      # the host's Docker socket. This is a real privilege grant — a process
-      # that can talk to this socket can start privileged containers — which is
-      # why workspace execution is gated to verified users and can be turned off
-      # entirely with WEAVE_WORKSPACE_ENABLED=false.
-      - /var/run/docker.sock:/var/run/docker.sock
       # A NAMED VOLUME, not a host bind.
       #
       # The workspace container runs as uid 1000 and has to write into this
@@ -117,11 +115,17 @@ services:
       # non-root. The service mounts the per-project subdirectory of this same
       # volume into each workspace container.
       - workspaces:/app/var/workspaces
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       WEAVE_API_BASE: http://backend:8000
       # Where the BROWSER opens WebSockets (live voice, screen share, the shared
@@ -132,11 +136,12 @@ services:
       WEAVE_PUBLIC_WS_BASE: ${WEAVE_PUBLIC_WS_BASE:-ws://localhost:8001}
       NODE_ENV: production
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   postgres:
     # pgvector image so the vector extension is available (architecture §2).
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     environment:
       POSTGRES_USER: weave
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weave}
@@ -158,7 +163,7 @@ services:
       - pg_data:/var/lib/postgresql/data
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     # Same reasoning as Postgres above: Redis has no password here, so it must
     # not be reachable from outside the host.
     ports:
@@ -171,9 +176,9 @@ services:
 
   worker:
     # Celery worker for background jobs (ingestion, heavy analysis, re-summarize).
-    build: ./backend
+    image: weave-backend:local
     profiles: ["full"]
-    command: ["celery", "-A", "app.tasks", "worker", "--loglevel=info"]
+    command: ["celery", "-A", "app.tasks", "worker", "--loglevel=info", "--concurrency=${WEAVE_CELERY_CONCURRENCY:-4}"]
     environment:
       WEAVE_REDIS_URL: redis://redis:6379/0
       WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:-postgresql+psycopg://weave:weave@postgres:5432/weave}
@@ -181,8 +186,16 @@ services:
       WEAVE_OLLAMA_MODEL: ${WEAVE_OLLAMA_MODEL:-gpt-oss:120b-cloud}
       WEAVE_OLLAMA_MODEL_FAST: ${WEAVE_OLLAMA_MODEL_FAST:-}
       WEAVE_OLLAMA_MODEL_FRONTIER: ${WEAVE_OLLAMA_MODEL_FRONTIER:-}
+      # Four prefork children, each with at most three DB connections, keeps the
+      # worker below 12 connections. The API may then use its 30-connection peak
+      # without exhausting a stock Postgres max_connections=100 deployment.
+      WEAVE_DB_POOL_SIZE: ${WEAVE_WORKER_DB_POOL_SIZE:-2}
+      WEAVE_DB_MAX_OVERFLOW: ${WEAVE_WORKER_DB_MAX_OVERFLOW:-1}
     depends_on:
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - backend_var:/app/var
 
@@ -191,10 +204,10 @@ services:
   # then point the backend at them (see .env: WEAVE_SEARXNG_URL=http://searxng:8080 etc.)
 
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:latest@sha256:d0a4ca04e68c6d57fe45509ad5a6b10c890350724762ade3abea5363571aa29a
     profiles: ["deep"]
     ports:
-      - "8888:8080"
+      - "127.0.0.1:8888:8080"
     environment:
       SEARXNG_BASE_URL: http://localhost:8888/
     volumes:
@@ -206,23 +219,11 @@ services:
     image: ghcr.io/browserless/chromium:latest
     profiles: ["deep"]
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
     environment:
       CONCURRENT: "4"
       TOKEN: ""
-
-  gotenberg:
-    # Deterministic HTML/Markdown -> PDF for decks and reports.
-    image: gotenberg/gotenberg:8
-    profiles: ["deep"]
-    command:
-      - "gotenberg"
-      - "--chromium-start-timeout=60s"       # Chromium is slow to boot under load
-      - "--api-timeout=120s"
-    ports:
-      - "3002:3000"
-    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
 
   render:
     # Node render-sandbox: AI specs -> charts / Three.js / Babylon.js scenes /
@@ -231,7 +232,7 @@ services:
     build: ./render-service
     profiles: ["deep"]
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
 
   # ---- optional server-side voice (profile: voice) ------------------------
   # The DEFAULT voice path needs none of this: the browser's Web Speech API does
@@ -248,7 +249,7 @@ services:
     profiles: ["voice"]
     command: ["./server", "-m", "/models/ggml-base.bin", "--host", "0.0.0.0", "--port", "8080"]
     ports:
-      - "8090:8080"
+      - "127.0.0.1:8090:8080"
     volumes:
       - whisper_models:/models
 
@@ -259,7 +260,7 @@ services:
       PIPER_VOICE: ${PIPER_VOICE:-en_GB-alba-medium}
       PIPER_LENGTH: "1.0"
     ports:
-      - "10200:10200"
+      - "127.0.0.1:10200:10200"
     volumes:
       - piper_data:/config
 
@@ -274,31 +275,35 @@ services:
     command: ["true"]
 
   minio:
-    image: minio/minio:latest
-    profiles: ["deep"]
+    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # Local S3 contract testing only. It is not required by the normal deep
+    # rendering/search profile and should not consume memory by accident.
+    profiles: ["object-storage"]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: weave
       MINIO_ROOT_PASSWORD: weave-secret
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
 
   qdrant:
-    image: qdrant/qdrant:latest
-    profiles: ["deep"]
+    image: qdrant/qdrant:latest@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10
+    # Reserved experiment; production retrieval currently uses pgvector.
+    profiles: ["experimental-scale"]
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    profiles: ["deep"]
+    image: clickhouse/clickhouse-server:latest@sha256:d73903d1b61dfe825fc3810542f252966f33d3fd8efb3b3edcbbafb46b524b04
+    # Reserved experiment; the warehouse tool currently uses DuckDB.
+    profiles: ["experimental-scale"]
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     volumes:

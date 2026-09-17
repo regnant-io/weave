@@ -2,7 +2,61 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable
+
+
+def _schema_errors(value: Any, schema: dict, path: str = "input") -> list[str]:
+    """Validate the useful JSON-Schema subset used by Weave tools.
+
+    Provider-side schema handling is advisory. Model output is untrusted and
+    must satisfy the contract again at the execution boundary. Keeping this
+    small avoids a large runtime dependency while covering every schema feature
+    currently emitted by the registry.
+    """
+    errors: list[str] = []
+    expected = schema.get("type")
+    types = {
+        "object": dict, "array": list, "string": str,
+        "number": (int, float), "integer": int, "boolean": bool,
+    }
+    if expected in types:
+        valid = isinstance(value, types[expected])
+        if expected in {"number", "integer"} and isinstance(value, bool):
+            valid = False
+        if not valid:
+            return [f"{path} must be {expected}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path} must be one of {schema['enum']!r}")
+    if isinstance(value, str):
+        if len(value) < int(schema.get("minLength", 0)):
+            errors.append(f"{path} is too short")
+        if "maxLength" in schema and len(value) > int(schema["maxLength"]):
+            errors.append(f"{path} is too long")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path} is below the minimum")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path} exceeds the maximum")
+    if isinstance(value, list):
+        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+            errors.append(f"{path} has too many items")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(_schema_errors(item, item_schema, f"{path}[{index}]"))
+    if isinstance(value, dict):
+        props = schema.get("properties", {})
+        for required in schema.get("required", []):
+            if required not in value:
+                errors.append(f"{path}.{required} is required")
+        if schema.get("additionalProperties") is False:
+            for key in value.keys() - props.keys():
+                errors.append(f"{path}.{key} is not allowed")
+        for key, item in value.items():
+            if key in props:
+                errors.extend(_schema_errors(item, props[key], f"{path}.{key}"))
+    return errors
 
 # trust ordering: anonymous < verified < institutional
 TRUST_ORDER = {"anonymous": 0, "verified": 1, "institutional": 2}
@@ -30,6 +84,11 @@ class ToolContext:
     #: anything (a user answer, a long build) must check this or it will keep a
     #: worker thread alive after the user has already walked away.
     cancel: Any = None
+    #: Exact capability names advertised for this turn.  Model tool calls are
+    #: untrusted input too: a provider can return a name that was never present
+    #: in its schema.  Keeping the allowlist in the execution context makes the
+    #: trust/service/intent decision hold at the point of use.
+    allowed_tools: frozenset[str] | None = None
 
     def progress(self, event: str, data: dict) -> None:
         if self.emit:
@@ -125,7 +184,7 @@ class ToolRegistry:
         """
         out = []
         forced = force or set()
-        trust_level = TRUST_ORDER.get(trust, 1)
+        trust_level = TRUST_ORDER.get(trust, 0)
         for t in self._tools.values():
             if mode not in t.modes:
                 continue
@@ -150,11 +209,52 @@ class ToolRegistry:
     def execute(self, name: str, ctx: ToolContext, tool_input: dict) -> dict:
         tool = self.get(name)
         if tool is None:
-            return {"status": "error", "error": f"unknown tool {name!r}"}
+            return {"status": "error", "code": "unknown_tool",
+                    "error": f"unknown tool {name!r}", "retryable": False}
+        if ctx.allowed_tools is not None and name not in ctx.allowed_tools:
+            return {
+                "status": "rejected",
+                "code": "tool_not_allowed",
+                "error": f"tool {name!r} is not available on this turn",
+                "retryable": False,
+            }
+        trust_level = TRUST_ORDER.get(ctx.trust, 0)
+        if trust_level < TRUST_ORDER.get(tool.trust_required, 0):
+            return {"status": "rejected", "code": "insufficient_trust",
+                    "error": "insufficient trust for this tool", "retryable": False}
+        if any(ctx.services.get(service) is None for service in tool.requires_services):
+            return {"status": "unavailable", "code": "service_unavailable",
+                    "error": "required service is unavailable", "retryable": True}
+        mode = getattr(ctx.project, "mode", None)
+        if mode is not None and mode not in tool.modes:
+            return {"status": "rejected", "code": "mode_not_allowed",
+                    "error": "tool is unavailable in this mode", "retryable": False}
+        if not isinstance(tool_input, dict):
+            return {"status": "error", "code": "invalid_tool_input",
+                    "error": "tool input must be an object", "retryable": True}
+        cleaned = dict(tool_input)
+        cleaned.pop("note", None)
+        validation_schema = {
+            **tool.input_schema,
+            "properties": tool.input_schema.get("properties", {}),
+        }
+        errors = _schema_errors(cleaned, validation_schema)
+        if errors:
+            return {"status": "error", "code": "invalid_tool_input",
+                    "error": "; ".join(errors[:8]), "details": errors[:8],
+                    "retryable": True}
         try:
-            return tool.execute(ctx, tool_input or {})
+            started = time.monotonic()
+            result = tool.execute(ctx, cleaned)
+            from ...metrics import observe
+            observe("tool", name, str(result.get("status", "ok")),
+                    (time.monotonic() - started) * 1000)
+            return result
         except Exception as exc:  # noqa: BLE001 - a tool failure must not crash the turn
-            return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            from ...metrics import observe
+            observe("tool", name, "exception", (time.monotonic() - started) * 1000)
+            return {"status": "error", "code": "tool_execution_failed",
+                    "error": f"{type(exc).__name__}: {exc}", "retryable": True}
 
 
 _registry: ToolRegistry | None = None

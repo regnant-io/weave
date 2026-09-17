@@ -17,13 +17,39 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from ...config import settings
 
 # Blocked destinations for SSRF protection.
 _BLOCKED_HOSTS = {"localhost", "metadata.google.internal"}
 _METADATA_IPS = {"169.254.169.254", "100.100.100.200"}  # AWS/GCP/Azure, Alibaba
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 5
+
+
+@dataclass
+class _BufferedResponse:
+    """Small response facade containing only a size-bounded response body."""
+
+    status_code: int
+    headers: Any
+    content: bytes
+
+    @property
+    def text(self) -> str:
+        ctype = str(self.headers.get("content-type", ""))
+        match = re.search(r"charset=([^;\s]+)", ctype, re.I)
+        encoding = (match.group(1).strip("\"'") if match else "utf-8")
+        try:
+            return self.content.decode(encoding, "replace")
+        except LookupError:
+            return self.content.decode("utf-8", "replace")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 300:
+            raise RuntimeError(f"upstream returned HTTP {self.status_code}")
 
 
 @dataclass
@@ -69,6 +95,68 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False, f"non-public address {ip_str} blocked"
     return True, ""
+
+
+def _safe_get(httpx_module, url: str, *, timeout, headers: dict | None = None,
+              max_bytes: int | None = None):
+    """GET while validating every redirect target against the SSRF policy.
+
+    Validating only the first URL is insufficient: a public endpoint may reply
+    with ``Location: http://127.0.0.1/...`` and an automatic redirect client
+    will then cross the trust boundary on our behalf.
+    """
+    current = url
+    byte_limit = max(1, int(max_bytes or settings.research_max_fetch_bytes))
+    for hop in range(_MAX_REDIRECTS + 1):
+        ok, reason = _is_safe_url(current)
+        if not ok:
+            raise ValueError(f"unsafe URL: {reason}")
+        # `httpx.get()` buffers the complete body before returning, which makes
+        # slicing it afterwards a cosmetic limit. Stream and stop while bytes
+        # arrive so a chunked response or decompression bomb cannot consume
+        # unbounded process memory.
+        stream = getattr(httpx_module, "stream", None)
+        if stream is None:  # tiny compatibility path for deterministic test fakes
+            response = httpx_module.get(
+                current, timeout=timeout, follow_redirects=False, headers=headers,
+            )
+            if response.status_code not in _REDIRECT_STATUSES:
+                body = bytes(getattr(response, "content", b""))
+                if len(body) > byte_limit:
+                    raise ValueError(f"response exceeds {byte_limit} byte limit")
+                return response
+            location = response.headers.get("location")
+        else:
+            with stream(
+                "GET", current, timeout=timeout, follow_redirects=False, headers=headers,
+            ) as response:
+                if response.status_code in _REDIRECT_STATUSES:
+                    location = response.headers.get("location")
+                else:
+                    declared = response.headers.get("content-length")
+                    if declared:
+                        try:
+                            if int(declared) > byte_limit:
+                                raise ValueError(f"response exceeds {byte_limit} byte limit")
+                        except ValueError as exc:
+                            if "exceeds" in str(exc):
+                                raise
+                    body = bytearray()
+                    for chunk in response.iter_bytes():
+                        body.extend(chunk)
+                        if len(body) > byte_limit:
+                            raise ValueError(f"response exceeds {byte_limit} byte limit")
+                    return _BufferedResponse(
+                        status_code=response.status_code,
+                        headers=response.headers,
+                        content=bytes(body),
+                    )
+        if not location:
+            return response
+        if hop >= _MAX_REDIRECTS:
+            raise ValueError("too many redirects")
+        current = urljoin(current, location)
+    raise ValueError("too many redirects")
 
 
 def _html_to_text(html: str) -> tuple[str, str]:
@@ -173,8 +261,8 @@ class WebSearchClient:
         # ad/tracker-heavy pages that never idle, causing 408s, so it is NOT used
         # for research fetches; it stays reserved for the render/screenshot path.)
         try:
-            resp = httpx.get(
-                url, timeout=settings.websearch_fetch_timeout, follow_redirects=True,
+            resp = _safe_get(
+                httpx, url, timeout=settings.websearch_fetch_timeout,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; weave-research/1.0)"},
             )
             resp.raise_for_status()
@@ -182,7 +270,6 @@ class WebSearchClient:
         except Exception as exc:  # noqa: BLE001
             return FetchedPage(url=url, title="", text="", ok=False, error=str(exc)[:200])
 
-        html = html[: settings.research_max_fetch_bytes]
         title, text = _html_to_text(html)
         return FetchedPage(url=url, title=title, text=text, ok=True)
 

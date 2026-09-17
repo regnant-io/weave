@@ -7,6 +7,7 @@ import type { Language } from "./types";
 import { parseServices, type ServicePrefs } from "./services";
 
 export const TOKEN_COOKIE = "weave_token";
+export const REFRESH_COOKIE = "weave_refresh";
 export const LANG_COOKIE = "weave_lang";
 export const MODE_COOKIE = "weave_mode";
 export const LITE_COOKIE = "weave_lite";

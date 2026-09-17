@@ -23,6 +23,10 @@ from pathlib import Path
 _tmp = Path(tempfile.mkdtemp(prefix="weave_eval_"))
 os.environ.setdefault("WEAVE_DATABASE_URL", f"sqlite:///{(_tmp / 'eval.db').as_posix()}")
 os.environ.setdefault("WEAVE_STORAGE_LOCAL_DIR", str(_tmp / "storage"))
+# Keep the deterministic gate deterministic even when a developer's .env points
+# at Ollama or a paid provider. An explicit process environment can still opt in
+# to a live-model evaluation.
+os.environ.setdefault("WEAVE_LLM_BACKEND", "offline")
 
 SW_HINTS = {"na", "ya", "kwa", "ni", "wa", "za", "katika", "hii", "kama"}
 
@@ -39,6 +43,7 @@ def main() -> int:
     from app.models import Project, User
     from app.security import hash_password
     from app.services.orchestration import get_orchestrator
+    from app.services.orchestration.router import classify
 
     init_db()
     db = SessionLocal()
@@ -58,7 +63,7 @@ def main() -> int:
         msg = orch.run_turn(db, project, c["prompt"], c["language"])
         answer = msg.content_sw if c["language"] == "sw" else msg.content_en
         tool_names = [t.get("name") for t in (msg.tool_calls or [])]
-        checks, ok = _score(c, answer, tool_names)
+        checks, ok = _score(c, answer, tool_names, classify(c["prompt"], c["mode"]))
         passed += ok
         results.append({"id": c["id"], "ok": ok, "checks": checks})
         print(f"[{'PASS' if ok else 'FAIL'}] {c['id']}: {checks}")
@@ -68,16 +73,25 @@ def main() -> int:
     return 0 if passed == len(cases) else 1
 
 
-def _score(case: dict, answer: str, tools: list) -> tuple[dict, bool]:
+def _score(case: dict, answer: str, tools: list, route) -> tuple[dict, bool]:
     exp = case["expect"]
     checks: dict = {}
     ok = True
     a = answer or ""
-    if exp.get("integrity_redirect"):
+    if "integrity_redirect" in exp:
         redirected = any(k in a.lower() for k in
                          ["won't write", "siwezi kuandika", "coach", "outline", "muundo", "mwenyewe"])
         checks["integrity_redirect"] = redirected
-        ok = ok and redirected
+        ok = ok and redirected == exp["integrity_redirect"]
+    if exp.get("intent"):
+        checks["intent"] = route.intent
+        ok = ok and route.intent == exp["intent"]
+    if "needs_sandbox" in exp:
+        checks["needs_sandbox"] = route.needs_sandbox
+        ok = ok and route.needs_sandbox == exp["needs_sandbox"]
+    if exp.get("tier"):
+        checks["tier"] = route.tier
+        ok = ok and route.tier == exp["tier"]
     if exp.get("language") == "sw":
         checks["is_swahili"] = _looks_swahili(a)
         ok = ok and checks["is_swahili"]

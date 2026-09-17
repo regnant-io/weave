@@ -22,7 +22,7 @@ import * as vega from "vega";
 import * as vegaLite from "vega-lite";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Resvg } from "@resvg/resvg-js";
 import { renderDiagram } from "./lib/diagram.js";
 import { renderSimulation } from "./lib/simulation.js";
@@ -39,7 +39,88 @@ import { applyTheme } from "./lib/vegaTheme.js";
 const app = express();
 // Babylon scenes can carry inlined .glb meshes and textures as data URLs, which
 // is the only way an offline artifact can use them at all.
-app.use(express.json({ limit: "48mb" }));
+app.use(express.json({ limit: process.env.RENDER_MAX_REQUEST_BYTES || "24mb" }));
+
+const MAX_CONCURRENT = Math.max(1, Number(process.env.RENDER_MAX_CONCURRENT || 2));
+const MAX_QUEUE = Math.max(0, Number(process.env.RENDER_MAX_QUEUE || 20));
+const MAX_QUEUE_MS = Math.max(100, Number(process.env.RENDER_MAX_QUEUE_MS || 5000));
+const MAX_NODES = Math.max(100, Number(process.env.RENDER_MAX_SPEC_NODES || 20000));
+const MAX_ARRAY_ITEMS = Math.max(100, Number(process.env.RENDER_MAX_ARRAY_ITEMS || 10000));
+const MAX_STRING_BYTES = Math.max(1024, Number(process.env.RENDER_MAX_STRING_BYTES || 12_000_000));
+const MAX_RESPONSE_BYTES = Math.max(1024, Number(process.env.RENDER_MAX_RESPONSE_BYTES || 40_000_000));
+let activeRenders = 0;
+const renderQueue = [];
+
+function inspectComplexity(value) {
+  let nodes = 0;
+  const walk = (item) => {
+    nodes += 1;
+    if (nodes > MAX_NODES) throw new Error(`spec exceeds ${MAX_NODES} nodes`);
+    if (typeof item === "string" && Buffer.byteLength(item) > MAX_STRING_BYTES) {
+      throw new Error(`string exceeds ${MAX_STRING_BYTES} bytes`);
+    }
+    if (Array.isArray(item)) {
+      if (item.length > MAX_ARRAY_ITEMS) throw new Error(`array exceeds ${MAX_ARRAY_ITEMS} items`);
+      for (const child of item) walk(child);
+    } else if (item && typeof item === "object") {
+      for (const child of Object.values(item)) walk(child);
+    }
+  };
+  walk(value);
+}
+
+function releaseRender() {
+  activeRenders = Math.max(0, activeRenders - 1);
+  while (renderQueue.length && activeRenders < MAX_CONCURRENT) {
+    const queued = renderQueue.shift();
+    clearTimeout(queued.timer);
+    if (!queued.res.headersSent) {
+      activeRenders += 1;
+      queued.start();
+    }
+  }
+}
+
+// Reject pathological specs before rendering and put a hard bound on work
+// admitted to the Node process. Responses also have a byte ceiling, including
+// self-contained Babylon/Three bundles.
+app.use((req, res, next) => {
+  if (req.method !== "POST") return next();
+  try { inspectComplexity(req.body); }
+  catch (error) { return res.status(413).json({ status: "error", code: "complexity_limit", error: error.message }); }
+
+  const originalSend = res.send.bind(res);
+  res.send = (body) => {
+    const bytes = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(
+      typeof body === "string" ? body : JSON.stringify(body ?? null),
+    );
+    if (bytes > MAX_RESPONSE_BYTES && !res.headersSent) {
+      return res.status(413).json({ status: "error", code: "output_limit",
+        error: `rendered output exceeds ${MAX_RESPONSE_BYTES} bytes` });
+    }
+    return originalSend(body);
+  };
+
+  const start = () => {
+    res.once("finish", releaseRender);
+    res.once("close", () => { if (!res.writableEnded) releaseRender(); });
+    next();
+  };
+  if (activeRenders < MAX_CONCURRENT) {
+    activeRenders += 1;
+    return start();
+  }
+  if (renderQueue.length >= MAX_QUEUE) {
+    return res.status(503).json({ status: "error", code: "render_queue_full", retryable: true });
+  }
+  const queued = { res, start, timer: null };
+  queued.timer = setTimeout(() => {
+    const index = renderQueue.indexOf(queued);
+    if (index >= 0) renderQueue.splice(index, 1);
+    if (!res.headersSent) res.status(503).json({ status: "error", code: "render_queue_timeout", retryable: true });
+  }, MAX_QUEUE_MS);
+  renderQueue.push(queued);
+});
 
 // Resolve bundles relative to THIS FILE, not the working directory. `npm start`
 // happens to run with cwd=/app, so a cwd-relative read worked by luck; anything
@@ -122,6 +203,10 @@ app.get("/health", (_req, res) => res.json({
   // Named explicitly so an operator can see WHICH engine is missing without
   // reading container logs.
   missing: Object.entries(ENGINES).filter(([, v]) => !v).map(([k]) => k),
+  limits: { max_concurrent: MAX_CONCURRENT, max_queue: MAX_QUEUE,
+    max_spec_nodes: MAX_NODES, max_array_items: MAX_ARRAY_ITEMS,
+    max_response_bytes: MAX_RESPONSE_BYTES },
+  load: { active: activeRenders, queued: renderQueue.length },
 }));
 
 // ---- charts: Vega-Lite spec -> SVG ----------------------------------------
@@ -320,4 +405,9 @@ app.post("/custom", (req, res) => {
 
 
 const PORT = process.env.PORT || 3100;
-app.listen(PORT, () => console.log(`weave render-service on :${PORT}`));
+export { app };
+
+const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";
+if (import.meta.url === invokedPath) {
+  app.listen(PORT, () => console.log(`weave render-service on :${PORT}`));
+}
