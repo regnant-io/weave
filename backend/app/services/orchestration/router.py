@@ -19,6 +19,10 @@ DATA_SIGNALS = re.compile(
     r"test|chart|graph|grafu|plot|column|safu|dataset|takwimu|significant|p-value|"
     r"histogram|scatter|trend|mwenendo|analy[sz]e|changanua)\b", re.I,
 )
+DATA_ACTION_SIGNALS = re.compile(
+    r"\b(analy[sz]e|changanua|calculate|compute|hesabu|plot|chart|graph|grafu|"
+    r"histogram|scatter|dataset|column|safu|p-value)\b", re.I,
+)
 LITERATURE_SIGNALS = re.compile(
     r"\b(cite|citation|rejea|reference|source|chanzo|literature|utafiti|study|"
     r"paper|journal|jarida|according to|kulingana na|NBS|COSTECH|UDSM)\b", re.I,
@@ -39,15 +43,21 @@ class RouteDecision:
 
 def classify(text: str, mode: str) -> RouteDecision:
     is_data = bool(DATA_SIGNALS.search(text))
+    is_data_action = bool(DATA_ACTION_SIGNALS.search(text))
     is_lit = bool(LITERATURE_SIGNALS.search(text))
     is_concept = bool(CONCEPT_SIGNALS.search(text))
 
-    if is_data:
+    # “Explain the mean” asks for teaching, while “calculate the mean of this
+    # column” asks for execution. A statistical noun alone is not a request to
+    # open the sandbox.
+    if is_data_action:
         intent = "data"
-    elif is_lit:
+    elif is_lit and not is_concept:
         intent = "literature"
     elif is_concept:
         intent = "concept"
+    elif is_data:
+        intent = "data"
     else:
         intent = "general"
 
@@ -61,5 +71,5 @@ def classify(text: str, mode: str) -> RouteDecision:
         intent=intent,
         tier="frontier" if frontier else "fast",
         needs_retrieval=is_lit or is_concept,
-        needs_sandbox=is_data,
+        needs_sandbox=intent == "data",
     )

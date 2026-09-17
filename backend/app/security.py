@@ -60,7 +60,8 @@ def verify_password(password: str, stored: str) -> bool:
 
 # --- HS256 JWT --------------------------------------------------------------
 
-def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
+def create_access_token(subject: str, extra: dict[str, Any] | None = None,
+                        session_id: str | None = None) -> str:
     now = int(time.time())
     payload: dict[str, Any] = {
         "sub": subject,
@@ -70,6 +71,8 @@ def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> st
     }
     if extra:
         payload.update(extra)
+    if session_id:
+        payload["sid"] = session_id
     header = {"alg": "HS256", "typ": "JWT"}
     signing_input = f"{_b64e_json(header)}.{_b64e_json(payload)}".encode("ascii")
     sig = hmac.new(settings.secret_key.encode(), signing_input, hashlib.sha256).digest()
@@ -148,16 +151,27 @@ def decode_access_token(token: str) -> dict[str, Any] | None:
 
 # --- OTP --------------------------------------------------------------------
 
-def sign_path(path: str) -> str:
-    """HMAC signature for an artifact key so its URL can't be forged/enumerated."""
-    return hmac.new(settings.secret_key.encode(), path.encode(), hashlib.sha256).hexdigest()[:24]
+def sign_path(path: str, expires_at: int) -> str:
+    """HMAC an artifact key and absolute expiry as one capability."""
+    payload = f"{path}\n{int(expires_at)}".encode()
+    return hmac.new(settings.secret_key.encode(), payload, hashlib.sha256).hexdigest()[:24]
 
 
-def verify_path(path: str, sig: str) -> bool:
+def verify_path(path: str, sig: str, expires_at: int) -> bool:
     try:
-        return hmac.compare_digest(sign_path(path), sig or "")
+        now = int(time.time())
+        expiry = int(expires_at)
+        if expiry <= now or expiry > now + settings.artifact_ttl_seconds + 300:
+            return False
+        return hmac.compare_digest(sign_path(path, expiry), sig or "")
     except Exception:  # noqa: BLE001
         return False
+
+
+def artifact_url(path: str) -> str:
+    """Return a signed, expiring application URL for a stored artifact."""
+    expiry = int(time.time()) + settings.artifact_ttl_seconds
+    return f"/api/artifact/{path}?exp={expiry}&sig={sign_path(path, expiry)}"
 
 
 def generate_otp() -> str:
@@ -168,6 +182,15 @@ def generate_otp() -> str:
 def hash_otp(code: str) -> str:
     """OTPs are stored hashed (architecture 10: PII minimization)."""
     return hashlib.sha256((settings.secret_key + code).encode()).hexdigest()
+
+
+def new_refresh_token() -> str:
+    """Opaque credential; only its keyed hash is stored."""
+    return secrets.token_urlsafe(48)
+
+
+def hash_refresh_token(token: str) -> str:
+    return hmac.new(settings.secret_key.encode(), token.encode(), hashlib.sha256).hexdigest()
 
 
 # --- base64url helpers ------------------------------------------------------

@@ -28,6 +28,9 @@
 
 :root,
 :root[data-theme="light"] {
+  /* System stacks keep first render independent of third-party font hosts. */
+  --font-ui-src: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono-src: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   /* -- warm monochrome ramp (paper) -- */
   --bg: #ffffff;
   --bg-subtle: #faf9f7;

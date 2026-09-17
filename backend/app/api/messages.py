@@ -33,7 +33,13 @@ def truncate_from(project_id: str, message_id: str, db: Session = Depends(get_db
     anchor = db.query(M).filter(M.id == message_id, M.project_id == project_id).first()
     if not anchor:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "message not found")
-    victims = db.query(M).filter(M.project_id == project_id, M.created_at >= anchor.created_at).all()
+    # Editing one chat must not erase later messages from a different chat in
+    # the same project.  The timeline boundary belongs to the anchor's thread.
+    victims = db.query(M).filter(
+        M.project_id == project_id,
+        M.thread_id == anchor.thread_id,
+        M.created_at >= anchor.created_at,
+    ).all()
     for m in victims:
         db.delete(m)
     db.commit()
@@ -115,11 +121,11 @@ def resume_turn(
     distinguishable, which matters because replaying event 0 twice would print
     the opening of the answer twice.
 
-    A turn this process does not know about is a 404, and that is the honest
-    answer: the registry is in-process (see orchestration/live.py), so a
-    reconnect routed to another worker cannot be served here. The client's
-    fallback is to reload the thread, which for a finished turn shows the real
-    answer.
+    When Redis is configured, the event log and cancellation signal are shared
+    across API workers, so a reconnect routed to another worker can resume from
+    the requested sequence. Without Redis, the registry is process-local and a
+    missing turn produces a ``turn_not_live`` SSE event; the client then reloads
+    the saved thread.
     """
     orch = get_orchestrator()
 

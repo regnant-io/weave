@@ -1,9 +1,8 @@
 """Analytics warehouse for mass data mining/analysis.
 
-Two backends:
-  * DuckDB (embedded) — out-of-core SQL directly over the user's dataset. Default
-    when the `duckdb` package is available. No server needed.
-  * ClickHouse (server) — for GB–TB scale, when WEAVE_CLICKHOUSE_URL is set.
+DuckDB runs embedded, out of core SQL directly over the user's dataset. A
+ClickHouse setting is reserved for a future measured scale-up, but does not
+advertise the tool by itself: there is no ingestion/query contract for it yet.
 
 SQL is a hostile-input surface, so this enforces a read-only guard: SELECT/WITH
 only, and file/system/DDL functions are blocked. (In production the whole query
@@ -13,7 +12,6 @@ from __future__ import annotations
 
 import re
 
-from ...config import settings
 from ...storage import storage
 
 _BLOCKED = re.compile(
@@ -47,14 +45,14 @@ class WarehouseService:
 
     @property
     def enabled(self) -> bool:
-        return self._duckdb is not None or bool(settings.clickhouse_url)
+        return self._duckdb is not None
 
     def query(self, sql: str, dataset=None, max_rows: int = 200) -> dict:
         ok, reason = _is_read_only(sql)
         if not ok:
             return {"status": "rejected", "error": reason}
         if self._duckdb is None:
-            return {"status": "unavailable", "error": "duckdb not installed (ClickHouse path TODO)"}
+            return {"status": "unavailable", "error": "duckdb is not installed"}
         if dataset is None:
             return {"status": "error", "error": "no dataset in context to query (use `data` table)"}
 

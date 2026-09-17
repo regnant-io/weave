@@ -1,0 +1,10 @@
+[
+  {"id":"population-en","language":"en","query":"Tanzania population census 2022","expected_title":"Tanzania in Figures"},
+  {"id":"idadi-sw","language":"sw","query":"idadi ya watu sensa Tanzania","expected_title":"Tanzania in Figures"},
+  {"id":"poverty-en","language":"en","query":"household consumption poverty line Tanzania","expected_title":"Household Budget Survey"},
+  {"id":"water-sw","language":"sw","query":"maji safi afya vijijini kuhara","expected_title":"Maji na Afya Vijijini"},
+  {"id":"maize-en","language":"en","query":"fertilizer adoption maize yield smallholders","expected_title":"Smallholder Maize Yields"},
+  {"id":"research-sw","language":"sw","query":"vipaumbele vya utafiti na ubunifu COSTECH","expected_title":"COSTECH National Research"},
+  {"id":"curriculum-sw","language":"sw","query":"mtaala sekondari takwimu wastani NECTA","expected_title":"Sekondari na Mitihani"},
+  {"id":"malaria-en","language":"en","query":"malaria prevalence children insecticide treated nets","expected_title":"Malaria Prevalence Study"}
+]

@@ -45,7 +45,8 @@ from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 from sqlalchemy.orm import Session
 
 from ...models import CrawlPage, CrawlSeed, Source
-from ..websearch.client import _html_to_text, _is_safe_url
+from ...config import settings
+from ..websearch.client import _html_to_text, _is_safe_url, _safe_get
 
 log = logging.getLogger(__name__)
 
@@ -162,9 +163,10 @@ class CrawlerService:
         parser = urllib.robotparser.RobotFileParser()
         parser.set_url(f"{key}/robots.txt")
         try:
-            resp = self._httpx.get(f"{key}/robots.txt", timeout=12,
-                                   headers={"User-Agent": USER_AGENT},
-                                   follow_redirects=True)
+            resp = _safe_get(
+                self._httpx, f"{key}/robots.txt", timeout=12,
+                headers={"User-Agent": USER_AGENT}, max_bytes=256_000,
+            )
             parser.parse(resp.text.splitlines() if resp.status_code == 200 else [])
         except Exception:  # noqa: BLE001 - unreachable robots.txt means no rules
             parser.parse([])
@@ -199,27 +201,19 @@ class CrawlerService:
     # -- fetching ----------------------------------------------------------
     def _fetch(self, url: str, render_js: bool) -> tuple[str, str, str]:
         """Return (title, text, error). Empty text means nothing usable."""
-        from ...config import settings
-
-        if render_js and settings.browserless_url:
-            # Headless render for JS-built pages. Falls through to a plain GET on
-            # failure rather than losing the page: a slow browser pool is a much
-            # more common failure than a page that genuinely needs JS.
-            try:
-                base = settings.browserless_url.rstrip("/")
-                resp = self._httpx.post(
-                    f"{base}/content",
-                    json={"url": url, "gotoOptions": {"waitUntil": "networkidle2"}},
-                    timeout=60,
-                )
-                if resp.status_code == 200 and resp.text:
-                    return (*_html_to_text(resp.text), "")
-            except Exception as exc:  # noqa: BLE001
-                log.debug("browserless render failed for %s: %s", url, exc)
+        if render_js:
+            # Browserless remains available for generated-artifact verification,
+            # where Weave supplies the HTML and a strict CSP blocks networking.
+            # It must not navigate to an arbitrary crawler URL while sharing the
+            # application network: page JavaScript could probe backend, database,
+            # metadata, or other private endpoints from inside Chromium.  Restore
+            # JS crawling only behind a browser pool with enforced egress policy.
+            log.info("crawler JS rendering skipped for %s; using SSRF-checked HTTP", url)
 
         try:
-            resp = self._httpx.get(url, timeout=30, follow_redirects=True,
-                                   headers={"User-Agent": USER_AGENT})
+            resp = _safe_get(
+                self._httpx, url, timeout=30, headers={"User-Agent": USER_AGENT},
+            )
             resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001
             return "", "", str(exc)[:200]
@@ -357,12 +351,18 @@ class CrawlerService:
 
             if depth < max_depth:
                 try:
-                    resp = self._httpx.get(url, timeout=20, follow_redirects=True,
-                                           headers={"User-Agent": USER_AGENT})
+                    resp = _safe_get(
+                        self._httpx, url, timeout=20, headers={"User-Agent": USER_AGENT},
+                    )
                     links = self._extract_links(url, resp.text)
                 except Exception:  # noqa: BLE001
                     links = []
                 for link in links:
+                    if len(queue) >= settings.crawler_max_queued_urls:
+                        stats.skipped += 1
+                        record(link, depth + 1, "skipped_budget",
+                               "per-seed URL queue limit reached")
+                        continue
                     if link in seen:
                         continue
                     if seed.same_domain_only and urlparse(link).netloc.lower() != seed_host:

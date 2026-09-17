@@ -1,0 +1,27 @@
+{$WEAVE_DOMAIN} {
+    encode zstd gzip
+
+    request_body {
+        max_size 110MB
+    }
+
+    # The browser-facing BFF routes live under /api/* in Next.js, while the
+    # versioned service API (including WebSocket upgrades) belongs to FastAPI.
+    # Matching the complete prefix also keeps native clients and integrations
+    # from receiving a Next.js 404 for ordinary HTTP requests.
+    @weave_backend path /api/v1/*
+    reverse_proxy @weave_backend backend:8000
+    reverse_proxy frontend:3000
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

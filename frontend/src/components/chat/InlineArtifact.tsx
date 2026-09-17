@@ -200,7 +200,6 @@ function InlineArtifactInner({
             {sw ? "Imeshindwa kupakia picha hii." : "This image could not be loaded."}
           </div>
         ) : (
-          // eslint-disable-next-line @next/next/no-img-element
           <img
             src={a.url}
             alt={a.name}
@@ -227,10 +226,10 @@ function InlineArtifactInner({
               src={a.url}
               title={a.name}
               loading="lazy"
-              /* Generated pages are self-contained and must not reach the parent
-                 document or the network. allow-scripts WITHOUT allow-same-origin
-                 puts the page in an opaque origin. */
-              sandbox={kind === "pdf" ? undefined : "allow-scripts"}
+              /* The response CSP and this attribute both keep generated HTML in
+                 an opaque origin. Pointer lock supports 3D fly-through controls;
+                 downloads support explicit export buttons. */
+              sandbox={kind === "pdf" ? undefined : "allow-scripts allow-pointer-lock allow-downloads"}
               className="h-full w-full border-0 bg-white"
             />
           ) : a.preview ? (
@@ -238,7 +237,6 @@ function InlineArtifactInner({
                the real thing, so an unmounted embed still shows what it is
                instead of a line of grey text. It is also the only honest
                placeholder available: it is what the page actually rendered. */
-            // eslint-disable-next-line @next/next/no-img-element
             <img
               src={a.preview}
               alt={a.name}

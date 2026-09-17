@@ -39,6 +39,9 @@ _INTEGRITY_PATTERNS = [
     r"\b(insha|zoezi|kazi ya (shule|darasa)|tasnifu)\b"
     r"[^.?!]{0,20}\b(yangu|langu|zangu|yetu)\b",
     r"\b(niwasilishe|kuwasilisha)\b[^.?!]{0,30}\b(insha|zoezi|kazi)\b",
+    # “insha ... nitakayowasilisha” puts the submission phrase after the work.
+    r"\b(insha|zoezi|kazi ya (shule|darasa))\b[^.?!]{0,50}\b"
+    r"(nitakayowasilisha|niwasilishe|kuwasilisha)\b",
 ]
 _INTEGRITY_RE = re.compile("|".join(_INTEGRITY_PATTERNS), re.I | re.S)
 

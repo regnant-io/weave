@@ -29,6 +29,22 @@ def test_models_endpoint_returns_objects_not_bare_strings():
         assert key in payload
 
 
+def test_offline_models_endpoint_does_not_probe_ollama(monkeypatch):
+    from app.api.config import list_models
+    from app.config import settings
+    from app.services.orchestration import llm
+
+    class UnexpectedOllama:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("offline mode must not contact Ollama")
+
+    monkeypatch.setattr(settings, "force_offline_llm", True)
+    monkeypatch.setattr(llm, "OllamaEngine", UnexpectedOllama)
+    payload = list_models(_user=None)  # type: ignore[arg-type]
+    assert payload["engine"] == "offline"
+    assert payload["models"] == []
+
+
 def test_workspace_path_traversal_is_contained():
     """A model-supplied path must never escape the project workspace.
 
@@ -152,6 +168,37 @@ def test_ask_user_answer_is_scoped_to_the_asking_user():
     broker.wait(q, timeout=1)
 
 
+def test_editing_one_thread_does_not_delete_another_threads_messages(db_session):
+    """Project-wide timestamp deletion erased unrelated chats after an edit."""
+    import uuid
+
+    from app.api.messages import truncate_from
+    from app.models import Message, Project, Thread, User
+
+    db = db_session
+    user = User(phone="+255" + uuid.uuid4().hex[:9], password_hash="x",
+                role="researcher")
+    project = Project(user=user, title="thread isolation", mode="researcher",
+                      hypotheses=[], summary="", notes=[])
+    first = Thread(project=project, title="first", summary="")
+    second = Thread(project=project, title="second", summary="")
+    db.add_all([user, project, first, second])
+    db.flush()
+    anchor = Message(project=project, thread=first, role="user", content_en="edit me")
+    unrelated = Message(project=project, thread=second, role="user", content_en="keep me")
+    db.add_all([anchor, unrelated])
+    db.commit()
+
+    try:
+        result = truncate_from(project.id, anchor.id, db=db, user=user)
+        assert result["deleted"] == 1
+        assert db.query(Message).filter(Message.id == unrelated.id).first() is not None
+    finally:
+        db.delete(project)
+        db.delete(user)
+        db.commit()
+
+
 def test_thread_history_is_budgeted_against_the_real_window(db_session):
     """History must be trimmed by TOKEN COST, not by a fixed message count.
 
@@ -198,3 +245,54 @@ def test_thread_history_is_budgeted_against_the_real_window(db_session):
     finally:
         db.delete(project)
         db.commit()
+
+
+def test_pdf_extraction_rejects_excessive_page_count(monkeypatch):
+    """A tiny compressed PDF may expand into thousands of expensive pages."""
+    import sys
+    from types import SimpleNamespace
+    from app.config import settings
+    from app.services.ingestion.service import _extract_pdf
+
+    fake = SimpleNamespace(is_encrypted=False,
+                           pages=[SimpleNamespace(extract_text=lambda: "x")]
+                                 * (settings.pdf_max_pages + 1))
+    monkeypatch.setitem(sys.modules, "pypdf",
+                        SimpleNamespace(PdfReader=lambda *_a, **_k: fake))
+    assert _extract_pdf(b"fake") == ""
+
+
+def test_production_preflight_rejects_sqlite(monkeypatch):
+    """A single-writer development DB must never pass a deployed preflight."""
+    import pytest
+    from app import main
+
+    monkeypatch.setattr(main.settings, "environment", "production")
+    monkeypatch.setattr(main.settings, "database_url", "sqlite:///production.db")
+    monkeypatch.setattr(main.settings, "debug", False)
+    monkeypatch.setattr(main.settings, "storage_backend", "s3")
+    monkeypatch.setattr(main.settings, "secret_key", "production-test-secret-long-enough")
+    monkeypatch.setattr(main.settings, "redis_url", "redis://example.invalid/0")
+    monkeypatch.setattr(main.settings, "analysis_execution_enabled", False)
+    with pytest.raises(RuntimeError, match="database is SQLite"):
+        main._preflight()
+
+
+def test_production_preflight_rejects_default_postgres_password(monkeypatch):
+    """The Compose development credential must never reach a deployment."""
+    import pytest
+    from app import main
+
+    monkeypatch.setattr(main.settings, "environment", "production")
+    monkeypatch.setattr(
+        main.settings,
+        "database_url",
+        "postgresql+psycopg://weave:weave@postgres:5432/weave",
+    )
+    monkeypatch.setattr(main.settings, "debug", False)
+    monkeypatch.setattr(main.settings, "storage_backend", "s3")
+    monkeypatch.setattr(main.settings, "secret_key", "production-test-secret-long-enough")
+    monkeypatch.setattr(main.settings, "redis_url", "redis://example.invalid/0")
+    monkeypatch.setattr(main.settings, "analysis_execution_enabled", False)
+    with pytest.raises(RuntimeError, match="commonly guessed database password"):
+        main._preflight()

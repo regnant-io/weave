@@ -69,7 +69,13 @@ class RetrievalService:
         embeddings = embed_texts(chunks)
         created = []
         for ordinal, (content, emb) in enumerate(zip(chunks, embeddings)):
-            chunk = SourceChunk(source_id=source.id, ordinal=ordinal, content=content, embedding=emb)
+            chunk = SourceChunk(
+                source_id=source.id,
+                ordinal=ordinal,
+                content=content,
+                embedding=emb,
+                embedding_vector=emb if len(emb) == settings.embedding_dim else None,
+            )
             db.add(chunk)
             created.append(chunk)
         db.flush()  # assign ids (uuid defaults are Python-side, available now)
@@ -96,6 +102,8 @@ class RetrievalService:
         top_k: int | None = None,
         source_types: list[str] | None = None,
     ) -> list[dict]:
+        import time
+        started = time.monotonic()
         top_k = top_k or settings.retrieval_top_k
 
         dense_ranked = self._dense_search(db, query, source_types, limit=top_k * 4)
@@ -104,6 +112,8 @@ class RetrievalService:
         fused = self._rrf_fuse(dense_ranked, sparse_ranked)
         chunk_ids = [cid for cid, _ in fused[: top_k]]
         if not chunk_ids:
+            from ...metrics import observe
+            observe("retrieval", "hybrid", "empty", (time.monotonic() - started) * 1000)
             return []
 
         chunks = {c.id: c for c in db.query(SourceChunk).filter(SourceChunk.id.in_(chunk_ids)).all()}
@@ -153,12 +163,30 @@ class RetrievalService:
                 "content": chunk.content,
                 "score": round(float(score_by_id.get(cid, 0.0)), 6),
             })
+        from ...metrics import observe
+        observe("retrieval", "hybrid", "grounded" if results else "filtered",
+                (time.monotonic() - started) * 1000, results=float(len(results)))
         return results
 
     # -- internals ------------------------------------------------------------
 
     def _dense_search(self, db: Session, query: str, source_types, limit: int) -> list[tuple[str, float]]:
         qvec = embed_text(query)
+        if not settings.is_sqlite and len(qvec) == settings.embedding_dim:
+            where = "WHERE c.embedding_vector IS NOT NULL"
+            params: dict = {"q": "[" + ",".join(str(float(x)) for x in qvec) + "]", "n": limit}
+            if source_types:
+                where += " AND s.source_type = ANY(:types)"
+                params["types"] = list(source_types)
+            rows = db.execute(
+                sql_text(
+                    "SELECT c.id, 1 - (c.embedding_vector <=> CAST(:q AS vector)) AS score "
+                    "FROM source_chunks c JOIN sources s ON s.id = c.source_id "
+                    f"{where} ORDER BY c.embedding_vector <=> CAST(:q AS vector) LIMIT :n"
+                ),
+                params,
+            ).fetchall()
+            return [(row[0], float(row[1])) for row in rows]
         q = db.query(SourceChunk)
         rows = q.all()
         scored = []

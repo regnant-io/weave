@@ -74,6 +74,10 @@ export function speechSupported(): boolean {
 let entryId = 0;
 
 export function useLiveSession(projectId: string, language: "sw" | "en") {
+  // Server rendering has no browser feature set. Start from the same value in
+  // both environments, then detect support after hydration so React does not
+  // have to replace the whole live-session subtree on capable browsers.
+  const [supported, setSupported] = useState(false);
   const [state, setState] = useState<LiveState>("off");
   const [ambient, setAmbient] = useState(false);
   const [sharing, setSharing] = useState(false);
@@ -91,6 +95,8 @@ export function useLiveSession(projectId: string, language: "sw" | "en") {
   const speaking = useRef(false);
   const wantOpen = useRef(false);
   const ambientRef = useRef(false);
+
+  useEffect(() => setSupported(speechSupported()), []);
 
   const push = useCallback((entry: Omit<LiveTranscriptEntry, "id">) => {
     setTranscript((cur) => [...cur.slice(-40), { id: `e${entryId++}`, ...entry }]);
@@ -407,6 +413,6 @@ export function useLiveSession(projectId: string, language: "sw" | "en") {
     setAmbientMode,
     startScreen,
     stopScreen,
-    supported: speechSupported(),
+    supported,
   };
 }

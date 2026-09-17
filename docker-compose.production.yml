@@ -1,0 +1,69 @@
+# Production overlay: one public TLS origin, shared Redis, and background jobs.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.production.yml --profile full up -d
+# Add optional profiles only after their images and network boundaries pass the
+# production gates in ROADMAP.md.
+services:
+  backend:
+    restart: unless-stopped
+    environment:
+      WEAVE_ENVIRONMENT: production
+      WEAVE_DEBUG: "false"
+      WEAVE_SECRET_KEY: ${WEAVE_SECRET_KEY:?set WEAVE_SECRET_KEY}
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:?set WEAVE_DATABASE_URL}
+      WEAVE_TRUST_PROXY_HEADERS: "true"
+      WEAVE_ANALYSIS_EXECUTION_ENABLED: "false"
+      WEAVE_WORKSPACE_ENABLED: "false"
+      WEAVE_STORAGE_BACKEND: ${WEAVE_STORAGE_BACKEND:-s3}
+      WEAVE_S3_BUCKET: ${WEAVE_S3_BUCKET:?set WEAVE_S3_BUCKET}
+      WEAVE_S3_REGION: ${WEAVE_S3_REGION:-af-south-1}
+      WEAVE_S3_ENDPOINT_URL: ${WEAVE_S3_ENDPOINT_URL:-}
+      WEAVE_S3_ACCESS_KEY_ID: ${WEAVE_S3_ACCESS_KEY_ID:-}
+      WEAVE_S3_SECRET_ACCESS_KEY: ${WEAVE_S3_SECRET_ACCESS_KEY:-}
+
+  frontend:
+    restart: unless-stopped
+    environment:
+      WEAVE_PUBLIC_WS_BASE: wss://${WEAVE_DOMAIN:?set WEAVE_DOMAIN}
+
+  postgres:
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+
+  redis:
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      WEAVE_DOMAIN: ${WEAVE_DOMAIN:?set WEAVE_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+
+  worker:
+    restart: unless-stopped
+    environment:
+      WEAVE_ENVIRONMENT: production
+      WEAVE_DEBUG: "false"
+      WEAVE_SECRET_KEY: ${WEAVE_SECRET_KEY:?set WEAVE_SECRET_KEY}
+      WEAVE_DATABASE_URL: ${WEAVE_DATABASE_URL:?set WEAVE_DATABASE_URL}
+      WEAVE_STORAGE_BACKEND: ${WEAVE_STORAGE_BACKEND:-s3}
+      WEAVE_S3_BUCKET: ${WEAVE_S3_BUCKET:?set WEAVE_S3_BUCKET}
+      WEAVE_S3_REGION: ${WEAVE_S3_REGION:-af-south-1}
+      WEAVE_S3_ENDPOINT_URL: ${WEAVE_S3_ENDPOINT_URL:-}
+      WEAVE_S3_ACCESS_KEY_ID: ${WEAVE_S3_ACCESS_KEY_ID:-}
+      WEAVE_S3_SECRET_ACCESS_KEY: ${WEAVE_S3_SECRET_ACCESS_KEY:-}
+
+volumes:
+  caddy_data:
+  caddy_config:

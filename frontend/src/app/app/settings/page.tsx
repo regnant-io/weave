@@ -45,9 +45,11 @@ export default async function SettingsPage() {
     return (
       <PageShell>
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">{t("settings", language)}</h1>
-        <div className="mb-6">
-          <OllamaSettings language={language} />
-        </div>
+        {user.role === "admin" && (
+          <div className="mb-6">
+            <OllamaSettings language={language} />
+          </div>
+        )}
         <SettingsClient
           language={language}
           theme={theme}

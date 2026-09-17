@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Language } from "@/lib/types";
-import { IcoExternal, IcoRetry, IcoStop } from "@/components/ui/icons";
+import { IcoExternal, IcoRetry } from "@/components/ui/icons";
 
 /**
  * The app the assistant is running, live.
@@ -17,11 +17,9 @@ import { IcoExternal, IcoRetry, IcoStop } from "@/components/ui/icons";
  * button does anything, whether the form validates, whether it is usable on a
  * narrow screen.
  *
- * The frame is deliberately NOT sandboxed the way generated artifacts are.
- * An artifact is untrusted model output rendered under `sandbox="allow-scripts"`
- * in an opaque origin. This is a dev server the user asked the assistant to
- * start, on their own machine, and it needs storage and same-origin XHR to be
- * the app it is. Sandboxing it would show a broken version of a working thing.
+ * The preview keeps its own origin so storage, forms, and same-origin XHR work,
+ * but iframe sandboxing still prevents it from navigating the Weave tab. The
+ * server is on another origin, so it cannot remove its frame's sandbox flags.
  */
 
 const LABELS = {
@@ -133,6 +131,7 @@ export default function PreviewPanel({
           key={`${url}#${nonce}`}
           src={url}
           title={t.title}
+          sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-pointer-lock"
           className="h-full border border-border bg-white"
           style={{ width: width ? `${width}px` : "100%", maxWidth: "100%" }}
         />

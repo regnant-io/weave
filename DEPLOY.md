@@ -1,369 +1,181 @@
-# Weave Deployment Guide for Kamatera Cloud
+# Deploying Weave
 
-This guide will help you deploy Weave on a Kamatera cloud server with all services including Ollama, Docker, and ngrok tunneling.
+This repository has a local developer stack, a temporary ngrok evaluation path,
+and a production overlay. Keep them separate because
+`docker-compose.override.yml` mounts the host Docker socket and enables
+model-driven developer workspaces.
 
-## Before You Start
-
-### Create GitLab Repository
-
-1. Go to https://gitlab.com and sign in as `daudi.abinallah`
-2. Click "New project" → "Create blank project"
-3. Set project name: `weave`
-4. Set visibility: Private (or Public if you prefer)
-5. Click "Create project"
-6. The repository URL will be: `https://gitlab.com/daudi.abinallah/weave.git`
-
-This repository is already configured to push to this URL.
-
-## Prerequisites
-
-- A Kamatera cloud instance (Ubuntu 20.04/22.04 recommended)
-- Minimum 8GB RAM, 4 CPU cores, 50GB disk (16GB RAM recommended for heavy usage)
-- Root or sudo access
-- ngrok auth token (already configured in script)
-
-## Quick Deployment
-
-### 1. Connect to Your Kamatera Server
+## Local development
 
 ```bash
-ssh root@your-server-ip
+docker compose --profile deep up --build
 ```
 
-### 2. Download the Deployment Script
+Compose loads the development override automatically. The frontend is at
+`http://localhost:3000` and the API is at `http://localhost:8001`.
+
+## Server evaluation deployment
+
+The Kamatera helper creates fresh application and Postgres secrets, writes them
+to `/opt/weave/.env` with mode `0600`, disables analysis and developer workspace
+execution, and starts only the base Compose file.
 
 ```bash
-curl -o deploy-kamatera.sh https://raw.githubusercontent.com/[your-repo]/weave/master/deploy-kamatera.sh
-chmod +x deploy-kamatera.sh
+export NGROK_AUTHTOKEN='value-from-your-secret-manager'
+bash deploy-kamatera.sh
 ```
 
-Or if you have the code locally:
+The ngrok tunnel exposes the frontend. Ordinary HTTP features work through the
+Next.js server-side API routes. Live voice and collaborative canvas sockets need
+the production reverse-proxy setup below; a browser outside the server cannot
+reach the loopback-only backend port directly.
 
-```bash
-# Upload the script
-scp deploy-kamatera.sh root@your-server-ip:/root/
-
-# Connect and run
-ssh root@your-server-ip
-chmod +x deploy-kamatera.sh
-```
-
-### 3. Run the Deployment Script
-
-```bash
-./deploy-kamatera.sh
-```
-
-The script will:
-- ✅ Update system packages
-- ✅ Install Docker & Docker Compose
-- ✅ Install ngrok and configure with auth token
-- ✅ Install Ollama and pull required models (llama3.2:3b, nomic-embed-text)
-- ✅ Clone the Weave repository
-- ✅ Create configuration files (.env)
-- ✅ Build Docker images
-- ✅ Start all services (backend, frontend, PostgreSQL, Qdrant, ClickHouse, MinIO, etc.)
-- ✅ Start ngrok tunnel to expose frontend
-
-### 4. Access Your Application
-
-After deployment completes, you'll see:
-
-```
-Frontend (ngrok):    https://xxxx-xxx-xxx-xxx.ngrok-free.app
-Frontend (local):    http://localhost:3000
-Backend API:         http://localhost:8000
-```
-
-Visit the ngrok URL to access Weave from anywhere!
-
-## Manual Setup (Alternative)
-
-If you prefer to set up manually or customize the installation:
-
-### 1. Install Docker
-
-```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
-```
-
-### 2. Install Docker Compose
-
-```bash
-DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d\" -f4)
-sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
-```
-
-### 3. Install Ollama
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3.2:3b
-ollama pull nomic-embed-text
-```
-
-### 4. Install ngrok
-
-```bash
-curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-sudo apt-get update
-sudo apt-get install ngrok
-ngrok config add-authtoken 3H4wuqzRY3EcfGMJwif0rPscF4I_6h93bQynFGPkb7yRgSpc3
-```
-
-### 5. Clone and Configure
-
-```bash
-git clone https://gitlab.com/daudi.abinallah/weave.git
-cd weave
-cp backend/.env.example backend/.env
-cp frontend/.env.local.example frontend/.env.local
-# Edit .env files as needed
-```
-
-### 6. Start Services
-
-```bash
-docker-compose --profile deep up -d
-ngrok http 3000 &
-```
-
-## Service Management
-
-### View Logs
-
-```bash
-# All services
-cd /opt/weave && docker-compose logs -f
-
-# Specific service
-docker-compose logs -f backend
-docker-compose logs -f frontend
-
-# ngrok logs
-tail -f /opt/weave/ngrok.log
-```
-
-### Restart Services
+Inspect the deployment with explicit base-file commands so the development
+override is never loaded:
 
 ```bash
 cd /opt/weave
-docker-compose restart
-
-# Restart specific service
-docker-compose restart backend
+sudo docker-compose -f docker-compose.yml ps
+sudo docker-compose -f docker-compose.yml logs -f backend frontend
+curl -fsS http://127.0.0.1:8001/health
 ```
 
-### Stop Services
+Create the first administrator through the interactive operator command. It
+does not print or store the password outside the database hash:
+
+```bash
+sudo docker-compose -f docker-compose.yml exec backend \
+  python -m app.cli create-admin --phone '+255700000000' --email 'admin@example.com'
+```
+
+Password registration creates an anonymous capability tier until SMS OTP is
+verified. Configure Africa's Talking before opening self-service signup in
+production; an unconfigured deployed SMS route returns 503 without logging OTPs.
+
+## Production topology
+
+The production overlay includes Caddy and routes one TLS origin to both services:
+
+```bash
+export WEAVE_DOMAIN=weave.example.org
+export WEAVE_SECRET_KEY="$(openssl rand -hex 32)"
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+export WEAVE_CORS_ORIGINS='["https://weave.example.org"]'
+export WEAVE_S3_BUCKET=weave-production
+# Set the S3 endpoint/region/access credentials required by your provider.
+docker compose -f docker-compose.yml -f docker-compose.production.yml \
+  --profile full up -d --build
+```
+
+The `full` profile is required: it starts the Celery owner for durable turns,
+profiling, ingestion, crawling, and channel delivery. Do not add the `deep`
+profile by default. Its browser and voice services remain development/evaluation
+components until their images and egress boundaries pass the production gates.
+
+Caddy then:
+
+- Route normal traffic to frontend port `3000`.
+- Route the complete `/api/v1/` surface, including WebSocket upgrades, to backend
+  port `8001`.
+- Sets the public WebSocket origin to `wss://$WEAVE_DOMAIN`.
+- Keep backend, Postgres, Redis, render, Browserless, SearXNG, MinIO, Qdrant,
+  ClickHouse, and Gotenberg ports bound to loopback or a private container network.
+- Set `WEAVE_ENVIRONMENT=production`, `WEAVE_DEBUG=false`, a random
+  `WEAVE_SECRET_KEY`, a random Postgres password, and the exact public origin in
+  `WEAVE_CORS_ORIGINS`.
+
+Production startup deliberately fails if the public demo account exists, the
+development signing secret is used, model-written subprocess analysis is
+enabled, or developer workspaces are enabled without an explicit override.
+These checks prevent a development convenience from silently becoming a remote
+execution path.
+
+The API implements a signed remote analysis-runner client, but no runner is
+shipped here. Keep analysis disabled until an isolated runner passes the hostile
+fixtures in `ROADMAP.md`. Developer workspaces likewise need a separate host.
+
+## Database migrations
+
+New databases need no manual schema command: the deployed backend runs
+`alembic upgrade head` before starting. A failed migration prevents the API from
+starting, and production startup independently checks that the database revision
+equals the repository head.
+
+For a production Postgres database created by an older Weave version that has
+tables but no `alembic_version` table:
+
+1. Stop API and worker writes and create a verified backup.
+2. Compare the existing schema with migration `a9583a2c2007`; fix any difference.
+3. Mark only that known baseline, then apply later changes:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm backend \
+  alembic stamp a9583a2c2007
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm backend \
+  alembic upgrade head
+```
+
+Never stamp an uninspected database. `stamp` records a version without executing
+schema changes.
+
+## Backups and upgrades
+
+Create and verify a database backup before every upgrade:
 
 ```bash
 cd /opt/weave
-docker-compose down
-
-# Stop ngrok
-pkill ngrok
+sudo scripts/backup-postgres.sh
+sudo scripts/verify-postgres-backup.sh backups/weave-TIMESTAMP.dump
+git pull --ff-only
+sudo docker compose -f docker-compose.yml -f docker-compose.production.yml build
+sudo docker compose -f docker-compose.yml -f docker-compose.production.yml \
+  --profile full up -d
 ```
 
-### Update Application
+On a Windows host with PowerShell 7.4 or newer, use the byte-safe equivalents:
+
+```powershell
+$backup = scripts/backup-postgres.ps1
+scripts/verify-postgres-backup.ps1 $backup
+```
+
+When upgrading a named `backend_var` volume created by an older root-running
+image, migrate its ownership once before starting the new API and worker:
 
 ```bash
-cd /opt/weave
-git pull origin master
-docker-compose build
-docker-compose up -d
+docker compose run --rm --no-deps --user root --entrypoint chown backend -R 10001:10001 /app/var
 ```
 
-## Configuration
+Do not use `docker compose down -v` during normal operations; it deletes named
+database and artifact volumes. Record the backup checksum, restore result,
+deployed Git revision, and migration revision with every promotion.
 
-### Backend Environment Variables
-
-Located at `/opt/weave/backend/.env`:
-
-- `DATABASE_URL`: PostgreSQL connection string
-- `OLLAMA_BASE_URL`: Ollama API endpoint
-- `LLM_MODEL`: Language model to use (default: llama3.2:3b)
-- `CORS_ORIGINS`: Allowed origins (add your ngrok URL here)
-
-### Frontend Environment Variables
-
-Located at `/opt/weave/frontend/.env.local`:
-
-- `WEAVE_API_BASE`: Backend API URL (for SSR)
-- `NEXT_PUBLIC_API_BASE`: Backend API URL (for client)
-
-## Troubleshooting
-
-### Services Not Starting
+After deployment, run the bilingual evaluation and Postgres retrieval benchmark:
 
 ```bash
-# Check Docker logs
-docker-compose logs
-
-# Check disk space
-df -h
-
-# Check memory
-free -h
-
-# Restart Docker
-sudo systemctl restart docker
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec backend \
+  python -m eval.run_eval
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec backend \
+  python -m eval.benchmark_retrieval --min-recall 0.75 --max-p95-ms 250
 ```
 
-### Ollama Not Responding
+Exercise storage and the public WebSocket path before promotion:
 
 ```bash
-# Check Ollama status
-sudo systemctl status ollama
-
-# Restart Ollama
-sudo systemctl restart ollama
-
-# Test Ollama
-curl http://localhost:11434/api/tags
+docker compose -f docker-compose.yml -f docker-compose.production.yml \
+  cp scripts/check-s3-contract.py backend:/tmp/check-s3-contract.py
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec backend \
+  python /tmp/check-s3-contract.py
+python scripts/check-production-websocket.py --origin "https://$WEAVE_DOMAIN"
+python scripts/check-stream-resume.py --origin "https://$WEAVE_DOMAIN"
 ```
 
-### ngrok Tunnel Issues
+The WebSocket check creates and deletes its own user project. Run it with a unique
+phone number if the target preserves users between drills.
 
-```bash
-# Check ngrok status
-curl http://localhost:4040/api/tunnels
+## Secret incident
 
-# Restart ngrok
-pkill ngrok
-nohup ngrok http 3000 --log=stdout > /opt/weave/ngrok.log 2>&1 &
-
-# Get new URL
-curl -s http://localhost:4040/api/tunnels | grep -o 'https://[^"]*ngrok-free.app' | head -1
-```
-
-### Database Connection Issues
-
-```bash
-# Check PostgreSQL logs
-docker-compose logs postgres
-
-# Access PostgreSQL
-docker-compose exec postgres psql -U weave -d weave
-
-# Reset database
-docker-compose down -v
-docker-compose up -d
-```
-
-## Security Recommendations
-
-1. **Change Default Passwords**: Update all passwords in `.env` files
-2. **Configure Firewall**: Only expose necessary ports
-   ```bash
-   sudo ufw allow 22/tcp    # SSH
-   sudo ufw allow 80/tcp    # HTTP
-   sudo ufw allow 443/tcp   # HTTPS
-   sudo ufw enable
-   ```
-3. **Use HTTPS**: Configure SSL certificate for production
-4. **Backup Data**: Regular backups of PostgreSQL, MinIO, and Qdrant data
-5. **Update ngrok Auth Token**: Use your own ngrok token for production
-
-## Resource Requirements
-
-### Minimum Configuration
-- **CPU**: 4 cores
-- **RAM**: 8GB
-- **Disk**: 50GB SSD
-- **Network**: 100 Mbps
-
-### Recommended Configuration
-- **CPU**: 8 cores
-- **RAM**: 16GB
-- **Disk**: 100GB SSD
-- **Network**: 1 Gbps
-
-### Heavy Load Configuration (with all services)
-- **CPU**: 16 cores
-- **RAM**: 32GB
-- **Disk**: 200GB SSD
-- **Network**: 1 Gbps
-
-## Service Ports
-
-- **3000**: Frontend (Next.js)
-- **8000**: Backend (FastAPI)
-- **5432**: PostgreSQL
-- **6333**: Qdrant
-- **8123**: ClickHouse
-- **9000**: MinIO API
-- **9001**: MinIO Console
-- **11434**: Ollama
-- **3001**: Browserless
-- **8080**: Render Service / SearXNG
-- **4040**: ngrok Web Interface
-
-## Monitoring
-
-### Check Service Health
-
-```bash
-# All services
-docker-compose ps
-
-# Backend health
-curl http://localhost:8000/health
-
-# Frontend health
-curl http://localhost:3000
-
-# Ollama health
-curl http://localhost:11434/api/tags
-```
-
-### System Resources
-
-```bash
-# CPU and Memory usage
-docker stats
-
-# Disk usage
-docker system df
-
-# Logs size
-du -sh /var/lib/docker/containers
-```
-
-## Backup and Restore
-
-### Backup
-
-```bash
-# Backup PostgreSQL
-docker-compose exec postgres pg_dump -U weave weave > backup.sql
-
-# Backup MinIO data
-docker-compose exec minio mc mirror /data /backup
-
-# Backup Qdrant data
-docker-compose exec qdrant tar -czf /backup/qdrant.tar.gz /qdrant/storage
-```
-
-### Restore
-
-```bash
-# Restore PostgreSQL
-docker-compose exec -T postgres psql -U weave weave < backup.sql
-
-# Restore MinIO data
-docker-compose exec minio mc mirror /backup /data
-```
-
-## Support
-
-For issues or questions:
-- Check logs: `docker-compose logs -f`
-- Review `/opt/weave/deployment-info.txt` for deployment details
-- Contact: admin@weave.local
-
-## License
-
-See [LICENSE](LICENSE) file in the repository.
+An ngrok credential was previously committed in deployment documentation and
+scripts. The working tree no longer contains it, but Git history still does.
+Revoke that credential in ngrok, create a replacement, and purge the old value
+from shared Git history in a coordinated maintenance window.

@@ -4,7 +4,7 @@ import PageShell from "@/components/PageShell";
 import AdminClient from "@/components/AdminClient";
 
 // Admin / ops dashboard (architecture 4.2 /admin) — real data from /admin/* API,
-// gated server-side to authed users; the API itself enforces admin/institutional.
+// Gated server-side to authenticated users; the API itself requires the admin role.
 export default async function AdminPage() {
   if (!(await isAuthed())) redirect("/auth/login");
   await getLanguage();
