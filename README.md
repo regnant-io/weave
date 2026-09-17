@@ -198,11 +198,17 @@ docker compose --profile build-images build workspace-image
 docker compose --profile deep up -d
 
 # then point the backend at them and restart it:
+
+## Linux OS
 WEAVE_SEARXNG_URL=http://searxng:8080 \
 WEAVE_BROWSERLESS_URL=http://browserless:3000 \
 WEAVE_RENDER_URL=http://render:3100 \
 WEAVE_GOTENBERG_URL=http://gotenberg:3000 \
   docker compose up -d backend
+
+## Windows 
+$env:WEAVE_SEARXNG_URL="http://searxng:8080"; $env:WEAVE_BROWSERLESS_URL="http://browserless:3000"; $env:WEAVE_RENDER_URL="http://render:3100"; $env:WEAVE_GOTENBERG_URL="http://gotenberg:3000"; docker compose up -d backend
+
 ```
 
 MinIO is isolated under `--profile object-storage` for local S3 contract tests.
