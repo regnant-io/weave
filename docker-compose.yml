@@ -21,7 +21,7 @@
 #   WEAVE_DATABASE_URL=sqlite:///./var/weave.db WEAVE_REDIS_URL= #     docker compose up backend frontend --build
 #
 # Optional capability tiers stay behind their profiles:
-#   --profile deep         search, headless Chrome, rendering, PDF, storage
+#   --profile deep         search, headless Chrome, rendering
 #   --profile voice        server-side speech
 #   --profile full         the Celery worker for background jobs
 #   --profile build-images build the workspace sandbox image
@@ -55,7 +55,6 @@ services:
       WEAVE_SEARXNG_URL: ${WEAVE_SEARXNG_URL:-}
       WEAVE_BROWSERLESS_URL: ${WEAVE_BROWSERLESS_URL:-}
       WEAVE_RENDER_URL: ${WEAVE_RENDER_URL:-}
-      WEAVE_GOTENBERG_URL: ${WEAVE_GOTENBERG_URL:-}
       WEAVE_CLICKHOUSE_URL: ${WEAVE_CLICKHOUSE_URL:-}
       WEAVE_ANALYSIS_EXECUTION_ENABLED: ${WEAVE_ANALYSIS_EXECUTION_ENABLED:-true}
       # Optional server-side voice. Empty (the default) means the BROWSER does
@@ -225,18 +224,6 @@ services:
     environment:
       CONCURRENT: "4"
       TOKEN: ""
-
-  gotenberg:
-    # Deterministic HTML/Markdown -> PDF for decks and reports.
-    image: gotenberg/gotenberg:8@sha256:f29984bd1e226bf1b93ba90af06000afa8b315853e99d27b9aaa41b93f15c769
-    profiles: ["deep"]
-    command:
-      - "gotenberg"
-      - "--chromium-start-timeout=60s"       # Chromium is slow to boot under load
-      - "--api-timeout=120s"
-    ports:
-      - "127.0.0.1:3002:3000"
-    shm_size: "1gb"          # Chromium needs more than the default 64MB /dev/shm
 
   render:
     # Node render-sandbox: AI specs -> charts / Three.js / Babylon.js scenes /
