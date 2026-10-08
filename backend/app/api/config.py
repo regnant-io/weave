@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from ..config import settings
-from ..deps import get_admin_user, get_current_user
+from ..deps import get_current_user
 from ..models import User
 from ..runtime import EFFORT_SPEC, current, set_ollama
 from ..schemas import OllamaConfig
@@ -16,13 +16,15 @@ router = APIRouter()
 
 
 @router.get("/models")
-def list_models(_user: User = Depends(get_current_user)) -> dict:
+def list_models(refresh: bool = False, _user: User = Depends(get_current_user)) -> dict:
     """Models available on the configured Ollama server (for the model picker).
 
     Each entry carries its effective context window so the composer can track
     usage against the real limit instead of guessing.
     """
-    from ..services.orchestration.llm import OllamaEngine, get_engine
+    from ..services.orchestration.llm import OllamaEngine, get_engine, reset_engine
+    if refresh:
+        reset_engine()
     engine = get_engine()
     ollama = engine if getattr(engine, "name", "") == "ollama" else None
     offline_only = settings.force_offline_llm or settings.llm_backend.lower() == "offline"
@@ -32,7 +34,8 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
         except Exception:  # noqa: BLE001 - no Ollama configured; empty picker
             ollama = None
 
-    names: list[str] = ollama.list_models() if ollama else []
+    reachable = bool(ollama and ollama.ping())
+    names: list[str] = ollama.list_models() if reachable else []
     models = []
     for n in names:
         ctx = None
@@ -62,7 +65,7 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
             # instrument or a chat window on this model, so the picker shows it
             # rather than letting the user discover it mid-turn.
             "capabilities": caps,
-            "supports_tools": ("tools" in caps) if caps else True,
+            "supports_tools": ("tools" in caps) if caps else None,
             "class": klass,
         })
 
@@ -83,6 +86,8 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
         "configured_model": configured,
         "model_substituted": effective != configured,
         "engine": getattr(engine, "name", "offline"),
+        "ollama_reachable": reachable,
+        "ollama_host": current()["ollama_host"],
         # Fallback window (used when a model's own window can't be read) and the
         # OPT-IN ceiling (0 = none: every model gets its full window).
         "num_ctx_fallback": settings.ollama_num_ctx,
@@ -92,17 +97,21 @@ def list_models(_user: User = Depends(get_current_user)) -> dict:
 
 
 @router.get("/ollama")
-def get_ollama(_user: User = Depends(get_admin_user)) -> dict:
+def get_ollama(_user: User = Depends(get_current_user)) -> dict:
+    if settings.is_deployed and _user.role != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "administrator access required")
     return current()
 
 
 @router.post("/ollama")
-def set_ollama_config(body: OllamaConfig, _user: User = Depends(get_admin_user)) -> dict:
+def set_ollama_config(body: OllamaConfig, _user: User = Depends(get_current_user)) -> dict:
     if settings.is_deployed:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "runtime model-host changes are disabled when deployed; update the environment",
         )
+    if settings.environment != "desktop" and _user.role != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "administrator access required")
     if body.host:
         parsed = urlparse(body.host)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:

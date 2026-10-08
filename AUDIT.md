@@ -1,5 +1,38 @@
 # Weave repository audit
 
+## 2026-09-26: orchestration, datasets and desktop release
+
+This pass prioritised abandoned plans, false completion, dataset correctness,
+runtime portability and a newly built Windows desktop distribution. Earlier
+production risks below remain applicable.
+
+| Severity | Root cause | Fix and evidence |
+|---|---|---|
+| High | Repeated gap notices removed unresolved work; one deliverable closed unrelated plan steps. | Persistent acceptance-driven gaps, cited tool evidence, dependencies and honest bounded termination; agent regressions. |
+| High | Plan/progress existed only until the final message commit; continued SQL tasks lost intent-gated tools and calculation evidence. | Short checkpoint commits, same-context recovery, retained outputs and bounded numerical evidence; turn-level database and continuation regressions. |
+| High | Independent generation repair budgets competed with the task supervisor. | Removed `verification.py` and post-generation gate; latest-version inspection, tests and self-audit now drive task continuation. |
+| High | Streamed provisional success could remain when final stored text said incomplete; shared filenames could attach another output's verification. | Exact artifact identity, complete provisional-text replacement and explicit incomplete plan state; backend and browser regressions. |
+| High | Dataset readers disagreed on encoding/nulls/schema; malformed, profiling or failed datasets could reach execution. | Shared strict reader, ready-state enforcement, bounded sampled CSV statistics and actual source/run identifiers; real Python/SQL format tests. |
+| High | SQL aliases could bypass external-access filtering. | DuckDB external access disabled and configuration locked; adversarial query regressions, bounded query duration and guaranteed connection close. |
+| Medium | Frozen Python omitted pytest and lazy analysis libraries; POSIX shell reset bundled-tool PATH and Docker lacked `python`. | Packaged modules, CPython-compatible workspace imports/options, preserved PATH and Docker alias; runtime and release smoke checks. |
+| Medium | Frozen Windows sandbox stripped required system settings; bundled node preload paths lost backslashes. | Minimal Windows system environment, writable temporary configuration and correctly quoted preload paths; source regressions and isolated packaged checks. |
+| Medium | Visual source sidecars became phantom list entries; absent PDF converter silently returned HTML as successful PDF. | Metadata-only visual listing, HTML-only deck schema without a converter and explicit PDF failure; real storage and adapter regressions. |
+| Medium | Stale staging included removed code; cross-OS packaging produced an incompatible frozen backend. | Fresh verified staging and host/target guard; production build and Windows package validation. |
+| Medium | Desktop navigation accepted lookalike origins; absent tray, orphan subprocesses, port collisions and Docker reconnects caused silent failures. | Exact-origin navigation, explicit exit/process cleanup, collision rejection and capability reprobes; desktop lifecycle/runtime tests. |
+
+Validation: 278 backend tests passed; 18 render tests and 4 desktop lifecycle
+tests passed; 8 browser journeys passed (3 mobile duplicates intentionally
+skipped); frontend typecheck, lint and production build passed. Production npm
+audits reported no vulnerabilities. Windows installer and bundled-runtime smoke
+results are recorded in `CHANGELOG.md` after packaging.
+
+Limits: Docker is unavailable on this host; macOS/Linux installers require native
+hosts. JSON/Excel currently parse fully into memory and Excel analysis uses the
+first worksheet. Checkpoints keep bounded excerpts, not an unlimited execution
+log; critical-history overflow remains an explicit recovery boundary. Provider
+availability and real-model semantic correctness cannot be established by offline
+regressions. Local desktop workspace commands run under the OS user's account.
+
 Audit date: 2026-09-14. Scope covered the FastAPI API and data boundaries, auth,
 orchestration, tool routing, sandbox/workspace execution, web retrieval/crawling,
 artifact verification, Next.js rendering and API proxy routes, the Node render

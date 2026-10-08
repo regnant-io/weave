@@ -28,8 +28,12 @@ const FORBIDDEN = [
   [/\bEventSource\b/i, "EventSource"],
   [/\bnavigator\s*\.\s*sendBeacon/i, "sendBeacon"],
   [/\bimport\s*\(/i, "dynamic import()"],
-  [/\bparent\s*\./i, "parent access"],
-  [/\btop\s*\./i, "top access"],
+  // Frame escapes only. A bare `\bparent\.` also matched `const parent = new
+  // BABYLON.TransformNode(...)` followed by `parent.position`, and d3's
+  // `d.parent.x`; `\btop\.` matched any variable named `top`. Both rejected
+  // ordinary, correct scene code as a sandbox escape.
+  [/(?<![\w$.])(?:window\s*\.\s*)?parent\s*\.\s*(?:document|location|postMessage|frames|window|opener)\b|\bwindow\s*\.\s*parent\b/, "parent access"],
+  [/(?<![\w$.])(?:window\s*\.\s*)?top\s*\.\s*(?:document|location|postMessage|frames|window|opener)\b|\bwindow\s*\.\s*top\b/, "top access"],
   [/\bwindow\s*\.\s*opener/i, "window.opener"],
   [/\bdocument\s*\.\s*cookie/i, "document.cookie"],
   [/\blocalStorage\b/i, "localStorage"],
@@ -135,7 +139,7 @@ canvas{max-width:100%}
 <body>
 <div id="weave-err"></div>
 ${html || '<div class="wrap"><div id="root"></div></div>'}
-${wantsThree ? `<script>${threeSrc}</script>` : ""}
+${wantsThree ? `<script data-weave-lib="three">${threeSrc}</script>` : ""}
 <script>
 // Surface runtime errors in the artifact itself. Without this a thrown error
 // inside an opaque-origin iframe is invisible to both the user and the model,

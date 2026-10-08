@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 import uuid
 import threading as _threading
 from collections.abc import Iterator
@@ -270,6 +271,20 @@ class Orchestrator:
         # they can never disagree.
         thread = self.memory.get_thread(db, project, thread_id)
         context_window = self._context_window(engine, model)
+        initial_state = None
+        if not regenerate and re.match(
+            r"^\s*(?:continue|resume|finish|carry on|keep going|endelea|malizia)\b",
+            user_text, re.I,
+        ):
+            previous = (db.query(Message).filter(
+                Message.thread_id == thread.id, Message.role == "assistant",
+            ).order_by(Message.created_at.desc(), Message.id.desc()).first())
+            state = (previous.plan or {}).get("_task_state") if previous else None
+            if (isinstance(state, dict) and state.get("status") != "finished"
+                    and state.get("project_id") == str(project.id)
+                    and (dataset_id is None or state.get("dataset_id") == dataset_id)):
+                initial_state = state
+                dataset_id = state.get("dataset_id")
 
         # 1. persist the user's message. On regenerate we reuse the last user turn
         # and drop the previous assistant answer instead of duplicating.
@@ -301,7 +316,10 @@ class Orchestrator:
             dataset = db.query(Dataset).filter(
                 Dataset.id == dataset_id, Dataset.project_id == project.id
             ).first()
-        dataset_profile = dataset.column_profile if dataset else None
+        dataset_profile = ({
+            **(dataset.column_profile or {}), "dataset_id": dataset.id,
+            "filename": dataset.original_filename, "status": dataset.status,
+        } if dataset else None)
 
         # 4. retrieval before generation (principle 3) — always for factual intents
         passages: list[dict] = []
@@ -389,6 +407,11 @@ class Orchestrator:
         # regardless of what the intent router inferred — an explicit preference
         # outranks a heuristic. Intent gating still applies to everything else.
         forced = {k for k, v in (services_pref or {}).items() if v}
+        if initial_state:
+            forced.update(event.get("name") for event in initial_state.get("tool_events", [])
+                          if isinstance(event, dict) and event.get("name"))
+            if (initial_state.get("plan") or {}).get("surface") == "analysis":
+                forced.update({"run_analysis", "profile_dataset", "query_warehouse"})
         tool_schemas = registry.schemas(mode=project.mode, trust=trust, services=services,
                                         intent=route.intent, force=forced)
         ctx.allowed_tools = frozenset(t["name"] for t in tool_schemas)
@@ -399,6 +422,17 @@ class Orchestrator:
                        "thread_id": thread.id, "context_window": context_window,
                        # The client may redirect this turn from now on.
                        "steerable": emit is not None})
+        if initial_state:
+            from ...security import artifact_url
+            for event in initial_state.get("tool_events", []):
+                result = event.get("result") or {}
+                for file in result.get("output_files") or []:
+                    if not file.get("s3_key"):
+                        continue
+                    _emit("artifact", {"name": file.get("name", "Saved output"),
+                          "mime": file.get("mime", "application/octet-stream"), "bytes": file.get("bytes", 0),
+                          "tool": event.get("name", ""), "visual_id": result.get("visual_id"),
+                          "url": artifact_url(file["s3_key"])})
 
         # Register for steering HERE, not at the generation call: the client has
         # the turn id from the event above, and retrieval plus pre-generation
@@ -432,17 +466,8 @@ class Orchestrator:
         # limits -- sandbox runs, web calls, container starts -- and a lost
         # increment is a limit that silently does not hold.
         _turn_lock = _threading.Lock()
-
-        # The artifact gate. Nothing a tool renders reaches the transcript until
-        # it has been opened in a real browser — see services/orchestration/
-        # verification.py for why this cannot be left to the model's discretion.
-        from .design_critic import for_turn as _critic_for_turn
-        from .verification import MAX_REPAIRS, ArtifactGate
-        # At the deepest effort level, and only when a vision-capable model is
-        # available, an artifact that renders cleanly is still checked by
-        # LOOKING at it. Returns None otherwise, and the gate then does exactly
-        # what it did before.
-        gate = ArtifactGate(str(project.id), polish=_critic_for_turn(engine, effort))
+        from .design_critic import for_turn
+        visual_audit = for_turn(engine, effort)
 
         def tool_executor(name: str, tool_input: dict) -> dict:
             # Per-turn caps: a runaway agentic loop must not hammer the sandbox or
@@ -458,15 +483,33 @@ class Orchestrator:
                     if _counts["web"] > _s.max_web_calls_per_turn:
                         return {"status": "rejected",
                                 "error": "web call limit reached for this turn"}
-                if name == "workspace_exec":
+                if name in {"workspace_exec", "workspace_check"}:
                     # Each exec starts a container; a looping agent would
-                    # otherwise spawn hundreds in a single turn.
-                    _counts["exec"] += 1
+                    # otherwise spawn hundreds in a single turn. A check runs
+                    # several commands, so it counts as one per phase.
+                    _counts["exec"] += 4 if name == "workspace_check" else 1
                     if _counts["exec"] > _s.max_workspace_execs_per_turn:
                         return {"status": "rejected",
                                 "error": "workspace command limit reached for this turn"}
 
             tool_input = dict(tool_input or {})
+            # Internal inspection can read only outputs recorded by this task.
+            # Storage keys are not a model-facing capability.
+            artifact_key = tool_input.pop("_artifact_key", None)
+            if name == "verify_artifact" and artifact_key:
+                known_events = tool_events + (initial_state or {}).get("tool_events", [])
+                allowed_keys = {
+                    f.get("s3_key") for event in known_events
+                    for f in (event.get("result") or {}).get("output_files", [])
+                    if f.get("mime") == "text/html"
+                }
+                if artifact_key not in allowed_keys:
+                    return {"status": "rejected", "error": "artifact is not an output of this task"}
+                from ...storage import storage
+                try:
+                    tool_input["html"] = storage.get_bytes(artifact_key).decode("utf-8")
+                except Exception as exc:
+                    return {"status": "error", "error": f"could not inspect task artifact: {exc}"}
             # `note` is the model-authored step title. It is a UI concern, never a
             # tool argument, so it is stripped before execution. When the model
             # omits it (small local models often do) the client falls back to a
@@ -498,15 +541,7 @@ class Orchestrator:
                     "title": str(tool_input.get("title") or note or "").strip()[:120],
                 })
 
-            # --- gated execution ------------------------------------------
-            # An artifact-producing tool pushes its output into the transcript
-            # the instant the render service accepts it. That is exactly the
-            # emit-and-continue behaviour we are removing, so for gated tools
-            # the `artifact` events are BUFFERED here and released only once the
-            # page has been proven to open. Buffering at the emit boundary keeps
-            # every tool implementation untouched.
-            gated = gate.gates(name)
-            buffered: list[dict] = []
+            # Each call owns its event scope; orchestration validates completed work.
             saved_emit = _emit
 
             def _scoped(event: str, data: dict) -> None:
@@ -520,12 +555,6 @@ class Orchestrator:
                 no tool has to know its own step number, and the client can stop
                 guessing from ordering.
                 """
-                if event == "artifact" and gated:
-                    # Held back until the artifact has been proven to render --
-                    # see the comment above and services/orchestration/
-                    # verification.py.
-                    buffered.append(dict(data))
-                    return
                 payload = data if "id" in data else {**data, "id": step_id}
                 saved_emit(event, payload)
 
@@ -547,42 +576,29 @@ class Orchestrator:
             # at all. See db.release.
             release_db(ctx.db)
 
-            verdict = None
-            if gated:
-                _emit("verify_start", {"id": step_id, "tool": name})
-                verdict = gate.check(name, tool_input, result)
-                _emit("verify_end", {
-                    "id": step_id,
-                    "tool": name,
-                    "checked": verdict.checked,
-                    "runtime_checked": verdict.runtime_checked,
-                    "ok": verdict.ok,
-                    "attempt": verdict.attempt,
-                    "max_attempts": MAX_REPAIRS,
-                    "exhausted": verdict.exhausted,
-                    "errors": verdict.errors[:4],
-                    "warnings": verdict.warnings[:3],
-                    "polish": verdict.polish_notes[:4],
-                    "summary": verdict.summary,
-                    "ms": verdict.duration_ms,
-                })
-                if verdict.released:
-                    from ...security import sign_path as _sign
-                    preview = ""
-                    if verdict.screenshot_key:
-                        preview = (f"/api/artifact/{verdict.screenshot_key}"
-                                   f"?sig={_sign(verdict.screenshot_key)}")
-                    for art in buffered:
-                        # A real screenshot of the real page: proof it rendered,
-                        # and a poster frame so a transcript full of 3D scenes
-                        # does not need a dozen live WebGL contexts at once.
-                        if preview:
-                            art["preview"] = preview
-                        art["verified"] = verdict.ok and verdict.runtime_checked
-                        if not verdict.ok:
-                            art["defects"] = verdict.errors[:4]
-                        _emit("artifact", art)
-                result = ArtifactGate.apply(result, verdict, name)
+            if name == "verify_artifact":
+                screenshot = result.pop("_screenshot_b64", "")
+                if result.get("ok") and result.get("executed") and screenshot:
+                    if visual_audit:
+                        defects = visual_audit(screenshot, "", name)
+                        if defects:
+                            result.update(status="error", ok=False, polish=defects,
+                                          errors=result.get("errors", []) + defects)
+                    from .inspection import store_preview
+                    preview = store_preview(screenshot)
+                    if preview:
+                        result["preview"] = preview
+                result["verified"] = bool(result.get("ok") and result.get("executed"))
+                visual_id = tool_input.get("visual_id")
+                for event in list(progress_events):
+                    data = event.get("data") or {}
+                    if event.get("event") == "artifact" and (
+                        (visual_id and data.get("visual_id") == visual_id)
+                        or (artifact_key and _artifact_storage_key(data.get("url")) == artifact_key)
+                    ):
+                        _emit("artifact", {**data, "verified": result["verified"],
+                              "preview": result.get("preview", ""),
+                              "defects": result.get("errors", [])[:4]})
 
             # Always resolve the placeholder — on failure too, or the skeleton
             # would shimmer forever.
@@ -613,7 +629,7 @@ class Orchestrator:
         # Installed here rather than with the other services because it needs the
         # turn's own toolset and executor, which are built above. A delegate runs
         # against exactly the same tool plumbing as the turn that spawned it --
-        # same per-turn limits, same artifact gate, same step events -- so there
+        # same per-turn limits, same step events -- so there
         # is no second, weaker path into the capabilities.
         def _run_delegate(*, task: str, context: str = "", expect: str = "") -> dict:
             from .subagent import run_delegate
@@ -709,11 +725,27 @@ class Orchestrator:
                 # model no longer decides on its own that the work is done by
                 # going quiet, because "it stopped emitting tool calls" is not
                 # a definition of finished.
-                from .agent import Agent, LoopPolicy, looks_like_work
+                from .agent import Agent, LoopPolicy
 
-                policy = LoopPolicy.for_effort(
-                    effort, complex_request=looks_like_work(user_text),
-                )
+                policy = (LoopPolicy.for_effort(effort, complex_request=True)
+                          if initial_state else LoopPolicy.for_request(effort, user_text))
+
+                def _checkpoint(state: dict) -> None:
+                    # A separate short transaction persists progress even if a
+                    # process exits before the final assistant text is stored.
+                    from ...db import SessionLocal
+                    with SessionLocal() as checkpoint_db:
+                        state = {**state, "project_id": str(project.id), "dataset_id": dataset_id}
+                        plan = {**(state.get("plan") or {}), "_task_state": state}
+                        checkpoint_db.query(Message).filter(
+                            Message.id == assistant_msg.id,
+                        ).update({Message.plan: plan,
+                                  Message.artifacts: _artifacts_from_events(progress_events)},
+                                 synchronize_session=False)
+                        checkpoint_db.commit()
+                    _emit("task_state", {"status": state.get("status"),
+                          "phase": state.get("phase"), "outstanding": state.get("outstanding", [])})
+
                 agent = Agent(
                     engine=engine, system=system, messages=messages,
                     tools=tool_schemas, tool_executor=tool_executor,
@@ -725,6 +757,7 @@ class Orchestrator:
                     # tool touches the database or changes the world is a
                     # property of the tool.
                     parallel_safe=registry.parallel_safe_names(),
+                    initial_state=initial_state, checkpoint=_checkpoint,
                 )
 
                 def _after_pass(_result) -> str | None:
@@ -785,8 +818,22 @@ class Orchestrator:
                 answer = run.text
                 tool_events = pre_generation_tool_events + run.tool_events
                 tier_used = run.tier_used
-                turn_plan = run.plan.to_json() if run.plan else None
+                turn_plan = {**(run.plan.to_json() if run.plan else {}),
+                             "_task_state": {**run.task_state,
+                                             "project_id": str(project.id), "dataset_id": dataset_id}}
                 engine_streamed = bool(getattr(engine, "streams", False))
+                # A continuation or repair pass can revise an earlier streamed
+                # answer. Replace the provisional text with the composed result
+                # so the live view and the persisted message agree exactly.
+                if engine_streamed and emit is not None and (
+                        run.passes > 1 or run.stopped_because in {"budget", "stalled"}):
+                    _emit("answer_restart", {"reason": "supervised_revision"})
+                    for token in _stream_tokens(answer):
+                        _emit("token", {"text": token})
+                if run.stopped_because in {"budget", "stalled"}:
+                    _emit("notice", {"kind": "incomplete", "text":
+                           "The run stopped before every planned step was complete. "
+                           "Review the plan and continue the remaining work."})
                 log.info(
                     "turn %s: %s after %d pass(es), %d review round(s), %d tool call(s)",
                     assistant_msg.id, run.stopped_because, run.passes,
@@ -809,8 +856,10 @@ class Orchestrator:
                 # was unavailable. Rate limiting is the common cause and is
                 # temporary, which makes telling them doubly worth it — the fix
                 # is to wait a minute and ask again.
-                log.warning("LLM engine '%s' failed (%s); falling back to offline",
-                            getattr(engine, "name", "?"), exc)
+                log.exception("agent run failed with engine '%s'; falling back to offline",
+                              getattr(engine, "name", "?"))
+                if emit is not None and getattr(engine, "streams", False):
+                    _emit("answer_restart", {"reason": "model_fallback"})
                 from ...metrics import observe
                 observe("model", str(getattr(engine, "name", "unknown")), "fallback", 0)
                 from .llm import QuotaExhausted
@@ -829,8 +878,9 @@ class Orchestrator:
                             "answer came from the offline fallback rather than the "
                             "model. Try again shortly.")
                 else:
-                    text = ("The language model could not be reached, so this answer "
-                            "came from the offline fallback rather than the model.")
+                    text = ("The assistant run failed, so this answer came from the "
+                            "offline fallback. Check the desktop log for the cause "
+                            f"({type(exc).__name__}).")
                 _emit("notice", {"kind": "degraded", "text": text})
                 answer, tier_used = self._offline_turn(
                     project, language, route, user_text, passages, integrity,
@@ -875,6 +925,17 @@ class Orchestrator:
         # from the events the client actually received, which keeps the replayed
         # transcript identical to the live one by construction.
         assistant_msg.tool_calls = _step_timeline(progress_events)
+        # Preserve the last checkpoint if the provider failed mid-task.
+        if turn_plan is None:
+            db.refresh(assistant_msg, attribute_names=["plan"])
+            turn_plan = assistant_msg.plan or None
+            if turn_plan and (turn_plan.get("_task_state") or {}).get("status") == "running":
+                state = {**turn_plan["_task_state"], "status": "interrupted", "phase": "incomplete",
+                         "outstanding": turn_plan["_task_state"].get("outstanding") or
+                         ["The model run failed; continue to recover the saved task."]}
+                turn_plan = {**turn_plan, "_task_state": state}
+                _emit("task_state", {"status": state["status"], "phase": state["phase"],
+                                      "outstanding": state["outstanding"]})
         assistant_msg.plan = turn_plan or {}
         # persist artifacts + images on the message so history re-renders them
         assistant_msg.artifacts = artifacts
@@ -1321,28 +1382,30 @@ _PENDING_ARTIFACT_KIND = {
 
 
 def _artifacts_from_events(events: list[dict]) -> list[dict]:
-    """The artifacts the client was actually shown, in the order it saw them.
-
-    Derived from the emitted events rather than re-walked from `tool_events`
-    for one reason that matters: an artifact that FAILED verification was never
-    emitted, and re-collecting from tool results would put it back — the exact
-    broken output the gate exists to withhold would reappear on reload.
-
-    It also preserves what the gate attached (`preview`, `verified`, `defects`),
-    which the tool result does not carry.
-    """
+    """Persist the artifacts emitted by tools and orchestration inspection."""
     out: list[dict] = []
-    seen: set[str] = set()
+    positions: dict[str, int] = {}
     for ev in events:
         if ev.get("event") != "artifact":
             continue
         data = ev.get("data") or {}
         url = str(data.get("url") or "")
-        if not url or url in seen:
+        if not url:
             continue
-        seen.add(url)
-        out.append(dict(data))
+        identity = str(data.get("visual_id") or url)
+        if identity in positions:
+            out[positions[identity]].update(data)
+        else:
+            positions[identity] = len(out)
+            out.append(dict(data))
     return out
+
+
+def _artifact_storage_key(url: str | None) -> str:
+    from urllib.parse import unquote, urlsplit
+    path = unquote(urlsplit(str(url or "")).path)
+    prefix = "/api/artifact/"
+    return path[len(prefix):] if path.startswith(prefix) else ""
 
 
 def _step_timeline(events: list[dict]) -> list[dict]:
@@ -1439,8 +1502,8 @@ def _step_timeline(events: list[dict]) -> list[dict]:
     # panel does not spin forever.
     for step in steps:
         if step["state"] == "running":
-            step["state"] = "done"
-            step["status"] = step["status"] or "ok"
+            step["state"] = "error"
+            step["status"] = step["status"] or "interrupted"
         for sub in step["substeps"]:
             sub["state"] = "done"
     return steps
@@ -1532,11 +1595,6 @@ def _summarise(name: str, result: dict) -> str:
     if not isinstance(result, dict):
         return ""
     status = result.get("status")
-    if status == "needs_repair":
-        v = result.get("verification") or {}
-        n = len(v.get("errors") or [])
-        return (f"broken · {n} error{'s' if n != 1 else ''} · "
-                f"repairing ({v.get('attempt', 1)}/{v.get('attempt', 1) + max(0, v.get('attempts_remaining', 0))})")
     if status and status not in {"ok", "success"}:
         return str(status)
     verification = result.get("verification")

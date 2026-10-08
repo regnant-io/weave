@@ -84,6 +84,36 @@ def _send_sms(phone: str, message: str) -> None:
     raise SmsDeliveryError("SMS delivery is not configured")
 
 
+def initial_trust_tier() -> str:
+    """Trust a brand-new account starts with.
+
+    On a shared server a new account is `anonymous` until its phone is proven,
+    because verified tools (web research, rendering, the workspace) spend the
+    operator's compute and network on the caller's behalf.
+
+    A desktop installation has no such stranger to guard against: the API is
+    bound to loopback, the account holder is the person who installed the app,
+    and there is no SMS gateway to complete verification with. Starting them as
+    `anonymous` silently hid every render, web and workspace tool from the model,
+    which then told the user those capabilities were "unavailable in this
+    session".
+    """
+    return "verified" if settings.environment == "desktop" else "anonymous"
+
+
+def promote_desktop_accounts(db: Session) -> int:
+    """Repair desktop accounts created before `initial_trust_tier` existed."""
+    if settings.environment != "desktop":
+        return 0
+    promoted = (
+        db.query(User)
+        .filter(User.trust_tier == "anonymous")
+        .update({User.trust_tier: "verified"}, synchronize_session=False)
+    )
+    db.commit()
+    return int(promoted or 0)
+
+
 @router.post("/register", response_model=TokenResponse, status_code=201,
              dependencies=[Depends(enforce_auth_limit)])
 def register(body: RegisterRequest, db: Session = Depends(get_db)) -> TokenResponse:
@@ -105,7 +135,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> TokenRespo
         phone=body.phone, email=body.email, password_hash=hash_password(body.password),
         role=body.role, preferred_language=body.preferred_language,
         institution_id=None,
-        trust_tier="anonymous",
+        trust_tier=initial_trust_tier(),
     )
     db.add(user)
     try:

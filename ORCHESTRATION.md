@@ -1,6 +1,6 @@
 # How Weave orchestration works
 
-This describes the executable control flow after the 2026-09-13 hardening pass.
+This describes the executable control flow after the 2026-09-26 hardening pass.
 `architecture.md` explains the product design; this file explains which component
 owns each transition and what happens when it fails.
 
@@ -12,7 +12,7 @@ sequenceDiagram
     participant Worker as Celery worker
     participant Orch as Orchestrator
     participant Tools as Authorized tools
-    participant Gate as Artifact gate
+    participant Agent as Task supervisor
     participant DB as Postgres
 
     UI->>API: start turn (access session, project, text)
@@ -24,8 +24,11 @@ sequenceDiagram
     Orch->>DB: load thread/project/dataset context
     Orch->>Orch: classify intent + integrity rule
     Orch->>Tools: execute against current allowlist
-    Tools->>Gate: generated artifact
-    Gate-->>Orch: verified, static-only, or repair result
+    Tools-->>Agent: tool results and stored outputs
+    Agent->>Tools: inspect latest output / run validation
+    Tools-->>Agent: execution evidence or concrete failures
+    Agent->>DB: checkpoint goals, steps, evidence, outstanding work
+    Agent->>Tools: continue unfinished work / edit detected defects
     Orch->>DB: commit answer, sources, plan, tool audit
     Orch->>Redis: done event + expiring replay state
     API-->>UI: ordered events; reconnect resumes by cursor
@@ -54,14 +57,42 @@ fallback makes a zero-service local boot possible. Production preflight rejects 
    the subject available.
 6. Build the service map and tool schemas for this user, mode, trust tier, intent,
    and delivery surface.
-7. Run the supervised agent: plan, execute, inspect, and bounded review/repair.
+7. Classify chat, small actions, analysis, coding, visual artifacts, and substantial
+   tasks. Chat and small actions skip planning and critic calls even at deep effort.
+   Substantial tasks use understand → plan → execute → inspect → validate →
+   self-audit → fix/polish → recheck → deliver.
 8. Re-authorize every tool at execution time. Schema validation rejects malformed
    model arguments with a stable error code and retryability hint.
-9. Gate generated artifacts with static checks and a browser probe when available.
-   Failed artifacts return to the model as failed tool calls; an unavailable browser
-   yields an explicit static-only state.
+9. The supervisor calls `verify_artifact` on each latest HTML output after a work
+   pass. Generation does not run a separate repair gate. Static checks alone are
+   `unverified`; browser or visual failures remain unfinished work. At deep effort,
+   a vision-capable model inspects the screenshot for concrete visual defects.
 10. Commit bilingual answer fields, citations, artifacts, plan, tool audit, context
     accounting, and thread rollover before emitting completion.
+
+## Completion, recovery, and resource boundaries
+
+Plans include a goal, constraints, numbered steps, dependencies, and acceptance
+checks. `update_plan` cites successful numbered tool events when closing work;
+tests and inspection support acceptance checks. Producing one file cannot close
+unrelated exports, research, or additional deliverables. Re-planning retains
+unfinished obligations and completed work.
+
+The supervisor retains unresolved gaps until resolved. Repeated prose, identical
+tool results, and failed retries do not count as progress. Pass limits and repeated
+no-progress attempts terminate with an explicit incomplete result and remaining
+work, never a successful completion. A browser outage, failed test, placeholder,
+unrecovered execution failure, or unaudited revision cannot be hidden by a
+confident closing paragraph. Source changes invalidate prior workspace checks;
+visual edits require inspection of the new version.
+
+Short transactions persist checkpoints in `messages.plan._task_state`, including
+bounded tool evidence and stored outputs. They do not wait for final generation.
+After a restart or resource boundary, `continue`, `resume`, or `finish` in the same
+task thread restores its latest incomplete checkpoint. Project and dataset IDs
+must match; a different dataset starts fresh. Recovery preserves useful files and
+uses a new execution allowance. Network reconnect still uses the SSE cursor;
+checkpoints recover work, not the interrupted provider stream.
 
 ## Durable control-plane records
 
@@ -74,6 +105,7 @@ fallback makes a zero-service local boot possible. Production preflight rejects 
 | `auth_sessions` | Refresh-token family | rotate each use; reuse and logout revoke server-side |
 | Redis turn keys | ordered events/cancel/resume | owner checked; bounded event history and TTL |
 | Redis steering keys | redirects during generation | owner checked; three restart budget |
+| Message task checkpoint | goal, dependencies, outputs and completion evidence | short commits; same-thread/project/dataset recovery |
 
 ## Failure semantics
 
@@ -93,7 +125,8 @@ fallback makes a zero-service local boot possible. Production preflight rejects 
 
 Implement a small tool adapter, declare its input schema and eligibility, and add it
 to the service map. Keep authorization in the registry/execution boundary rather
-than relying on prompt instructions. If it creates an artifact, register it with the
-artifact gate. If it can outlive a request or cause an external side effect, give it
+than relying on prompt instructions. If it creates an artifact, expose output files
+and a stable visual ID so the supervisor can inspect revisions. If it can outlive
+a request or cause an external side effect, give it
 a tracked job and/or transactional outbox record. Add its latency/failure category
 to operational metrics and include one denial and one success regression.

@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
+    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -85,6 +85,9 @@ class OtpCode(Base):
 class Project(Base):
     """Persistent research memory (architecture section 9 / 6.2 project memory layer)."""
     __tablename__ = "projects"
+    __table_args__ = (
+        Index("ix_project_user_created_id", "user_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
@@ -197,6 +200,10 @@ class MemoryEntry(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        Index("ix_message_thread_created_id", "thread_id", "created_at", "id"),
+        Index("ix_message_project_created", "project_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"))

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -153,15 +154,32 @@ class SandboxManager:
                 "TMPDIR": str(workspace),
                 "TEMP": str(workspace),
                 "TMP": str(workspace),
+                # The frozen dispatcher imports app.config through the sandbox
+                # package. Never let its default write inside the installation.
+                "WEAVE_DATA_DIR": str(workspace),
             }
+            if sys.platform == "win32":
+                # Windows needs SystemRoot to locate Winsock providers, even
+                # when user code has no network access. Scrubbing it crashes
+                # the frozen runner while importing asyncio (WinError 10106).
+                system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+                if system_root:
+                    env["SystemRoot"] = system_root
+                    env["WINDIR"] = system_root
+                    env["PATH"] = os.pathsep.join((str(Path(system_root) / "System32"), system_root))
             started = time.monotonic()
             status = "ok"
             try:
                 # -I = isolated mode (ignore PYTHON* env + user site-dir) but still
                 #      run site.py so the pinned scientific stack in site-packages
                 #      is importable. (Do NOT add -S; it would hide site-packages.)
-                subprocess.run(
-                    [sys.executable, "-I", str(_RUNNER), str(manifest_file)],
+                command = (
+                    [sys.executable, "weave-sandbox", str(manifest_file)]
+                    if getattr(sys, "frozen", False)
+                    else [sys.executable, "-I", str(_RUNNER), str(manifest_file)]
+                )
+                process = subprocess.run(
+                    command,
                     cwd=str(workspace),
                     env=env,
                     timeout=timeout + 5,  # grace over the in-VM CPU limit
@@ -181,9 +199,13 @@ class SandboxManager:
                     stderr=f"Execution exceeded the {timeout}s time limit and was terminated.",
                 )
             if not result_file.exists():
+                diagnostic = (process.stderr or b"")
+                if isinstance(diagnostic, bytes):
+                    diagnostic = diagnostic.decode("utf-8", errors="replace")
                 return SandboxResult(
                     status="error", execution_time_ms=elapsed_ms, code_hash=code_hash,
-                    stderr="Sandbox produced no result (the process crashed before completing).",
+                    stderr="Sandbox produced no result (the process crashed before completing)."
+                           + ("\n" + diagnostic[-6000:] if diagnostic else ""),
                 )
 
             raw = json.loads(result_file.read_text(encoding="utf-8"))

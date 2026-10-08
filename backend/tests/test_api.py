@@ -12,6 +12,83 @@ def test_health(app_client):
     assert body["llm_engine"] == "offline"  # forced in tests
 
 
+def test_project_lists_are_keyset_paged(app_client, auth_headers, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import Project
+    from app.security import decode_access_token
+
+    subject = decode_access_token(auth_headers["Authorization"].split(" ", 1)[1])["sub"]
+    base = datetime.now(timezone.utc) - timedelta(days=300)
+    db_session.add_all([
+        Project(
+            user_id=subject, title=f"Workspace {i:03}", mode="researcher",
+            created_at=base + timedelta(seconds=i),
+        )
+        for i in range(105)
+    ])
+    db_session.commit()
+
+    first = app_client.get("/api/v1/projects?limit=100", headers=auth_headers)
+    assert first.status_code == 200
+    assert len(first.json()) == 100
+    before = first.json()[-1]["id"]
+    second = app_client.get(
+        f"/api/v1/projects?limit=100&before={before}", headers=auth_headers
+    )
+    assert second.status_code == 200
+    assert len(second.json()) == 5
+    assert not ({p["id"] for p in first.json()} & {p["id"] for p in second.json()})
+
+
+def test_thread_message_history_is_bounded_and_keyset_paged(app_client, auth_headers, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models import Message
+
+    project = app_client.post(
+        "/api/v1/projects", json={"title": "History", "mode": "researcher"},
+        headers=auth_headers,
+    ).json()
+    thread = app_client.get(
+        f"/api/v1/projects/{project['id']}/threads", headers=auth_headers
+    ).json()[0]
+    base = datetime.now(timezone.utc) - timedelta(days=1)
+    messages = [
+        Message(
+            project_id=project["id"], thread_id=thread["id"], role="user",
+            original_language="en", content_en=f"Message {i}", content_sw="",
+            created_at=base + timedelta(seconds=i),
+        )
+        for i in range(205)
+    ]
+    db_session.add_all(messages)
+    db_session.commit()
+
+    first = app_client.get(
+        f"/api/v1/projects/{project['id']}/threads/{thread['id']}/messages",
+        headers=auth_headers,
+    )
+    assert first.status_code == 200
+    assert len(first.json()) == 100
+    before = first.json()[0]["id"]
+    second = app_client.get(
+        f"/api/v1/projects/{project['id']}/threads/{thread['id']}/messages"
+        f"?limit=100&before={before}",
+        headers=auth_headers,
+    )
+    assert second.status_code == 200
+    assert len(second.json()) == 100
+    assert second.json()[-1]["created_at"] < first.json()[0]["created_at"]
+    third = app_client.get(
+        f"/api/v1/projects/{project['id']}/threads/{thread['id']}/messages"
+        f"?limit=100&before={second.json()[0]['id']}",
+        headers=auth_headers,
+    )
+    assert third.status_code == 200
+    assert len(third.json()) == 5
+
+
 def test_readiness_checks_durable_dependencies(app_client):
     res = app_client.get("/ready")
     assert res.status_code == 200

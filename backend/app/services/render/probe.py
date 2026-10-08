@@ -55,6 +55,7 @@ HEAVY_SETTLE_MS = 3200
 #: behaving exactly as designed inside an opaque-origin sandbox.
 _IGNORABLE = (
     "download the react devtools",
+    "electron security warning",
     "favicon.ico",
     "was preloaded using link preload",
     "sandboxed and the 'allow-scripts' permission is not set",
@@ -386,7 +387,17 @@ class ArtifactProbe:
         warnings: list[str] = []
 
         if not data.get("loaded", False):
-            msg = data.get("loadError") or "the page did not load"
+            msg = str(data.get("loadError") or "the page did not load")
+            if not allow_network and _is_infrastructure_failure(msg):
+                # The browser could not even OPEN the document it was handed:
+                # an oversized URL, a blocked temp file, a crashed worker. None
+                # of that is in the artifact, and reporting it as a defect sent
+                # the model to "repair" a page with nothing wrong with it,
+                # three times, before it gave up and told the user that 3D was
+                # unavailable. Treat it as the probe not running.
+                log.warning("artifact probe could not open the document: %s", msg)
+                return ProbeResult(available=False, ok=True,
+                                   note=f"the verification browser could not open the page ({msg[:160]})")
             return ProbeResult(ok=False, errors=[f"the document failed to load: {msg}"])
 
         paint = data.get("paint") or {}
@@ -484,6 +495,22 @@ class ArtifactProbe:
             title=str(paint.get("title") or ""),
             paint=paint,
         )
+
+
+#: Chromium network errors raised while loading the artifact document ITSELF.
+#: An inline artifact makes no request to load, so these only come from the
+#: probe's own plumbing. A timeout is deliberately absent: a synchronous
+#: infinite loop in the page's own script is a real defect and presents as one.
+_INFRA_LOAD_ERRORS = (
+    "err_invalid_url", "err_file_not_found", "err_access_denied", "err_aborted",
+    "err_blocked_by_client", "err_failed", "err_insufficient_resources",
+    "err_out_of_memory", "renderer stopped", "browser worker is busy",
+)
+
+
+def _is_infrastructure_failure(message: str) -> bool:
+    low = message.lower()
+    return any(marker in low for marker in _INFRA_LOAD_ERRORS)
 
 
 def _ignorable(text: str) -> bool:

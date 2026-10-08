@@ -83,20 +83,18 @@ def _build_weave_io(input_dir: Path, output_dir: Path, max_files: int) -> types.
 
     def load_dataset(name: str | None = None):
         """Return the dataset as a pandas DataFrame (read-only copy)."""
-        import pandas as pd
         path = _find_dataset(name)
-        suffix = path.suffix.lower()
-        if suffix in {".csv"}:
-            return pd.read_csv(path)
-        if suffix in {".tsv"}:
-            return pd.read_csv(path, sep="\t")
-        if suffix in {".xlsx", ".xls"}:
-            return pd.read_excel(path)
-        if suffix == ".json":
-            return pd.read_json(path)
-        if suffix == ".parquet":
-            return pd.read_parquet(path)
-        raise ValueError(f"unsupported dataset format: {suffix}")
+        if __package__:
+            from .datasets import read_dataset
+        else:
+            # python -I omits the source directory from sys.path. Load only
+            # this trusted adjacent helper; do not expose the application path.
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("weave_dataset_reader", Path(__file__).with_name("datasets.py"))
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            read_dataset = helper.read_dataset
+        return read_dataset(path)
 
     def save_output(obj, name: str) -> str:
         """Persist a chart / table / text artifact to the sandbox output surface.
@@ -202,8 +200,10 @@ def main() -> int:
         try:
             compiled = compile(code, "<analysis>", "exec")
             exec(compiled, sandbox_globals)  # noqa: S102 - the whole point of the sandbox
-        except SystemExit:
-            status = "ok"
+        except SystemExit as exc:
+            status = "ok" if exc.code in (None, 0) else "error"
+            if status == "error":
+                print(f"SystemExit: analysis exited with code {exc.code}", file=err_buf)
         except MemoryError:
             status = "error"
             print("MemoryError: sandbox memory limit exceeded", file=err_buf)

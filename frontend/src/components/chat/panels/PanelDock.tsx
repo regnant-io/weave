@@ -127,7 +127,7 @@ export default function PanelDock({
       />
 
       <div
-        className={`z-[46] flex min-h-0 min-w-0 max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:w-[min(92vw,460px)]
+        className={`weave-panel-dock z-[46] flex min-h-0 min-w-0 max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:w-[min(92vw,460px)]
           max-lg:transition-transform max-lg:duration-panel max-lg:ease-expo ${
             open.length ? "max-lg:translate-x-0" : "max-lg:translate-x-full"
           }`}

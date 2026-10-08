@@ -3,6 +3,7 @@ import "./globals.css";
 import { getLanguage, getTheme, isAuthed } from "@/lib/session";
 import AppShell from "@/components/shell/AppShell";
 import BootProbe from "@/components/BootProbe";
+import DesktopTitlebar from "@/components/shell/DesktopTitlebar";
 
 export const metadata: Metadata = {
   title: "Weave",
@@ -135,6 +136,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         />
       </head>
       <body className="bg-bg text-fg">
+        <DesktopTitlebar />
         {/*
           TWO DIFFERENT FAILURES, TWO DIFFERENT MECHANISMS.
 
@@ -159,7 +161,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         */}
         <noscript>
           <div className="border-b border-border bg-surface-2 px-4 py-2 text-center text-sm">
-            JavaScript imezimwa / is turned off — content is still readable.
+            JavaScript imezimwa / is turned off. Content is still readable.
           </div>
         </noscript>
         {/*
@@ -174,7 +176,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           className="border-b border-warn bg-warn-soft px-4 py-2 text-center text-sm text-warn"
           dangerouslySetInnerHTML={{
             __html:
-              "Programu haijapakia kikamilifu / the app did not finish loading — " +
+              "Programu haijapakia kikamilifu / the app did not finish loading. " +
               '<button type="button" onclick="location.reload()" ' +
               'style="text-decoration:underline;text-underline-offset:2px">' +
               "jaribu tena / reload</button>",

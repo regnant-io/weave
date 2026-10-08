@@ -32,24 +32,39 @@ export default async function ProjectsPage() {
 
   return (
     <PageShell size="wide">
-      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-2xl font-semibold tracking-tight">{t("projects", language)}</h1>
+      <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="platform-eyebrow mb-2">WEAVE / WORKSPACE</p>
+          <h1 className="platform-page-title text-[27px] font-semibold leading-tight sm:text-[32px]">
+            {t("projects", language)}
+          </h1>
+          <p className="mt-2 max-w-2xl text-[13px] leading-5 text-fg-muted">
+            {language === "sw"
+              ? "Miradi yako ya utafiti na mazungumzo ya hivi karibuni."
+              : "Research projects and their recent activity."}
+          </p>
+        </div>
         <CreateProjectForm language={language} defaultMode={defaultMode} />
       </div>
 
-      {/*
-        Analytics sit top-right on desktop and BELOW the projects on mobile:
-        the projects are what the user came for, and a 400px stats block above
-        them on a phone would bury the actual content.
-      */}
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
-        <div className="order-1 min-w-0">
-          <ProjectList projects={projects} language={language} />
-        </div>
-        <div className="order-2 min-w-0 lg:sticky lg:top-4">
-          <StatsPanel stats={stats} language={language} />
-        </div>
+      <div className="mb-7 min-w-0">
+        <StatsPanel stats={stats} language={language} />
       </div>
+
+      <section aria-labelledby="project-section-title" className="min-w-0">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h2 id="project-section-title" className="text-sm font-semibold">
+              {language === "sw" ? "Miradi" : "Projects"}
+            </h2>
+            <p className="mt-0.5 text-xs text-fg-faint">
+              {language === "sw" ? "Hifadhi kazi zako katika nafasi tofauti." : "Keep related chats and datasets together."}
+            </p>
+          </div>
+          <span className="font-mono text-[11px] text-fg-faint">{(stats?.projects ?? projects.length).toString().padStart(2, "0")}</span>
+        </div>
+        <ProjectList projects={projects} language={language} />
+      </section>
     </PageShell>
   );
 }

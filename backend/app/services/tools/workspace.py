@@ -17,7 +17,48 @@ Two design decisions are load-bearing:
 """
 from __future__ import annotations
 
+import re
+
 from .base import Tool, ToolContext, ToolRegistry
+
+
+def _desktop() -> bool:
+    from ...config import settings
+    return settings.environment == "desktop"
+
+
+def _exec_description() -> str:
+    """What the shell actually is. Telling a Windows desktop model it has
+    Debian and bash produced `rm -rf`, `export` and heredocs, each a failure."""
+    common = (
+        "NETWORK IS AVAILABLE, so you can install dependencies and download "
+        "assets. There is no terminal: interactive prompts are disabled (CI=1, "
+        "npm_config_yes), so pass scaffolders their options as flags, e.g. "
+        "`npx create-vite@latest app --template react-ts`. Use workspace_check "
+        "to run the project's tests/typecheck/build. Long builds: pass a larger "
+        "`timeout`. Never start a dev server here; use workspace_serve."
+    )
+    if _desktop():
+        import os
+        if os.name == "nt":
+            return (
+                "Run a command in the project directory on this Windows computer, "
+                "in PowerShell, with node, npm, npx and python on PATH. `&&` and `||` "
+                "chain commands. Use PowerShell forms, not bash: `Remove-Item -Recurse "
+                "-Force dir` (not rm -rf), `$env:NAME='v'` (not export), `New-Item "
+                "-ItemType Directory -Force a/b` (not mkdir -p). " + common
+            )
+        return ("Run a shell command (sh) in the project directory on this computer, "
+                "with node, npm, npx and python on PATH. " + common)
+    return ("Run a shell command with bash in the workspace container (Debian, Node "
+            "20, Python 3, git, ffmpeg, ImageMagick). " + common)
+
+
+def _exec_command_hint() -> str:
+    if _desktop():
+        import os
+        return "PowerShell command." if os.name == "nt" else "Shell command (sh -lc)."
+    return "Shell command, run with bash -lc."
 
 
 def _svc(ctx: ToolContext):
@@ -33,12 +74,68 @@ def _unavailable() -> dict:
             "message": "the developer workspace is not configured on this server"}
 
 
+#: Source files where an elision marker means code is missing. Prose formats
+#: are excluded: "..." in a README is punctuation, not a hole.
+_CODE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".css",
+    ".scss", ".html", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".c", ".h",
+    ".cpp", ".cs", ".swift", ".sql", ".sh",
+}
+
+#: Things a model writes INSTEAD of code. Each is a statement that part of the
+#: file was never written, so none can be shipped.
+_PLACEHOLDERS = [
+    (re.compile(r"(?://|#|/\*|<!--)\s*\.{3}\s*(?:rest|existing|remaining|other|more|previous|same)\b",
+                re.I), "an elision comment standing in for code"),
+    (re.compile(r"(?://|#|/\*|<!--)\s*(?:rest of (?:the )?(?:code|file|implementation)|"
+                r"(?:existing|previous|unchanged) code(?: here| remains| unchanged)?|"
+                r"implementation (?:goes )?here|your code here|add (?:your|more) .{0,30} here)",
+                re.I), "a comment standing in for code"),
+    (re.compile(r"\b(?:TODO|FIXME)\b[:\s]+(?:implement|add|write|fill|finish)\b", re.I),
+     "an unfinished TODO"),
+    # `raise NotImplementedError` is deliberately absent: it is also the
+    # idiomatic body of an abstract method, and a false flag here sends the
+    # model to "fix" correct code.
+]
+
+
+def _placeholders(path: str, content: str) -> list[str]:
+    """Elisions and stubs in a source file, as 'line N: why' strings."""
+    suffix = ("." + path.rsplit(".", 1)[-1].lower()) if "." in path else ""
+    if suffix not in _CODE_SUFFIXES or not content:
+        return []
+    found: list[str] = []
+    for number, line in enumerate(content.splitlines(), start=1):
+        for pattern, why in _PLACEHOLDERS:
+            if pattern.search(line):
+                found.append(f"line {number}: {why} ({line.strip()[:80]})")
+                break
+        if len(found) >= 5:
+            break
+    return found
+
+
+def _flag_placeholders(ctx: ToolContext, result: dict) -> None:
+    """Attach placeholder findings for the file just written, read back from disk."""
+    svc = _svc(ctx)
+    path = result.get("path") or ""
+    read = svc.read_file(_project_id(ctx), path) if svc is not None and path else {}
+    found = _placeholders(path, str(read.get("content") or "")) if read.get("status") == "ok" else []
+    if found:
+        result["placeholders"] = found
+        result["hint"] = ((result.get("hint") + " ") if result.get("hint") else "") + (
+            "This file contains stand-ins for code that was never written. Replace "
+            "every one with the real implementation. Code that says it is "
+            "unfinished is unfinished.")
+
+
 def _write_file(ctx: ToolContext, inp: dict) -> dict:
     svc = _svc(ctx)
     if svc is None:
         return _unavailable()
     result = svc.write_file(_project_id(ctx), inp.get("path", ""), inp.get("content", ""))
     if result.get("status") == "ok":
+        _flag_placeholders(ctx, result)
         ctx.progress("step_sub", {
             "text": f"{'Created' if result.get('created') else 'Updated'} {result['path']}",
             "detail": f"{result.get('bytes', 0)} bytes",
@@ -75,6 +172,7 @@ def _edit_file(ctx: ToolContext, inp: dict) -> dict:
         inp.get("replace", ""), bool(inp.get("replace_all")),
     )
     if result.get("status") == "ok":
+        _flag_placeholders(ctx, result)
         ctx.progress("step_sub", {"text": f"Edited {result['path']}"})
         check = svc.verify_file(_project_id(ctx), result["path"])
         if check.get("status") == "ok" and check.get("valid") is False:
@@ -130,6 +228,18 @@ def _verify(ctx: ToolContext, inp: dict) -> dict:
     if svc is None:
         return _unavailable()
     return svc.verify_file(_project_id(ctx), inp.get("path", ""))
+
+
+def _check(ctx: ToolContext, inp: dict) -> dict:
+    svc = _svc(ctx)
+    if svc is None:
+        return _unavailable()
+    ctx.progress("step_sub", {"text": "Detecting and running the project's checks"})
+    result = svc.run_checks(_project_id(ctx), str(inp.get("path") or ""), cancel=ctx.cancel)
+    for check in result.get("checks") or []:
+        ctx.progress("step_sub", {"text": f"{check['name']}: {check['status']}",
+                                  "detail": check.get("command", "")})
+    return result
 
 
 def _package(ctx: ToolContext, inp: dict) -> dict:
@@ -236,8 +346,8 @@ def _preview_check(ctx: ToolContext, inp: dict) -> dict:
             "error": (
                 "no dev server is running. This tool checks a web app you started "
                 "with `workspace_serve` — it is not for artifacts. An artifact you "
-                "rendered has ALREADY been opened in a browser and verified; if you "
-                "want to check one yourself, use `verify_artifact`."
+                "rendered is inspected with `verify_artifact`; use that tool "
+                "to check its current version."
             ),
         }
 
@@ -286,6 +396,8 @@ def _git(ctx: ToolContext, inp: dict) -> dict:
         return _unavailable()
     action = str(inp.get("action") or "status").lower()
     pid = _project_id(ctx)
+    if getattr(svc, "_native", False):
+        return _native_git(svc, pid, action, inp)
 
     # Identity and an initial commit are set up on first use rather than asked
     # for: a model that has to remember to `git init` will forget, and the
@@ -324,6 +436,75 @@ def _git(ctx: ToolContext, inp: dict) -> dict:
     }
 
 
+def _native_git(svc, project_id: str, action: str, inp: dict) -> dict:
+    """Use argument arrays on desktop instead of container shell syntax."""
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if not git:
+        return {"status": "unavailable", "error": "Git is not installed on this computer"}
+    root = svc.project_dir(project_id)
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([git, *args], cwd=root, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=90, check=False)
+
+    if not (root / ".git").exists():
+        started = run("init", "-q")
+        if started.returncode:
+            return {"status": "error", "error": started.stderr[:1000]}
+        run("config", "user.email", "weave@local")
+        run("config", "user.name", "Weave")
+        ignore_file = root / ".gitignore"
+        if not ignore_file.exists():
+            ignore_file.write_text(
+                "node_modules/\n.cache/\n.weave/\ndist/\n.next/\n__pycache__/\n",
+                encoding="utf-8",
+            )
+    if action == "commit":
+        staged = run("add", "-A")
+        if staged.returncode:
+            return {"status": "error", "error": staged.stderr[:1000]}
+        if run("diff", "--cached", "--quiet").returncode == 0:
+            result = "nothing to commit"
+        else:
+            message = str(inp.get("message") or "checkpoint")[:200]
+            committed = run("commit", "-q", "-m", message)
+            if committed.returncode:
+                return {"status": "error", "error": committed.stderr[:1000]}
+            result = run("log", "--oneline", "-1").stdout
+    elif action == "log":
+        logged = run("log", "--oneline", "-n", str(max(1, min(int(inp.get("limit") or 15), 100))))
+        if logged.returncode:
+            return {"status": "error", "error": logged.stderr[:1000]}
+        result = logged.stdout
+    elif action == "diff":
+        ref = str(inp.get("ref") or "HEAD")[:80]
+        if ref.startswith("-"):
+            return {"status": "error", "error": "a Git reference cannot start with '-'"}
+        diff = run("--no-pager", "diff", ref, "--")
+        if diff.returncode:
+            return {"status": "error", "error": diff.stderr[:1000]}
+        result = diff.stdout[:12000]
+    elif action == "revert":
+        ref = str(inp.get("ref") or "HEAD")[:80]
+        if ref.startswith("-"):
+            return {"status": "error", "error": "a Git reference cannot start with '-'"}
+        reverted = run("reset", "--hard", ref)
+        if reverted.returncode:
+            return {"status": "error", "error": reverted.stderr[:1000]}
+        result = reverted.stdout
+    else:
+        status = run("status", "--short")
+        if status.returncode:
+            return {"status": "error", "error": status.stderr[:1000]}
+        history = run("log", "--oneline", "-n", "5")
+        result = status.stdout + "\n" + (history.stdout or "No commits yet.")
+    return {"status": "ok", "action": action, "output": result[:12000]}
+
+
 def register_workspace_tools(reg: ToolRegistry) -> None:
     common = {"trust_required": "verified", "requires_services": ("workspace",)}
 
@@ -335,8 +516,7 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
             "live preview panel beside the chat. The command runs in the "
             "background and keeps running between turns, so this is how you show "
             "someone a working web app rather than a tarball. Ports 5173, 3000, "
-            "8000 and 8080 are published; bind to 0.0.0.0, not localhost, or "
-            "nothing outside the container can reach it. Returns once the port is "
+            "8000 and 8080 are available. Returns once the port is "
             "genuinely accepting connections, so a URL you get back is a URL that "
             "works. ALWAYS follow it with `preview_check`."
         ),
@@ -526,18 +706,31 @@ def register_workspace_tools(reg: ToolRegistry) -> None:
 
     reg.register(Tool(
         name="workspace_exec",
-        description=(
-            "Run a shell command in the workspace container (Debian, Node 20, "
-            "Python 3, git, ffmpeg, ImageMagick). NETWORK IS AVAILABLE, so you can "
-            "`npm install`, `pip install`, `git clone` and download assets or 3D "
-            "models. Use it to install dependencies, build, and RUN TESTS — always "
-            "run the tests you write. Long builds: pass a larger `timeout`."
-        ),
+        description=_exec_description(),
         input_schema={"type": "object", "properties": {
-            "command": {"type": "string", "description": "Shell command, run with bash -lc."},
+            "command": {"type": "string", "description": _exec_command_hint()},
             "timeout": {"type": "integer", "description": "Seconds to allow (default 180)."},
         }, "required": ["command"]},
         execute=_exec, **common,
+    ))
+
+    reg.register(Tool(
+        name="workspace_check",
+        description=(
+            "Run the project's OWN verification, detected from its manifests: "
+            "dependency install (when node_modules is missing), typecheck, lint, "
+            "tests, then build. Fail-fast, with each command's exit code and the "
+            "tail of its output. This is the definition of 'the code works': a "
+            "coding task is not finished until this passes after your last change. "
+            "Declare the checks in the manifest (a `test` script, a `typecheck` "
+            "script) so there is something to run. Scaffolded into a subfolder? "
+            "It is found automatically, or pass `path`."
+        ),
+        input_schema={"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "Project directory; omit to auto-detect."},
+        }},
+        execute=_check, **common,
     ))
 
     reg.register(Tool(

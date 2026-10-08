@@ -132,9 +132,13 @@ def listing(project_id: str) -> list[dict]:
     """Every visual in a project, newest first, without their HTML bodies."""
     out: list[dict] = []
     for key in storage.list_prefix(f"{PREFIX}/{_safe(project_id)}", suffix=".json"):
+        if key.endswith(".src.json"):
+            continue
         try:
             rec = json.loads(storage.get_bytes(key).decode("utf-8"))
         except (ValueError, OSError):
+            continue
+        if not isinstance(rec, dict) or not rec.get("visual_id"):
             continue
         out.append({
             "visual_id": rec.get("visual_id"),

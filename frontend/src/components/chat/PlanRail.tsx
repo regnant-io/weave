@@ -26,6 +26,7 @@ const LABELS = {
     complete: "all steps complete",
     checks: "Checks",
     working: "working",
+    incomplete: "incomplete",
   },
   sw: {
     plan: "Mpango",
@@ -33,6 +34,7 @@ const LABELS = {
     complete: "hatua zote zimekamilika",
     checks: "Ukaguzi",
     working: "inaendelea",
+    incomplete: "haijakamilika",
   },
 } as const;
 
@@ -68,7 +70,10 @@ export default function PlanRail({
   const done = steps.filter(
     (s) => s.status === "done" || s.status === "skipped",
   ).length;
-  const finished = steps.length > 0 && done === steps.length;
+  const taskStatus = plan._task_state?.status;
+  const incomplete = Boolean(taskStatus && taskStatus !== "running" && taskStatus !== "finished");
+  const finished = steps.length > 0 && done === steps.length &&
+    (!taskStatus || taskStatus === "finished");
 
   // Open while the work is live; settle closed once it is over. `userSet`
   // stops that automatic collapse from yanking the panel shut under a reader
@@ -111,7 +116,7 @@ export default function PlanRail({
 
         {/* The denominator. This is the whole point of the component. */}
         <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-fg-muted">
-          {finished ? t.complete : t.of(done, steps.length)}
+          {incomplete ? `${t.incomplete} · ${t.of(done, steps.length)}` : finished ? t.complete : t.of(done, steps.length)}
         </span>
       </button>
 
@@ -123,6 +128,12 @@ export default function PlanRail({
           style={{ width: `${pct}%` }}
         />
       </div>
+
+      {incomplete && Boolean(plan._task_state?.outstanding?.length) && (
+        <p className="px-3 py-2 text-xs text-danger" role="status">
+          {plan._task_state?.outstanding?.slice(0, 3).join("; ")}
+        </p>
+      )}
 
       {!open && !finished && activeTitle && (
         <p className="truncate px-3 py-1.5 text-xs text-fg-muted">{activeTitle}</p>
@@ -150,7 +161,7 @@ export default function PlanRail({
                 >
                   {s.title}
                   {s.note && (
-                    <span className="ml-1.5 text-fg-faint">— {s.note}</span>
+                    <span className="ml-1.5 text-fg-faint">· {s.note}</span>
                   )}
                 </span>
               </li>

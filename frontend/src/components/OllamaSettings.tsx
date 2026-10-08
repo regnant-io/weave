@@ -17,10 +17,12 @@ export default function OllamaSettings({ language }: { language: Language }) {
   const [model, setModel] = useState("");
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (forceProbe = false) => {
+    setRefreshing(forceProbe);
     setError(null);
     let cfg: { ollama_host?: unknown; ollama_model?: unknown } = {};
     try {
@@ -29,14 +31,15 @@ export default function OllamaSettings({ language }: { language: Language }) {
     } catch {
       setError(sw ? "Imeshindwa kupakia mipangilio." : "Could not load the current configuration.");
     }
-    const cat = await fetchCatalog();
+    const cat = await fetchCatalog(undefined, forceProbe);
     setHost(typeof cfg.ollama_host === "string" ? cfg.ollama_host : "");
     setModel(typeof cfg.ollama_model === "string" ? cfg.ollama_model : cat.currentModel);
     setCatalog(cat);
+    setRefreshing(false);
   }, [sw]);
 
   useEffect(() => {
-    void refresh();
+    void refresh(true);
   }, [refresh]);
 
   async function save() {
@@ -50,7 +53,7 @@ export default function OllamaSettings({ language }: { language: Language }) {
         body: JSON.stringify({ host, model }),
       });
       if (!res.ok) throw new Error(String(res.status));
-      await refresh();
+      await refresh(true);
       setSaved(true);
       setTimeout(() => setSaved(false), 2200);
     } catch {
@@ -62,30 +65,39 @@ export default function OllamaSettings({ language }: { language: Language }) {
 
   const models = catalog?.models ?? [];
   const selected = models.find((m) => m.name === model);
-  const reachable = models.length > 0;
+  const reachable = catalog?.ollamaReachable ?? models.length > 0;
+  const active = catalog?.engine === "ollama";
 
   return (
-    <section className="border border-border bg-surface p-4 sm:p-5">
+    <section className="platform-panel p-4 sm:p-5">
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <h2 className="text-sm font-semibold">{sw ? "Modeli ya AI (Ollama)" : "AI model (Ollama)"}</h2>
         <span
           className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ${
-            reachable ? "bg-ok-soft text-ok" : "bg-warn-soft text-warn"
+            active ? "bg-ok-soft text-ok" : reachable ? "bg-accent-soft text-accent" : "bg-warn-soft text-warn"
           }`}
         >
-          <span className={`h-1.5 w-1.5 rounded-full ${reachable ? "bg-ok" : "bg-warn"}`} />
-          {reachable
-            ? `${models.length} ${sw ? "modeli" : "models"}`
-            : sw
-              ? "Haipatikani"
-              : "Unreachable"}
+          <span className={`h-1.5 w-1.5 rounded-full ${active ? "bg-ok" : reachable ? "bg-accent" : "bg-warn"}`} />
+          {active ? sw ? "Inatumika" : "Active" : reachable ? sw ? "Imeunganishwa" : "Connected" : sw ? "Haipatikani" : "Offline"}
         </span>
       </div>
       <p className="mb-4 text-xs text-fg-faint">
         {sw
-          ? "Weka anwani ya seva ya Ollama na modeli chaguo-msingi. Muktadha hupatikana kutoka kwa modeli yenyewe."
-          : "Set the Ollama server URL and default model. The context window is read from the model itself."}
+          ? "Unganisha seva ya Ollama na uchague modeli ya mazungumzo."
+          : "Connect an Ollama server and choose a model for conversations."}
       </p>
+      {!reachable && (
+        <p className="mb-3 rounded-md border border-warn/20 bg-warn-soft px-3 py-2 text-xs leading-5 text-warn" role="status">
+          {sw
+            ? "Weave itatumia majibu ya msingi hadi seva na modeli zipatikane."
+            : "Weave will use its local fallback until the server and a model are available."}
+        </p>
+      )}
+      {reachable && !models.length && (
+        <p className="mb-3 rounded-md border border-accent-line bg-accent-soft px-3 py-2 text-xs leading-5 text-accent-strong" role="status">
+          {sw ? "Seva inajibu, lakini hakuna modeli iliyosakinishwa." : "The server responds, but no models are installed."}
+        </p>
+      )}
 
       <div className="space-y-3">
         <label className="block">
@@ -117,7 +129,13 @@ export default function OllamaSettings({ language }: { language: Language }) {
               )}
               {models.map((m) => (
                 <option key={m.name} value={m.name}>
-                  {m.context ? `${m.name} — ${formatTokens(m.context)}` : m.name}
+                  {`${m.name}${m.context ? ` · ${formatTokens(m.context)}` : ""}${
+                    m.supportsTools === true
+                      ? sw ? " · zana" : " · tools"
+                      : m.supportsTools === false
+                        ? sw ? " · gumzo pekee" : " · chat only"
+                        : " · ?"
+                  }`}
                 </option>
               ))}
             </select>
@@ -134,6 +152,21 @@ export default function OllamaSettings({ language }: { language: Language }) {
           )}
         </label>
 
+        {selected?.supportsTools === false && (
+          <p className="rounded-md border border-warn/20 bg-warn-soft px-3 py-2 text-xs leading-5 text-warn" role="status">
+            {sw
+              ? "Modeli hii haitoi uwezo wa kutumia zana. Uchambuzi wa data na utafutaji unaweza kukosa kufanya kazi."
+              : "This model does not advertise tool support. Data analysis and retrieval may not work."}
+          </p>
+        )}
+        {catalog?.modelSubstituted && (
+          <p className="rounded-md border border-accent-line bg-accent-soft px-3 py-2 text-xs leading-5 text-accent-strong" role="status">
+            {sw
+              ? `Modeli ${catalog.configuredModel} haipo. Weave inatumia ${catalog.currentModel}.`
+              : `The configured model ${catalog.configuredModel} is unavailable. Weave selected ${catalog.currentModel}.`}
+          </p>
+        )}
+
         {selected?.context ? (
           <p className="text-xs text-fg-faint">
             {sw ? "Dirisha la muktadha" : "Context window"}:{" "}
@@ -142,28 +175,29 @@ export default function OllamaSettings({ language }: { language: Language }) {
               <>
                 {" "}
                 <span className="text-warn">
-                  ({sw ? "imepunguzwa kutoka" : "capped from"} {formatTokens(selected.trainedContext)})
+                  ({sw ? "limepunguzwa kutoka" : "reduced from"} {formatTokens(selected.trainedContext)})
                 </span>
               </>
             ) : null}
           </p>
         ) : null}
 
-        {error && <p className="text-xs text-danger">{error}</p>}
+        {error && <p className="text-xs text-danger" role="alert">{error}</p>}
 
         <div className="flex flex-wrap items-center gap-3 pt-1">
           <button
             onClick={save}
             disabled={saving}
-            className="rounded-full bg-accent px-4 py-2 text-sm font-medium text-accent-fg transition-opacity duration-fast hover:opacity-90 disabled:opacity-60"
+            className="platform-control platform-control-primary disabled:opacity-60"
           >
             {saving ? (sw ? "Inahifadhi…" : "Saving…") : sw ? "Hifadhi" : "Save"}
           </button>
           <button
-            onClick={() => void refresh()}
-            className="rounded-full border border-border px-3 py-2 text-sm text-fg-muted transition-colors duration-fast hover:border-border-mid hover:text-fg"
+            onClick={() => void refresh(true)}
+            disabled={refreshing}
+            className="platform-control disabled:cursor-wait disabled:opacity-60"
           >
-            {sw ? "Onyesha upya" : "Refresh"}
+            {refreshing ? sw ? "Inakagua…" : "Checking…" : sw ? "Jaribu muunganisho" : "Test connection"}
           </button>
           {saved && <span className="text-xs text-ok">{sw ? "Imehifadhiwa ✓" : "Saved ✓"}</span>}
         </div>

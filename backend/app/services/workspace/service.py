@@ -50,7 +50,9 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
+import socket
 import subprocess
 import tarfile
 import time
@@ -84,11 +86,17 @@ class WorkspaceService:
         self.root = Path(settings.workspace_root)
         self.image = settings.workspace_image
         self._docker: bool | None = None
+        self._docker_checked_at = 0.0
         self._net: str | None = None
         #: container name -> monotonic timestamp of its last command. Drives
         #: idle reaping; empty after a restart, which reap_idle handles by
         #: giving an unknown container one grace period.
         self._last_used: dict[str, float] = {}
+        self._native_servers: dict[str, subprocess.Popen] = {}
+
+    @property
+    def _native(self) -> bool:
+        return settings.environment == "desktop"
 
     # ------------------------------------------------------------ availability
 
@@ -99,8 +107,14 @@ class WorkspaceService:
         confidently 'installing' packages that never install."""
         if not settings.workspace_enabled:
             return False
-        if self._docker is None:
+        if self._native:
+            return True
+        # A missing or restarted daemon is a temporary state. An indefinite
+        # negative cache hid tools until the user visited Settings to refresh.
+        lifetime = 30 if self._docker else 5
+        if self._docker is None or time.monotonic() - self._docker_checked_at >= lifetime:
             self._docker = self._probe_docker()
+            self._docker_checked_at = time.monotonic()
         return self._docker
 
     def _probe_docker(self) -> bool:
@@ -121,6 +135,14 @@ class WorkspaceService:
         """Re-probe. Used by the settings page after Docker is started."""
         self._docker = None
         return self.enabled
+
+    def shutdown(self) -> None:
+        """Reap desktop dev-server process groups before the backend exits."""
+        for project_id in list(self._native_servers):
+            try:
+                self.stop_server(project_id)
+            except (OSError, subprocess.SubprocessError):
+                log.exception("could not stop desktop workspace server %s", project_id)
 
     # ------------------------------------------------------------------- paths
 
@@ -497,9 +519,10 @@ class WorkspaceService:
                 return {"status": "ok", "valid": False, "checker": "json",
                         "error": f"line {exc.lineno}, col {exc.colno}: {exc.msg}"}
 
-        if suffix in {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"} and self.enabled:
-            # `node --check` only understands scripts; everything else goes
-            # through a parse attempt that reports the real syntax error.
+        if suffix in {".js", ".mjs", ".cjs"} and self.enabled:
+            # Node cannot parse TypeScript or JSX without a build tool. Do not
+            # report every valid TSX file as broken because `node --check` saw
+            # type annotations or JSX tags.
             rel = self._rel(project_id, target)
             res = self.exec(project_id, f"node --check {_sh_quote(rel)}", timeout=45)
             if res.status == "ok" and res.exit_code == 0:
@@ -767,6 +790,8 @@ class WorkspaceService:
         return out
 
     def stop_container(self, project_id: str) -> dict:
+        if self._native:
+            return self.stop_server(project_id)
         name = self.container_name(project_id)
         subprocess.run(["docker", "rm", "-f", name], capture_output=True,
                        text=True, timeout=60, check=False)
@@ -779,6 +804,14 @@ class WorkspaceService:
         for a week is a server nobody is watching. Driven off Docker's own
         labels rather than in-process state so it still works after a restart.
         """
+        if self._native:
+            removed = 0
+            for name, last in list(self._last_used.items()):
+                if time.monotonic() - last >= older_than_seconds:
+                    self.stop_server(name)
+                    self._last_used.pop(name, None)
+                    removed += 1
+            return removed
         removed = 0
         try:
             r = subprocess.run(
@@ -815,14 +848,19 @@ class WorkspaceService:
         timeout = int(timeout or settings.workspace_exec_timeout)
         timeout = max(5, min(timeout, settings.workspace_exec_max_timeout))
 
+        if self._native:
+            return self._native_exec(project_id, command, timeout, cancel)
+
         up = self.ensure_container(project_id)
         if up.status != "ok":
             return up
         name = self.container_name(project_id)
         self._last_used[name] = time.monotonic()
 
+        env_flags = [flag for key, value in _NON_INTERACTIVE_ENV.items()
+                     if key not in _HOST_ONLY_ENV for flag in ("-e", f"{key}={value}")]
         args = ["docker", "exec", "-i", "--user", settings.workspace_user,
-                "--workdir", "/workspace", name, "bash", "-lc", command]
+                "--workdir", "/workspace", *env_flags, name, "bash", "-lc", command]
 
         started = time.monotonic()
         try:
@@ -831,7 +869,8 @@ class WorkspaceService:
             # before, which meant closing the tab left an npm install running to
             # completion against a turn nobody was waiting for.
             proc = subprocess.Popen(
-                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                args, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
             )
         except FileNotFoundError:
@@ -872,6 +911,86 @@ class WorkspaceService:
             duration_ms=int((time.monotonic() - started) * 1000),
         )
 
+    def _native_args(self, command: str) -> list[str]:
+        if os.name == "nt":
+            pwsh = shutil.which("pwsh")
+            if pwsh:
+                # PowerShell 7 understands `&&` and `||` natively.
+                return [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                        _powershell_script(command)]
+            return ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-Command", _powershell_script(_ps51_chain(command))]
+        # A login shell may replace PATH and hide the bundled node/npm/python
+        # shims. Keep the environment supplied by the desktop launcher.
+        return ["/bin/sh", "-c", command]
+
+    @staticmethod
+    def _native_env() -> dict[str, str]:
+        """The process environment for a desktop workspace command.
+
+        Commands run with no terminal attached, so anything that stops to ask
+        a question ("Ok to proceed? (y)", a scaffolder's template picker) would
+        otherwise wait out the whole timeout. These variables are the
+        documented non-interactive switches for the tools models actually use.
+        """
+        return {**os.environ, **_NON_INTERACTIVE_ENV}
+
+    @staticmethod
+    def _stop_native_process(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10, check=False)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def _native_exec(self, project_id: str, command: str, timeout: int,
+                     cancel=None) -> ExecResult:
+        """Run desktop workspace commands in its own directory, without Docker."""
+        started = time.monotonic()
+        self._last_used[str(project_id)] = started
+        try:
+            proc = subprocess.Popen(
+                self._native_args(command), cwd=self.project_dir(project_id),
+                stdin=subprocess.DEVNULL, env=self._native_env(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                start_new_session=os.name != "nt",
+            )
+        except OSError as exc:
+            return ExecResult(status="unavailable", stderr=str(exc))
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if cancel is not None and cancel.is_set():
+                self._stop_native_process(proc)
+                proc.communicate()
+                return ExecResult(status="error", exit_code=130,
+                                  stderr="cancelled by the user",
+                                  duration_ms=int((time.monotonic() - started) * 1000))
+            if time.monotonic() - started > timeout:
+                self._stop_native_process(proc)
+                stdout, stderr = proc.communicate()
+                return ExecResult(status="timeout", exit_code=124,
+                                  stdout=_tail(stdout or "", settings.workspace_output_chars),
+                                  stderr=_tail(stderr or "", 2000) + f"\ncommand exceeded {timeout}s",
+                                  duration_ms=int((time.monotonic() - started) * 1000))
+        return ExecResult(
+            status="ok" if proc.returncode == 0 else "error",
+            exit_code=proc.returncode or 0,
+            stdout=_tail(stdout or "", settings.workspace_output_chars),
+            stderr=_tail(stderr or "", settings.workspace_output_chars),
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
     # ------------------------------------------------------------- dev servers
 
     #: Where a started server's bookkeeping lives inside the workspace. On disk
@@ -900,6 +1019,8 @@ class WorkspaceService:
         if not self.enabled:
             return {"status": "unavailable",
                     "message": "workspace execution is not configured"}
+        if self._native:
+            return self._native_serve(project_id, command, port, wait_seconds)
         if port not in self.DEV_PORTS:
             return {"status": "error",
                     "error": f"port {port} is not published; use one of "
@@ -969,6 +1090,11 @@ class WorkspaceService:
         """Stop whatever this project last started. Safe to call when nothing is."""
         if not self.enabled:
             return {"status": "unavailable"}
+        if self._native:
+            proc = self._native_servers.pop(str(project_id), None)
+            if proc is not None:
+                self._stop_native_process(proc)
+            return {"status": "ok", "stopped": proc is not None}
         if self._container_state(self.container_name(project_id)) != "running":
             return {"status": "ok", "stopped": False}
         self.exec(
@@ -985,6 +1111,21 @@ class WorkspaceService:
         """What is running, if anything — for the preview panel."""
         if not self.enabled:
             return {"status": "unavailable", "running": False}
+        if self._native:
+            state = self.read_file(project_id, self.SERVER_STATE)
+            if state.get("status") != "ok":
+                return {"status": "ok", "running": False}
+            try:
+                saved = json.loads(state.get("content") or "{}")
+                port = int(saved.get("port") or 0)
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    pass
+            except (OSError, ValueError):
+                return {"status": "ok", "running": False}
+            return {"status": "ok", "running": True, "port": port,
+                    "url": f"http://127.0.0.1:{port}",
+                    "internal_url": f"http://127.0.0.1:{port}",
+                    "command": saved.get("command", "")}
         if self._container_state(self.container_name(project_id)) != "running":
             return {"status": "ok", "running": False}
         state = self.read_file(project_id, self.SERVER_STATE)
@@ -1016,9 +1157,62 @@ class WorkspaceService:
     def server_log(self, project_id: str, lines: int = 200) -> dict:
         if not self.enabled:
             return {"status": "unavailable"}
+        if self._native:
+            target = self.project_dir(project_id) / ".weave" / "server.log"
+            if not target.exists():
+                return {"status": "ok", "log": ""}
+            return {"status": "ok", "log": _tail(target.read_text(
+                encoding="utf-8", errors="replace"), 12000)}
         out = self.exec(project_id, f"tail -n {max(1, min(lines, 2000))} "
                                     ".weave/server.log 2>/dev/null || true", timeout=25)
         return {"status": "ok", "log": _tail(out.stdout or "", 12000)}
+
+    def _native_serve(self, project_id: str, command: str, port: int,
+                      wait_seconds: int) -> dict:
+        if port not in self.DEV_PORTS:
+            return {"status": "error", "error": f"use one of these ports: {self.DEV_PORTS}"}
+        self.stop_server(project_id)
+        # A server from another project (or another application) must not count
+        # as this command starting successfully just because the port answers.
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return {"status": "error", "error": f"port {port} is already in use; choose another preview port"}
+        except OSError:
+            pass
+        root = self.project_dir(project_id)
+        state_dir = root / ".weave"
+        state_dir.mkdir(exist_ok=True)
+        log_path = state_dir / "server.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as output:
+                proc = subprocess.Popen(
+                    self._native_args(command), cwd=root,
+                    stdin=subprocess.DEVNULL, env=self._native_env(),
+                    stdout=output, stderr=subprocess.STDOUT,
+                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                    start_new_session=os.name != "nt",
+                )
+        except OSError as exc:
+            return {"status": "error", "error": str(exc)}
+        self._native_servers[str(project_id)] = proc
+        self._last_used[str(project_id)] = time.monotonic()
+        self.write_file(project_id, self.SERVER_STATE,
+                        json.dumps({"command": command, "port": port, "pid": proc.pid}))
+        deadline = time.monotonic() + max(1, wait_seconds)
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return {"status": "ok", "port": port,
+                            "url": f"http://127.0.0.1:{port}",
+                            "internal_url": f"http://127.0.0.1:{port}",
+                            "log": self.server_log(project_id).get("log", "")[-2000:]}
+            except OSError:
+                time.sleep(0.3)
+        self.stop_server(project_id)
+        return {"status": "error", "error": f"server did not listen on port {port}",
+                "log": self.server_log(project_id).get("log", "")[-3000:]}
 
     # ---------------------------------------------------------------- packaging
 
@@ -1069,6 +1263,39 @@ class WorkspaceService:
             }],
         }
 
+    def run_checks(self, project_id: str, path: str = "", cancel=None) -> dict:
+        """Detect and run the project's own checks. See workspace/checks.py."""
+        from . import checks as project_checks
+
+        if not self.enabled:
+            return {"status": "unavailable",
+                    "error": "workspace execution is not available on this server"}
+        workspace = self.project_dir(project_id)
+        try:
+            base = self._resolve(project_id, path) if path else workspace
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
+        if not base.is_dir():
+            return {"status": "error", "error": f"no such directory: {path}"}
+        root = project_checks.find_project_root(workspace, self._rel(project_id, base)
+                                                if base != workspace else "")
+        if self._native:
+            def has_tool(name: str) -> bool:
+                return shutil.which(name) is not None
+        else:
+            def has_tool(name: str) -> bool:
+                return name in {"node", "npm", "npx", "python"}
+        found, note = project_checks.detect(root, has_tool=has_tool)
+        rel_root = self._rel(project_id, root) if root != workspace else ""
+        report = project_checks.run(
+            root, found,
+            lambda command, timeout: self.exec(project_id, command, timeout=timeout,
+                                               cancel=cancel),
+            rel_root,
+        )
+        report.note = note
+        return report.as_result()
+
     def stats(self, project_id: str) -> dict:
         base = self.project_dir(project_id)
         files = 0
@@ -1115,6 +1342,128 @@ def _sh_quote(s: str) -> str:
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
+#: Documented non-interactive switches for the tools models actually run.
+#: There is no terminal to answer a prompt, so a prompt is a hang.
+_NON_INTERACTIVE_ENV = {
+    "CI": "1",
+    "npm_config_yes": "true",
+    "npm_config_fund": "false",
+    "npm_config_audit": "false",
+    "npm_config_update_notifier": "false",
+    "NO_COLOR": "1",
+    "FORCE_COLOR": "0",
+    "BROWSER": "none",
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONUTF8": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_INPUT": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+#: Meaningful only to the Windows host process, never to a Linux container.
+_HOST_ONLY_ENV = {"PYTHONUTF8"}
+
+#: Run before every desktop PowerShell command: UTF-8 in both directions (the
+#: default OEM code page garbles any non-ASCII output) and no progress bars,
+#: which PowerShell otherwise renders into captured stderr as CLIXML noise.
+_PS_PRELUDE = (
+    "$ProgressPreference='SilentlyContinue';"
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+    "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+)
+#: PowerShell reports only "the last pipeline failed" as exit code 1; carry
+#: the native program's own code through so `npm test` failing reads as that.
+_PS_EPILOGUE = "\nif (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }"
+
+
+def _powershell_script(command: str) -> str:
+    return _PS_PRELUDE + "\n" + command + _PS_EPILOGUE
+
+
+def _split_top_level(command: str) -> list[str]:
+    """Split on `&&` / `||` outside quotes, braces and parentheses.
+
+    Returns alternating [segment, op, segment, op, segment...].
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    depth = 0
+    i = 0
+    while i < len(command):
+        c = command[i]
+        if quote:
+            buf.append(c)
+            if c == quote:
+                quote = ""
+            elif c == "`" and i + 1 < len(command):
+                buf.append(command[i + 1])
+                i += 1
+            i += 1
+            continue
+        if c in {"'", '"'}:
+            quote = c
+        elif c in "({":
+            depth += 1
+        elif c in ")}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and command[i:i + 2] in {"&&", "||"}:
+            parts.append("".join(buf).strip())
+            parts.append(command[i:i + 2])
+            buf = []
+            i += 2
+            continue
+        buf.append(c)
+        i += 1
+    parts.append("".join(buf).strip())
+    return parts
+
+
+def _ps51_chain(command: str) -> str:
+    """Translate `a && b || c` into Windows PowerShell 5.1 syntax.
+
+    5.1 rejects `&&` and `||` as parse errors ("The token '&&' is not a valid
+    statement separator"), and it is the PowerShell every Windows machine has.
+    `npm install && npm test` is the single most common command a model
+    writes, so failing it on syntax meant the first command of almost every
+    coding turn failed. `$?` is false after a native program exits non-zero,
+    so `if ($?)` carries the same meaning. Chains nest to the right, which
+    matches bash for every chain made of one operator.
+    """
+    parts = _split_top_level(command)
+    if len(parts) < 3 or any(not p for p in parts[::2]):
+        return command
+
+    def build(index: int) -> str:
+        segment = parts[index]
+        if index + 1 >= len(parts):
+            return segment
+        test = "$?" if parts[index + 1] == "&&" else "-not $?"
+        return f"{segment}; if ({test}) {{ {build(index + 2)} }}"
+
+    return build(0)
+
+
+_PROSE_SUFFIXES = {".md", ".markdown", ".txt", ".rst", ".csv", ".tsv", ".log",
+                   ".yml", ".yaml", ".toml", ".ini", ".cfg", ".env", ".gitignore",
+                   ".dockerignore", ".svg", ".xml"}
+
+
+def _closing_quote(text: str, start: int, quote: str) -> int:
+    """Index of the quote closing the one at `start` on the same line, or -1."""
+    i = start + 1
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "\n":
+            return -1
+        if c == quote:
+            return i
+        i += 1
+    return -1
+
+
 def _structural_check(text: str, suffix: str) -> dict:
     """Cheap balance check for languages we cannot really parse here.
 
@@ -1124,6 +1473,10 @@ def _structural_check(text: str, suffix: str) -> dict:
     """
     if not text.strip():
         return {"valid": False, "error": "file is empty"}
+    # Prose and data formats have no bracket grammar to balance. An apostrophe
+    # in a README is not an unterminated string.
+    if suffix in _PROSE_SUFFIXES:
+        return {"valid": True, "note": "prose file; only checked for emptiness"}
 
     pairs = {"{": "}", "[": "]", "(": ")"}
     closers = {v: k for k, v in pairs.items()}
@@ -1145,8 +1498,17 @@ def _structural_check(text: str, suffix: str) -> dict:
                 in_str = None
             i += 1
             continue
-        if c in {'"', "'", "`"}:
+        if c == "`":
             in_str = c
+        elif c in {'"', "'"}:
+            # Single- and double-quoted strings cannot span lines in any
+            # language checked here. A quote with no partner before the end of
+            # the line is an apostrophe in JSX/HTML text ("Don't"), not the
+            # start of a string that swallows the rest of the file.
+            end = _closing_quote(text, i, c)
+            if end != -1:
+                i = end + 1
+                continue
         elif c == "/" and i + 1 < len(text) and text[i + 1] == "/":
             nl = text.find("\n", i)
             if nl == -1:

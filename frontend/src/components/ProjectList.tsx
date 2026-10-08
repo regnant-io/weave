@@ -32,6 +32,8 @@ export default function ProjectList({
   const [confirmOne, setConfirmOne] = useState<Project | null>(null);
   const [confirmAll, setConfirmAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreProjects, setMoreProjects] = useState(initial.length >= 100);
 
   const refresh = useCallback(() => router.refresh(), [router]);
 
@@ -83,12 +85,35 @@ export default function ProjectList({
     }
   }
 
+  async function loadMore() {
+    const cursor = projects.at(-1)?.id;
+    if (!cursor || loadingMore || !moreProjects) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ limit: "100", before: cursor });
+      const res = await fetch(`/api/projects?${params.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error();
+      const next: Project[] = await res.json();
+      setProjects((current) => [...current, ...next.filter((p) => !current.some((item) => item.id === p.id))]);
+      setMoreProjects(next.length >= 100);
+    } catch {
+      setError(sw ? "Imeshindwa kupakia miradi zaidi." : "Could not load more projects.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
   if (!projects.length) {
     return (
-      <div className="border border-dashed border-border-strong p-10 text-center text-fg-muted">
-        {sw
-          ? "Huna miradi bado. Anzisha mradi mpya kuanza."
-          : "No projects yet. Create one to get started."}
+      <div className="platform-panel flex min-h-52 flex-col items-center justify-center px-6 py-10 text-center">
+        <div className="grid h-10 w-10 place-items-center rounded-lg border border-border bg-surface-2 text-accent">
+          <span className="font-mono text-sm">W</span>
+        </div>
+        <h3 className="mt-4 text-sm font-semibold text-fg">{sw ? "Hakuna miradi bado" : "No projects yet"}</h3>
+        <p className="mt-1 max-w-sm text-xs leading-5 text-fg-muted">
+          {sw ? "Unda mradi ili kuweka pamoja mazungumzo na data." : "Create a project to keep its chats and datasets together."}
+        </p>
       </div>
     );
   }
@@ -99,11 +124,11 @@ export default function ProjectList({
         <p className="mb-3 border-l-2 border-danger pl-3 text-[13px] text-danger">{error}</p>
       )}
 
-      <ul className="grid gap-3 sm:grid-cols-2">
+      <ul className="platform-panel divide-y divide-border overflow-visible">
         {projects.map((p) => (
           <li key={p.id} className="relative">
             {renaming === p.id ? (
-              <div className="border border-accent-line bg-surface p-4">
+              <div className="bg-accent-soft p-4">
                 <input
                   autoFocus
                   value={draft}
@@ -135,24 +160,34 @@ export default function ProjectList({
               <div className="group relative">
                 <Link
                   href={`/app/chat/${p.id}`}
-                  className="block border border-border bg-surface p-4 pr-11 transition-all duration-fast ease-soft hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft"
+                  className="flex min-h-[76px] items-center gap-3 px-3 py-3 pr-14 transition-colors duration-fast hover:bg-surface-2 sm:gap-4 sm:px-4"
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <h2 className="min-w-0 truncate font-semibold">{p.title}</h2>
-                    <span
-                      className={`flex-shrink-0 rounded-full px-2 py-0.5 text-[11px] ${
-                        p.mode === "researcher"
-                          ? "bg-warn/15 text-warn"
-                          : "bg-accent-soft text-accent"
-                      }`}
-                    >
-                      {t(p.mode, language)}
-                    </span>
+                  <span className="grid h-9 w-9 flex-shrink-0 place-items-center rounded-md border border-border bg-surface-2 font-mono text-xs font-semibold text-accent">
+                    {p.title.trim().slice(0, 1).toUpperCase() || "W"}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                      <h2 className="min-w-0 truncate text-[13px] font-semibold text-fg">{p.title}</h2>
+                      <span
+                        className={`flex-shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide ${
+                          p.mode === "researcher"
+                            ? "border-warn/20 bg-warn-soft text-warn"
+                            : "border-accent-line bg-accent-soft text-accent-strong"
+                        }`}
+                      >
+                        {t(p.mode, language)}
+                      </span>
+                    </div>
+                    {p.summary ? (
+                      <p className="mt-1 truncate text-[11px] text-fg-muted">{p.summary}</p>
+                    ) : (
+                      <p className="mt-1 text-[11px] text-fg-faint">{sw ? "Mradi wa utafiti" : "Research workspace"}</p>
+                    )}
                   </div>
-                  {p.summary && (
-                    <p className="mt-2 line-clamp-2 text-sm text-fg-muted">{p.summary}</p>
-                  )}
-                  <div className="mt-3 text-xs text-accent">{t("chat", language)} →</div>
+                  <span className="hidden flex-shrink-0 font-mono text-[10px] text-fg-faint sm:block">
+                    {new Date(p.created_at).toLocaleDateString(sw ? "sw-TZ" : "en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+                  </span>
+                  <span aria-hidden="true" className="hidden text-fg-faint transition-transform group-hover:translate-x-0.5 group-hover:text-accent sm:block">↗</span>
                 </Link>
 
                 <button
@@ -162,7 +197,7 @@ export default function ProjectList({
                   }}
                   aria-label={sw ? "Chaguo za mradi" : "Project options"}
                   aria-expanded={menuFor === p.id}
-                  className="absolute right-2 top-3 grid h-8 w-8 place-items-center rounded-full text-fg-faint transition-colors duration-fast hover:bg-surface-hover hover:text-fg"
+                  className="absolute right-2 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-md text-fg-faint transition-colors duration-fast hover:bg-surface-hover hover:text-fg"
                 >
                   <IcoMore size={16} />
                 </button>
@@ -170,7 +205,7 @@ export default function ProjectList({
                 {menuFor === p.id && (
                   <>
                     <div className="fixed inset-0 z-40" onClick={() => setMenuFor(null)} />
-                    <div className="animate-rise absolute right-2 top-11 z-50 w-44 overflow-hidden rounded-sm border border-border bg-surface shadow-lg">
+                    <div className="animate-rise absolute right-2 top-11 z-50 w-44 overflow-hidden rounded-md border border-border bg-surface shadow-lg">
                       <button
                         onClick={() => {
                           setDraft(p.title);
@@ -200,6 +235,16 @@ export default function ProjectList({
           </li>
         ))}
       </ul>
+
+      {moreProjects && (
+        <div className="flex justify-center border-x border-b border-border bg-surface px-3 py-3">
+          <button type="button" onClick={() => void loadMore()} disabled={loadingMore} className="platform-control text-xs disabled:opacity-60">
+            {loadingMore
+              ? sw ? "Inapakia…" : "Loading…"
+              : sw ? "Pakia miradi zaidi" : "Load more projects"}
+          </button>
+        </div>
+      )}
 
       <div className="mt-6 flex justify-end border-t border-border pt-4">
         <button
@@ -232,7 +277,7 @@ export default function ProjectList({
         body={
           sw
             ? `Miradi yako ${projects.length} yote, pamoja na gumzo, data, kumbukumbu na faili zote, itafutwa kabisa. Hakuna njia ya kurudisha.`
-            : `All ${projects.length} of your projects — every chat, dataset, memory entry and generated file — will be permanently deleted. There is no way back.`
+            : `All ${projects.length} of your projects, including every chat, dataset, memory entry and generated file, will be permanently deleted. There is no way back.`
         }
         confirmLabel={sw ? "Futa yote" : "Delete everything"}
         requirePhrase="DELETE"

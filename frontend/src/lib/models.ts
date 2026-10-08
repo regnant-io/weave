@@ -15,6 +15,8 @@ export interface ModelInfo {
   context?: number;
   /** What the model itself advertises (may exceed `context` if a ceiling is set). */
   trainedContext?: number;
+  capabilities: string[];
+  supportsTools: boolean | null;
 }
 
 export interface ModelCatalog {
@@ -25,6 +27,10 @@ export interface ModelCatalog {
   fallbackContext: number;
   /** Opt-in ceiling; 0 means every model gets its full window. */
   ceiling: number;
+  ollamaReachable: boolean;
+  ollamaHost: string;
+  configuredModel: string;
+  modelSubstituted: boolean;
 }
 
 const toInt = (v: unknown): number | undefined => {
@@ -34,7 +40,9 @@ const toInt = (v: unknown): number | undefined => {
 
 /** Normalise one entry from either wire shape. Returns null for unusable input. */
 export function parseModel(raw: unknown): ModelInfo | null {
-  if (typeof raw === "string") return raw.trim() ? { name: raw.trim() } : null;
+  if (typeof raw === "string") {
+    return raw.trim() ? { name: raw.trim(), capabilities: [], supportsTools: null } : null;
+  }
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
   const name = typeof o.name === "string" ? o.name.trim() : "";
@@ -43,6 +51,10 @@ export function parseModel(raw: unknown): ModelInfo | null {
     name,
     context: toInt(o.context),
     trainedContext: toInt(o.trained_context),
+    capabilities: Array.isArray(o.capabilities)
+      ? o.capabilities.filter((value): value is string => typeof value === "string")
+      : [],
+    supportsTools: typeof o.supports_tools === "boolean" ? o.supports_tools : null,
   };
 }
 
@@ -57,13 +69,17 @@ export function parseCatalog(raw: unknown): ModelCatalog {
     engine: typeof o.engine === "string" ? o.engine : "offline",
     fallbackContext: toInt(o.num_ctx_fallback) ?? 8192,
     ceiling: toInt(o.num_ctx_ceiling) ?? 0,
+    ollamaReachable: o.ollama_reachable === true,
+    ollamaHost: typeof o.ollama_host === "string" ? o.ollama_host : "",
+    configuredModel: typeof o.configured_model === "string" ? o.configured_model : "",
+    modelSubstituted: o.model_substituted === true,
   };
 }
 
 /** Fetch + normalise. Never throws — an unreachable Ollama yields an empty catalog. */
-export async function fetchCatalog(signal?: AbortSignal): Promise<ModelCatalog> {
+export async function fetchCatalog(signal?: AbortSignal, refresh = false): Promise<ModelCatalog> {
   try {
-    const res = await fetch("/api/models", { signal });
+    const res = await fetch(`/api/models${refresh ? "?refresh=true" : ""}`, { signal });
     if (!res.ok) return parseCatalog(null);
     return parseCatalog(await res.json());
   } catch {
@@ -73,7 +89,7 @@ export async function fetchCatalog(signal?: AbortSignal): Promise<ModelCatalog> 
 
 /** "128k", "8.2k", "512" — compact, never a bare token count in the UI. */
 export function formatTokens(n: number | undefined | null): string {
-  if (!n || n <= 0) return "—";
+  if (!n || n <= 0) return "Unknown";
   if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
   if (n >= 1000) return `${Math.round(n / 100) / 10}k`;
   return String(n);

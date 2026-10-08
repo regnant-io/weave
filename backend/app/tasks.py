@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -18,6 +19,8 @@ from .config import settings
 log = logging.getLogger("weave.tasks")
 
 _celery = None
+_local_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="weave-job")
+_local_capacity = threading.BoundedSemaphore(32)
 
 
 def get_celery():
@@ -165,8 +168,17 @@ def dispatch(name: str, *args, job_owner_id: str = "", job_project_id: str = "",
                 _set_job(job_id, "failed", error=f"broker unavailable: {exc}"[:2000])
                 return job_id
     fn = _JOBS.get(name)
-    threading.Thread(target=lambda: _safe(fn, *args, _job_id=job_id, **kwargs),
-                     daemon=True).start()
+    if not _local_capacity.acquire(blocking=False):
+        _set_job(job_id, "failed", error="local background queue is full")
+        return job_id
+
+    def run_local() -> None:
+        try:
+            _safe(fn, *args, _job_id=job_id, **kwargs)
+        finally:
+            _local_capacity.release()
+
+    _local_executor.submit(run_local)
     return job_id
 
 
@@ -175,6 +187,53 @@ def _safe(fn, *args, **kwargs) -> None:
         fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001
         log.warning("job failed: %s", exc)
+
+
+def recover_desktop_jobs() -> None:
+    """Make interrupted local work visible and resume dataset profiling."""
+    if settings.environment != "desktop":
+        return
+    from .db import SessionLocal
+    from .models import Dataset, JobRecord, Message, Project
+    from .storage import storage
+
+    db = SessionLocal()
+    pending: list[tuple[str, str, str]] = []
+    try:
+        for row in db.query(JobRecord).filter(
+            JobRecord.status.in_(("queued", "running", "retrying"))
+        ):
+            row.status = "failed"
+            row.error = "desktop app closed before this job finished"
+            db.add(row)
+        for dataset in db.query(Dataset).filter(Dataset.status == "profiling"):
+            if not dataset.s3_key or not storage.exists(dataset.s3_key):
+                dataset.status = "error"
+                db.add(dataset)
+                continue
+            project = db.get(Project, dataset.project_id)
+            pending.append((dataset.id, dataset.project_id,
+                            project.user_id if project else ""))
+        for message in db.query(Message).filter(Message.role == "assistant").yield_per(100):
+            plan = message.plan or {}
+            state = plan.get("_task_state")
+            if isinstance(state, dict) and state.get("status") == "running":
+                state = {**state, "status": "interrupted", "phase": "incomplete",
+                         "outstanding": list(state.get("outstanding") or []) or
+                         ["The desktop app closed during this task. Continue to recover the saved work."]}
+                message.plan = {**plan, "_task_state": state}
+                db.add(message)
+        db.commit()
+        for dataset_id, project_id, owner_id in pending:
+            new_id = dispatch("weave.profile_dataset", dataset_id,
+                              job_owner_id=owner_id, job_project_id=project_id)
+            dataset = db.get(Dataset, dataset_id)
+            if dataset is not None:
+                dataset.job_id = new_id
+                db.add(dataset)
+                db.commit()
+    finally:
+        db.close()
 
 
 # --- jobs -------------------------------------------------------------------

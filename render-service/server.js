@@ -210,19 +210,167 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ---- charts: Vega-Lite spec -> SVG ----------------------------------------
+
+/*
+  A LOADER THAT LOADS NOTHING.
+
+  Vega's default Node loader follows `data.url` and image `url`s: over HTTP, and
+  from the local filesystem. A spec asking for `{"url": "package.json"}` read
+  this service's own files into the chart, and on a desktop install this
+  process runs on the user's machine with their permissions. Chart specs come
+  from a model that also reads untrusted web pages, so that is a file-read and
+  SSRF primitive. Charts are rendered from inline data only. The rejection says
+  so, which is also what the model needs to hear to fix the spec.
+*/
+const INLINE_ONLY =
+  "charts render offline from inline data only: put the rows in `data.values` " +
+  "instead of `data.url`, and do not reference remote images";
+const offlineLoader = {
+  load: async () => { throw new Error(INLINE_ONLY); },
+  sanitize: async () => { throw new Error(INLINE_ONLY); },
+  http: async () => { throw new Error(INLINE_ONLY); },
+  file: async () => { throw new Error(INLINE_ONLY); },
+};
+
+/**
+ * Data marks actually drawn, read from Vega's scenegraph.
+ *
+ * The SVG alone cannot answer this: axes, gridlines and titles render text and
+ * paths for a chart with no data at all, so "has SVG content" passed an empty
+ * chart whose encoding named a field missing from the data. Only items of
+ * role "mark" are data; axis, legend and title marks are scaffolding. Items
+ * with non-finite geometry (an x of undefined) are not drawn.
+ */
+function countDataMarks(view) {
+  let count = 0;
+  const finite = (v) => v === undefined || Number.isFinite(v);
+  const visit = (mark, depth) => {
+    if (!mark || !Array.isArray(mark.items) || depth > 30) return;
+    if (mark.marktype === "group") {
+      for (const group of mark.items) {
+        for (const child of group.items || []) visit(child, depth + 1);
+      }
+      return;
+    }
+    if (mark.role !== "mark") return;
+    for (const item of mark.items) {
+      if (item && finite(item.x) && finite(item.y) && finite(item.x2) && finite(item.y2)) count++;
+    }
+  };
+  visit(view.scenegraph().root, 0);
+  return count;
+}
+
+/**
+ * Encoding fields that do not exist in the inline data.
+ *
+ * The most common broken chart a model produces: `"field": "Yield"` over rows
+ * keyed `yield`. Depending on the field type Vega either drops every mark or
+ * draws them all at `undefined`, and neither says why. Checked only for
+ * Vega-Lite with inline `data.values` and transforms whose outputs are known;
+ * anything else is left to the renderer rather than guessed at.
+ */
+const KNOWN_TRANSFORMS = {
+  calculate: (t) => [t.as],
+  filter: () => [],
+  bin: (t) => (Array.isArray(t.as) ? t.as : [t.as, `${t.as}_end`]),
+  timeUnit: (t) => [t.as],
+  aggregate: (t) => [...(t.aggregate || []).map((a) => a.as), ...(t.groupby || [])],
+  joinaggregate: (t) => (t.joinaggregate || []).map((a) => a.as),
+  window: (t) => (t.window || []).map((a) => a.as),
+  fold: (t) => (Array.isArray(t.as) ? t.as : ["key", "value"]),
+  sample: () => [],
+};
+
+function missingFields(spec) {
+  if (!isVegaLite(spec)) return null;
+  const values = spec?.data?.values;
+  if (!Array.isArray(values) || !values.length || typeof values[0] !== "object") return null;
+  const known = new Set();
+  for (const row of values.slice(0, 200)) {
+    if (row && typeof row === "object") Object.keys(row).forEach((k) => known.add(k));
+  }
+  const collect = (node, depth) => {
+    const out = [];
+    if (!node || typeof node !== "object" || depth > 6) return out;
+    for (const t of node.transform || []) {
+      const kind = Object.keys(KNOWN_TRANSFORMS).find((k) => k in t);
+      if (!kind) return null;                 // unknown output names: do not guess
+      for (const name of KNOWN_TRANSFORMS[kind](t)) if (name) known.add(String(name));
+    }
+    for (const channel of Object.values(node.encoding || {})) {
+      for (const def of Array.isArray(channel) ? channel : [channel]) {
+        if (def && typeof def.field === "string") out.push(def.field.split(".")[0].replace(/\\/g, ""));
+      }
+    }
+    for (const key of ["layer", "concat", "hconcat", "vconcat"]) {
+      for (const child of node[key] || []) {
+        if (child?.data) continue;            // a child with its own data is checked by Vega
+        const found = collect(child, depth + 1);
+        if (found === null) return null;
+        out.push(...found);
+      }
+    }
+    return out;
+  };
+  const used = collect(spec, 0);
+  if (used === null || spec.repeat || spec.facet) return null;
+  const missing = [...new Set(used)].filter((f) => !known.has(f));
+  return missing.length ? { missing, known: [...known] } : null;
+}
+
+/** True when a spec is Vega-Lite rather than full Vega, with or without $schema. */
+function isVegaLite(spec) {
+  if (typeof spec.$schema === "string") return spec.$schema.includes("vega-lite");
+  if (Array.isArray(spec.marks) || Array.isArray(spec.signals) || Array.isArray(spec.scales)) {
+    return false;
+  }
+  return ["mark", "layer", "concat", "hconcat", "vconcat", "facet", "repeat", "spec"]
+    .some((key) => key in spec);
+}
+
+/** Any `url` anywhere in the spec, found before Vega tries to load it. */
+function findUrl(value, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 40) return "";
+  if (!Array.isArray(value) && typeof value.url === "string" && value.url) return value.url;
+  for (const child of Object.values(value)) {
+    const found = findUrl(child, depth + 1);
+    if (found) return found;
+  }
+  return "";
+}
+
 app.post("/chart", async (req, res) => {
   try {
     const { spec, format = "svg", theme = "light" } = req.body || {};
-    if (!spec) return res.status(400).json({ error: "missing spec" });
+    if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+      return res.status(400).json({ error: "missing spec: pass a Vega-Lite spec object" });
+    }
+    const url = findUrl(spec);
+    if (url) {
+      return res.status(400).json({ error: `${INLINE_ONLY} (found url: ${String(url).slice(0, 80)})` });
+    }
+    const fields = missingFields(spec);
+    if (fields) {
+      return res.status(400).json({
+        error:
+          `encoding refers to ${fields.missing.map((f) => `\`${f}\``).join(", ")}, which ` +
+          `${fields.missing.length === 1 ? "is" : "are"} not in the data. Field names are ` +
+          `case-sensitive. The data has: ${fields.known.slice(0, 30).join(", ")}.`,
+      });
+    }
     // House style is applied here rather than asked for in a prompt: charts that
     // each look fine but share no visual language read as amateur, and Vega's
     // own defaults (blue, cramped labels, dark gridlines, a box border) are not
     // a design. The caller's own `config` still wins — see lib/vegaTheme.js.
     const themed = applyTheme(spec, theme);
-    const vgSpec = themed.$schema && themed.$schema.includes("vega-lite")
-      ? vegaLite.compile(themed).spec
-      : themed;
-    const view = new vega.View(vega.parse(vgSpec), { renderer: "none" });
+    // Detected by SHAPE as well as by $schema: models omit $schema often, and
+    // a Vega-Lite spec parsed as raw Vega fails with an error about Vega
+    // internals that says nothing useful about the chart that was asked for.
+    const vgSpec = isVegaLite(themed) ? vegaLite.compile(themed).spec : themed;
+    const view = new vega.View(vega.parse(vgSpec), { renderer: "none", loader: offlineLoader });
+    await view.runAsync();
+    const dataMarks = countDataMarks(view);
     const svg = await view.toSVG();
     /*
       REFUSE TO RETURN AN EMPTY CHART.
@@ -240,7 +388,7 @@ app.post("/chart", async (req, res) => {
       specific reason is something the model repairs; a blank image is
       something it congratulates itself on.
     */
-    if (!svgHasContent(svg)) {
+    if (dataMarks === 0 || !svgHasContent(svg)) {
       return res.status(400).json({
         error:
           "the chart rendered with no marks on it -- the spec is valid but it draws " +
@@ -261,7 +409,10 @@ app.post("/chart", async (req, res) => {
       res.json({ svg });
     }
   } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
+    // Every failure here comes from the spec (a bad field, an invalid
+    // encoding, a transform Vega rejects), so it is a 400 the caller can fix,
+    // not a 500 that reads as the service being down.
+    res.status(400).json({ error: `the chart spec could not be rendered: ${String(e && e.message ? e.message : e)}` });
   }
 });
 
@@ -405,9 +556,10 @@ app.post("/custom", (req, res) => {
 
 
 const PORT = process.env.PORT || 3100;
+const HOST = process.env.HOST || "0.0.0.0";
 export { app };
 
 const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";
 if (import.meta.url === invokedPath) {
-  app.listen(PORT, () => console.log(`weave render-service on :${PORT}`));
+  app.listen(PORT, HOST, () => console.log(`weave render-service on ${HOST}:${PORT}`));
 }

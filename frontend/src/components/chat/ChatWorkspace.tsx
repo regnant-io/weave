@@ -189,17 +189,18 @@ export default function ChatWorkspace({
 
   return (
     <div className="relative h-full">
-      <ThreadBar
-        projectId={projectId}
-        threads={threads}
-        activeId={activeId}
-        language={language}
-        onSelect={select}
-        onPrefetch={prefetch}
-        onChanged={refreshThreads}
-      />
-
       <ChatClient
+        threadBar={
+          <ThreadBar
+            projectId={projectId}
+            threads={threads}
+            activeId={activeId}
+            language={language}
+            onSelect={select}
+            onPrefetch={prefetch}
+            onChanged={refreshThreads}
+          />
+        }
         key={`${activeId || "none"}:${rev}`}
         projectId={projectId}
         threadId={activeId || undefined}

@@ -34,6 +34,9 @@ def run_analysis(
     )
     if not dataset:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "dataset not found")
+    if dataset.status != "ready":
+        detail = (dataset.column_profile or {}).get("reason") or "profiling has not completed"
+        raise HTTPException(status.HTTP_409_CONFLICT, f"dataset is not ready: {detail}")
 
     heavy = body.heavy and user.trust_tier == "institutional"  # heavy jobs gated by tier
     run = get_analysis_service().run_code(

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -554,13 +555,18 @@ class OllamaEngine:
         #: point half the answer had never been saved. Keeping every part means
         #: what is persisted is what the reader actually saw.
         said: list[str] = []
+        cutoffs = 0
 
         def _cancelled() -> bool:
             return cancel is not None and cancel.is_set()
 
         for _ in range(max_iters):
             if _cancelled():
-                return TurnResult(text=final_text.strip(), tool_events=tool_events, tier_used=tier)
+                # `said`, not the long-gone `final_text`: that name raised
+                # NameError here, so every Stop or steer that landed between
+                # steps crashed the turn into the offline fallback.
+                return TurnResult(text="\n\n".join(said).strip(),
+                                  tool_events=tool_events, tier_used=tier)
             payload = {
                 "model": model,
                 "messages": convo,
@@ -581,6 +587,7 @@ class OllamaEngine:
 
             content_parts: list[str] = []
             tool_calls: list[dict] = []
+            done_reason = ""
             #: Characters actually pushed to the client for THIS step. Distinct
             #: from `content_parts`, which is what we will keep -- the two
             #: diverge exactly when a stream dies part-way and has to be
@@ -638,13 +645,16 @@ class OllamaEngine:
                             if m.get("tool_calls"):
                                 tool_calls.extend(m["tool_calls"])
                             if obj.get("done"):
+                                done_reason = str(obj.get("done_reason") or "")
                                 break
                     break
             except QuotaExhausted:
                 raise
             except Exception:  # noqa: BLE001 - fall back to non-streaming for this step
                 resp2 = self._post_chat({**payload, "stream": False}, on_event=on_event)
-                m = resp2.json().get("message", {}) or {}
+                body2 = resp2.json()
+                done_reason = str(body2.get("done_reason") or "")
+                m = body2.get("message", {}) or {}
                 text = m.get("content", "") or ""
                 tool_calls = m.get("tool_calls") or []
                 content_parts = [text]
@@ -673,6 +683,17 @@ class OllamaEngine:
                     _emit_token(text)
 
             step_text = "".join(content_parts)
+            if (done_reason == "length" and cutoffs < _MAX_CUTOFF_RECOVERIES
+                    and not _cancelled()):
+                # Cut off at num_predict. Whatever tool call was being written
+                # is incomplete, so it is not executed; the model is told why
+                # and continues, instead of the turn ending mid-sentence.
+                cutoffs += 1
+                if step_text.strip():
+                    said.append(step_text.strip())
+                convo.append({"role": "assistant", "content": step_text})
+                convo.append({"role": "user", "content": _CUTOFF_NOTICE})
+                continue
             convo.append({
                 "role": "assistant", "content": step_text,
                 **({"tool_calls": tool_calls} if tool_calls else {}),
@@ -681,25 +702,31 @@ class OllamaEngine:
             if step_text.strip():
                 said.append(step_text.strip())
 
-            if not tool_calls:
+            if not tool_calls or _cancelled():
+                # A stream cut short by Stop can end holding a half-received
+                # tool call. Executing it would act on an instruction the user
+                # has just withdrawn.
                 return TurnResult(text="\n\n".join(said).strip(),
                                   tool_events=tool_events, tier_used=tier)
 
             calls = []
-            for tc in tool_calls:
+            malformed: dict[int, dict] = {}
+            for index, tc in enumerate(tool_calls):
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
+                args, problem = _parse_tool_arguments(fn.get("arguments", {}))
+                if problem:
+                    # Executing with `{}` used to turn a truncated argument
+                    # string into "x is required", which sent the model hunting
+                    # for a missing field instead of re-sending valid JSON.
+                    malformed[index] = {"status": "error", "code": "invalid_tool_arguments",
+                                        "retryable": True, "error": problem}
                 calls.append((name, args))
 
-            for name, args, result in _run_tool_calls(
-                calls, tool_executor, parallel_safe, cancel=cancel,
-            ):
+            runnable = [c for i, c in enumerate(calls) if i not in malformed]
+            outcomes = iter(_run_tool_calls(runnable, tool_executor, parallel_safe, cancel=cancel))
+            for index, (name, args) in enumerate(calls):
+                result = malformed[index] if index in malformed else next(outcomes)[2]
                 tool_events.append({"name": name, "input": args, "result": result})
                 convo.append({"role": "tool", "tool_name": name,
                               "content": _stringify_tool_result(result)})
@@ -804,6 +831,7 @@ class AnthropicEngine:
         convo = [self._with_images(m) for m in messages]
         tool_events: list[dict] = []
         said: list[str] = []
+        cutoffs = 0
 
         def _cancelled() -> bool:
             return cancel is not None and cancel.is_set()
@@ -838,6 +866,19 @@ class AnthropicEngine:
                 stop_reason = final.stop_reason
                 assistant_content = [self._block_to_dict(b) for b in final.content]
                 tool_uses = [b for b in final.content if b.type == "tool_use"]
+
+            if stop_reason == "max_tokens" and cutoffs < _MAX_CUTOFF_RECOVERIES:
+                # Cut off mid-output. A half-emitted tool call cannot be
+                # executed and cannot be answered with a tool_result, so it is
+                # dropped from the transcript and the model is told why.
+                cutoffs += 1
+                kept = [b for b in assistant_content if b.get("type") == "text"]
+                if kept:
+                    convo.append({"role": "assistant", "content": kept})
+                if step_text.strip():
+                    said.append(step_text.strip())
+                convo.append({"role": "user", "content": _CUTOFF_NOTICE})
+                continue
 
             convo.append({"role": "assistant", "content": assistant_content})
             if step_text.strip():
@@ -891,9 +932,78 @@ class AnthropicEngine:
         return {"type": block.type}
 
 
-def _stringify_tool_result(result: dict) -> str:
+#: How many times one generate() call recovers from output cut off at the
+#: token limit before accepting what it has.
+_MAX_CUTOFF_RECOVERIES = 2
+_CUTOFF_NOTICE = (
+    "Your last message was cut off at the output-token limit, so any tool call "
+    "in it was NOT executed. Continue from where you stopped. If you were "
+    "writing a large file, write it in smaller parts: create it with the first "
+    "part, then add the rest with workspace_edit."
+)
+
+
+def _parse_tool_arguments(raw: Any) -> tuple[dict, str]:
+    """(arguments, problem). `problem` is set when the model's JSON is unusable."""
     import json
-    return json.dumps(result, ensure_ascii=False)[:8000]
+    if isinstance(raw, dict):
+        return raw, ""
+    if raw in (None, ""):
+        return {}, ""
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {}, (f"your tool arguments were not valid JSON ({exc.msg}; "
+                        f"position {exc.pos}). This usually means the output was cut off or a "
+                        "string was not escaped. Send the call again with complete, "
+                        "valid JSON; for a very large file, write it in parts.")
+        if isinstance(value, dict):
+            return value, ""
+    return {}, "tool arguments must be a JSON object"
+
+
+#: Ceiling on one tool result as the model sees it.
+_TOOL_RESULT_CHARS = 8000
+
+
+def _stringify_tool_result(result: dict) -> str:
+    """Serialise a tool result for the model, within budget, as VALID JSON.
+
+    The old `json.dumps(result)[:8000]` cut the document mid-token: the model
+    received an unterminated string and no closing braces, and small models
+    responded by re-running the tool to "see the rest". Long string fields are
+    shortened instead (keeping the head and the tail, where errors live), with
+    a marker saying how much was dropped.
+    """
+    import json
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    if len(text) <= _TOOL_RESULT_CHARS:
+        return text
+
+    def shrink(value: Any, limit: int) -> Any:
+        if isinstance(value, str) and len(value) > limit:
+            head = limit * 2 // 3
+            tail = limit - head
+            return (value[:head] + f"\n…[{len(value) - limit} characters omitted]…\n"
+                    + value[-tail:])
+        if isinstance(value, list):
+            items = [shrink(v, limit) for v in value[:40]]
+            if len(value) > 40:
+                items.append(f"…[{len(value) - 40} more items omitted]")
+            return items
+        if isinstance(value, dict):
+            return {k: shrink(v, limit) for k, v in value.items()}
+        return value
+
+    for limit in (3000, 1500, 700, 300, 120):
+        text = json.dumps(shrink(result, limit), ensure_ascii=False, default=str)
+        if len(text) <= _TOOL_RESULT_CHARS:
+            return text
+    return json.dumps({"status": result.get("status"),
+                       "error": str(result.get("error") or "")[:1000],
+                       "note": "the full result was too large to show"},
+                      ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -1071,6 +1181,8 @@ class OfflineEngine:
 # --------------------------------------------------------------------------- #
 _Engine = OllamaEngine | AnthropicEngine | OfflineEngine
 _engine: _Engine | None = None
+_engine_retry_at = 0.0
+_engine_lock = threading.Lock()
 
 
 def _try_ollama() -> OllamaEngine | None:
@@ -1078,6 +1190,30 @@ def _try_ollama() -> OllamaEngine | None:
         eng = OllamaEngine()
         return eng if eng.ping() else None
     except Exception:  # noqa: BLE001 - httpx missing / unreachable
+        return None
+
+
+class CordonEngine(OllamaEngine):
+    """The Ollama engine, wired to a Cordon node (see cordon_bridge)."""
+
+    name = "cordon"
+
+    def __init__(self) -> None:
+        from .cordon_bridge import cordon_client
+        super().__init__(client=cordon_client(settings))
+
+    def model_for_tier(self, tier: str) -> str:
+        return settings.cordon_model or "default"
+
+    def resolve_model(self, requested: str | None = None) -> str:
+        return settings.cordon_model or "default"
+
+
+def _try_cordon() -> CordonEngine | None:
+    try:
+        eng = CordonEngine()
+        return eng if eng.ping() else None
+    except Exception:  # noqa: BLE001 - unreachable / misconfigured
         return None
 
 
@@ -1097,27 +1233,42 @@ def get_engine() -> _Engine:
     is configured, else the deterministic offline engine. Every branch degrades to
     offline so the platform always boots.
     """
-    global _engine
-    if _engine is not None:
+    import time
+
+    global _engine, _engine_retry_at
+    if settings.force_offline_llm or (settings.llm_backend or "auto").lower() == "offline":
+        if _engine is None or _engine.name != "offline":
+            _engine = OfflineEngine()
         return _engine
 
-    if settings.force_offline_llm:
-        _engine = OfflineEngine()
+    now = time.monotonic()
+    if _engine is not None and (_engine.name != "offline" or now < _engine_retry_at):
         return _engine
 
-    backend = (settings.llm_backend or "auto").lower()
-    if backend == "offline":
-        _engine = OfflineEngine()
-    elif backend == "ollama":
-        _engine = _try_ollama() or OfflineEngine()
-    elif backend == "anthropic":
-        _engine = _try_anthropic() or OfflineEngine()
-    else:  # auto
-        _engine = _try_ollama() or _try_anthropic() or OfflineEngine()
-    return _engine
+    # A locally installed model server often starts after Weave. Keep the
+    # offline engine responsive, but retry discovery periodically instead of
+    # locking the process into offline mode for its entire lifetime.
+    with _engine_lock:
+        now = time.monotonic()
+        if _engine is not None and (_engine.name != "offline" or now < _engine_retry_at):
+            return _engine
+
+        _engine_retry_at = now + 15.0
+        backend = (settings.llm_backend or "auto").lower()
+        if backend == "ollama":
+            _engine = _try_ollama() or OfflineEngine()
+        elif backend == "cordon":
+            _engine = _try_cordon() or OfflineEngine()
+        elif backend == "anthropic":
+            _engine = _try_anthropic() or OfflineEngine()
+        else:  # auto
+            _engine = _try_ollama() or _try_anthropic() or OfflineEngine()
+        return _engine
 
 
 def reset_engine() -> None:
     """Test hook."""
-    global _engine
-    _engine = None
+    global _engine, _engine_retry_at
+    with _engine_lock:
+        _engine = None
+        _engine_retry_at = 0.0

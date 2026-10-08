@@ -3,62 +3,25 @@
 import { useMemo } from "react";
 import type { Language, UsageStats } from "@/lib/types";
 
-/**
- * Usage analytics for the welcome screen.
- *
- * This replaces a pale "no projects yet" panel that told a returning user
- * nothing. It is deliberately about THEIR work — how much they've done, when
- * they work, what they reach for — rather than product metrics, and every
- * number comes from rows the app already writes.
- *
- * Design notes that matter at this density:
- *   * figures are set in the display serif and left-aligned, so a grid of eight
- *     tiles still reads as a page rather than as a dashboard widget;
- *   * every tile keeps its slot when its value is zero — a grid that reflows as
- *     data arrives feels broken;
- *   * the activity strip is twelve weeks of one-bit-per-day, which is enough to
- *     show a rhythm without implying precision the data doesn't have.
- */
-
 const WEEKDAYS: Record<Language, string[]> = {
   en: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
   sw: ["Jumatatu", "Jumanne", "Jumatano", "Alhamisi", "Ijumaa", "Jumamosi", "Jumapili"],
 };
 
 function compact(n: number): string {
-  if (!n) return "0";
   if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
   if (n >= 1000) return `${Math.round(n / 100) / 10}k`;
   return String(n);
 }
 
-/** "14:00–15:00" — an hour bucket, not a timestamp. */
-function hourRange(h: number | null): string {
-  if (h === null || h === undefined) return "—";
-  const pad = (x: number) => String(((x % 24) + 24) % 24).padStart(2, "0");
-  return `${pad(h)}:00–${pad(h + 1)}:00`;
-}
-
-function Tile({
-  label,
-  value,
-  hint,
-  wide,
-}: {
-  label: string;
-  value: string;
-  hint?: string;
-  wide?: boolean;
-}) {
+function Metric({ label, value, note }: { label: string; value: string; note?: string }) {
   return (
-    <div
-      className={`min-w-0 border-t border-border pt-2.5 ${wide ? "col-span-2" : ""}`}
-    >
-      <div className="eyebrow truncate">{label}</div>
-      <div className="mt-1 truncate font-display text-[26px] leading-none tracking-tight text-fg">
+    <div className="min-w-0 px-4 py-3 sm:px-5">
+      <div className="truncate text-[11px] font-medium text-fg-faint">{label}</div>
+      <div className="mt-1.5 truncate font-mono text-[22px] font-semibold leading-none tracking-tight text-fg">
         {value}
       </div>
-      {hint && <div className="mt-1 truncate text-[11.5px] text-fg-faint">{hint}</div>}
+      {note && <div className="mt-1 truncate text-[10px] text-fg-faint">{note}</div>}
     </div>
   );
 }
@@ -71,8 +34,6 @@ export default function StatsPanel({
   language: Language;
 }) {
   const sw = language === "sw";
-
-  // Grouped into weeks (columns) so the strip reads like a calendar, oldest left.
   const weeks = useMemo(() => {
     const days = stats?.activity ?? [];
     const out: Array<Array<{ date: string; active: boolean }>> = [];
@@ -82,125 +43,73 @@ export default function StatsPanel({
 
   if (!stats) {
     return (
-      <aside className="border border-border bg-surface p-4">
-        <div className="eyebrow mb-2">{sw ? "Takwimu" : "Your activity"}</div>
-        <p className="text-[12.5px] leading-relaxed text-fg-faint">
-          {sw
-            ? "Takwimu hazipatikani kwa sasa."
-            : "Activity stats aren't available right now."}
-        </p>
-      </aside>
+      <section className="platform-panel flex min-h-20 items-center px-4 py-3 text-[13px] text-fg-muted">
+        {sw ? "Takwimu za matumizi hazipatikani kwa sasa." : "Usage data is temporarily unavailable."}
+      </section>
     );
   }
 
-  const streakHint =
-    stats.current_streak > 0
-      ? sw
-        ? `bora zaidi ${stats.longest_streak}`
-        : `best ${stats.longest_streak}`
-      : sw
-        ? `bora zaidi ${stats.longest_streak}`
-        : `best ${stats.longest_streak}`;
+  const weekday = stats.busiest_weekday == null ? null : WEEKDAYS[language][stats.busiest_weekday];
+  const peakHour = stats.peak_hour == null
+    ? null
+    : `${String(stats.peak_hour).padStart(2, "0")}:00`;
 
   return (
-    <aside className="border border-border bg-surface p-4 sm:p-5">
-      <div className="mb-3 flex items-baseline justify-between gap-2">
-        <div className="eyebrow">{sw ? "Takwimu zako" : "Your activity"}</div>
-        {stats.last_active && (
-          <div className="truncate text-[11px] text-fg-faint">
-            {sw ? "mwisho" : "last"}{" "}
-            {new Date(stats.last_active).toLocaleDateString(sw ? "sw-TZ" : "en-GB", {
-              day: "numeric",
-              month: "short",
-            })}
+    <section className="platform-panel overflow-hidden" aria-label={sw ? "Muhtasari wa matumizi" : "Usage overview"}>
+      <div className="grid grid-cols-2 divide-x divide-y divide-border sm:grid-cols-4 sm:divide-y-0">
+        <Metric label={sw ? "Miradi" : "Projects"} value={compact(stats.projects)} />
+        <Metric label={sw ? "Ujumbe" : "Messages"} value={compact(stats.messages)} note={`${compact(stats.prompts)} ${sw ? "maulizo" : "prompts"}`} />
+        <Metric label={sw ? "Seti za data" : "Datasets"} value={compact(stats.datasets)} />
+        <Metric label={sw ? "Siku za kazi" : "Active days"} value={compact(stats.active_days)} />
+      </div>
+
+      <div className="grid gap-5 border-t border-border px-4 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:px-5">
+        <div className="min-w-0">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h2 className="text-xs font-semibold text-fg">{sw ? "Shughuli za wiki 12" : "Activity over 12 weeks"}</h2>
+            <span className="font-mono text-[10px] text-fg-faint">{stats.activity.filter((d) => d.active).length} / 84</span>
           </div>
-        )}
-      </div>
-
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3">
-        <Tile
-          label={sw ? "Vipindi" : "Sessions"}
-          value={compact(stats.sessions)}
-          hint={`${compact(stats.projects)} ${sw ? "miradi" : "projects"}`}
-        />
-        <Tile
-          label={sw ? "Ujumbe" : "Messages"}
-          value={compact(stats.messages)}
-          hint={`${compact(stats.prompts)} ${sw ? "maswali" : "prompts"}`}
-        />
-        <Tile label={sw ? "Tokeni" : "Total tokens"} value={compact(stats.total_tokens)} />
-        <Tile
-          label={sw ? "Siku hai" : "Active days"}
-          value={compact(stats.active_days)}
-        />
-        <Tile
-          label={sw ? "Mfululizo" : "Current streak"}
-          value={`${stats.current_streak}`}
-          hint={streakHint}
-        />
-        <Tile
-          label={sw ? "Mrefu zaidi" : "Longest streak"}
-          value={`${stats.longest_streak}`}
-        />
-        <Tile
-          label={sw ? "Saa ya kilele" : "Peak hour"}
-          value={hourRange(stats.peak_hour)}
-          hint={
-            stats.busiest_weekday !== null && stats.busiest_weekday !== undefined
-              ? WEEKDAYS[sw ? "sw" : "en"][stats.busiest_weekday]
-              : undefined
-          }
-          wide
-        />
-        <Tile
-          label={sw ? "Modeli kipenzi" : "Favourite model"}
-          value={stats.favourite_model || "—"}
-          hint={
-            stats.analyses
-              ? `${compact(stats.analyses)} ${sw ? "uchambuzi" : "analyses"}`
-              : undefined
-          }
-          wide
-        />
-      </div>
-
-      {weeks.length > 0 && (
-        <div className="mt-4 border-t border-border pt-3">
-          <div className="eyebrow mb-2">{sw ? "Wiki 12 zilizopita" : "Last 12 weeks"}</div>
-          <div className="flex gap-[3px] overflow-x-auto pb-1">
-            {weeks.map((week, wi) => (
-              <div key={wi} className="flex flex-shrink-0 flex-col gap-[3px]">
-                {week.map((d) => (
-                  <span
-                    key={d.date}
-                    title={d.date}
-                    className={`block h-[9px] w-[9px] rounded-[1px] ${
-                      d.active ? "bg-accent" : "bg-surface-3"
-                    }`}
-                  />
-                ))}
-              </div>
+          <div
+            className="grid w-fit grid-flow-col grid-rows-7 gap-[3px]"
+            role="img"
+            aria-label={sw ? "Shughuli za siku kwa siku katika wiki 12 zilizopita" : "Daily activity over the last 12 weeks"}
+          >
+            {weeks.flatMap((week) => week).map((day) => (
+              <span
+                key={day.date}
+                title={`${day.date}${day.active ? sw ? " · shughuli" : " · activity" : ""}`}
+                className={`h-[10px] w-[10px] rounded-[2px] ${day.active ? "bg-accent" : "bg-surface-3"}`}
+              />
             ))}
           </div>
         </div>
-      )}
+
+        <div className="grid grid-cols-2 gap-x-7 gap-y-3 border-t border-border pt-3 sm:grid-cols-1 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0">
+          <div>
+            <div className="text-[10px] font-medium text-fg-faint">{sw ? "Mfululizo wa sasa" : "Current streak"}</div>
+            <div className="mt-0.5 font-mono text-sm font-semibold">{stats.current_streak} <span className="font-sans text-[11px] font-normal text-fg-faint">{sw ? "siku" : "days"}</span></div>
+          </div>
+          <div>
+            <div className="text-[10px] font-medium text-fg-faint">{sw ? "Saa yenye shughuli nyingi" : "Peak activity"}</div>
+            <div className="mt-0.5 truncate text-xs font-medium">{peakHour ?? "None"}{weekday ? ` · ${weekday}` : ""}</div>
+          </div>
+        </div>
+      </div>
 
       {stats.top_tools.length > 0 && (
-        <div className="mt-3 border-t border-border pt-3">
-          <div className="eyebrow mb-1.5">{sw ? "Zana zinazotumika" : "Most-used tools"}</div>
-          <div className="flex flex-wrap gap-1.5">
-            {stats.top_tools.map((tool) => (
-              <span
-                key={tool.name}
-                className="inline-flex items-center gap-1.5 rounded-sm bg-surface-2 px-2 py-1 text-[11px] text-fg-muted"
-              >
-                {tool.name.replace(/_/g, " ")}
-                <span className="font-mono text-[10px] text-fg-faint">{tool.count}</span>
-              </span>
-            ))}
-          </div>
+        <div className="flex flex-wrap items-center gap-2 border-t border-border px-4 py-3 sm:px-5">
+          <span className="mr-1 text-[10px] font-medium text-fg-faint">{sw ? "Zana zinazotumika" : "Recent tools"}</span>
+          {stats.top_tools.map((tool) => (
+            <span key={tool.name} className="inline-flex items-center gap-1.5 rounded border border-border bg-surface-2 px-2 py-1 text-[10px] text-fg-muted">
+              {tool.name.replace(/_/g, " ")}
+              <span className="font-mono text-fg-faint">{tool.count}</span>
+            </span>
+          ))}
+          <span className="ml-auto truncate text-[10px] text-fg-faint">
+            {sw ? "Modeli" : "Model"}: {stats.favourite_model || "None"}
+          </span>
         </div>
       )}
-    </aside>
+    </section>
   );
 }

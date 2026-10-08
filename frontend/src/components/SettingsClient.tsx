@@ -20,6 +20,7 @@ type Health = {
 
 type WorkspaceStatus = {
   enabled: boolean;
+  runtime: "local" | "docker";
   image: string;
   network: boolean;
   memory_mb: number;
@@ -42,8 +43,8 @@ const applyTheme = (pref: ThemePref) => {
  * Every value that crosses the network boundary goes through here.
  */
 function asText(v: unknown): string {
-  if (v === null || v === undefined) return "—";
-  if (typeof v === "string") return v || "—";
+  if (v === null || v === undefined) return "Unknown";
+  if (typeof v === "string") return v || "Unknown";
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   if (Array.isArray(v)) return v.map(asText).join(", ");
   if (typeof v === "object") {
@@ -53,7 +54,7 @@ function asText(v: unknown): string {
     try {
       return JSON.stringify(v);
     } catch {
-      return "—";
+      return "Unknown";
     }
   }
   return String(v);
@@ -68,7 +69,7 @@ const SERVICE_LABELS: Record<ServiceId, [string, string]> = {
 
 const EFFORTS: { id: Effort; label: string; hint: [string, string] }[] = [
   { id: "spool", label: "Spool", hint: ["Majibu mafupi, haraka", "Short answers, fast"] },
-  { id: "weave", label: "Weave", hint: ["Sawia — chaguo-msingi", "Balanced — the default"] },
+  { id: "weave", label: "Weave", hint: ["Sawia, chaguo-msingi", "Balanced, the default"] },
   {
     id: "tapestry",
     label: "Tapestry",
@@ -211,7 +212,7 @@ export default function SettingsClient({
         note={
           sw
             ? "Chaguo hizi ni chaguo-msingi za gumzo jipya; unaweza kubadilisha kwa kila gumzo kwenye upau wa kuandika."
-            : "These are defaults for new chats — you can override them per chat from the composer."
+            : "These are defaults for new chats. You can override them per chat from the composer."
         }
       >
         <Row label={sw ? "Kina cha kazi" : "Effort"} hint={sw ? "Loom" : "Loom level"}>
@@ -253,10 +254,10 @@ export default function SettingsClient({
             : "The context window is read from the model itself. When a chat reaches it, it is summarised automatically and continued in a new chat, so nothing already established is lost."
         }
       >
-        <Info label={sw ? "Modeli" : "Model"} value={currentModel || "—"} />
+        <Info label={sw ? "Modeli" : "Model"} value={currentModel || "Unknown"} />
         <Info
           label={sw ? "Dirisha la muktadha" : "Context window"}
-          value={contextWindow ? `${formatTokens(contextWindow)} tokens` : "—"}
+          value={contextWindow ? `${formatTokens(contextWindow)} tokens` : "Unknown"}
         />
         <Info label={sw ? "Injini" : "Engine"} value={health?.llm_engine} />
       </Section>
@@ -267,7 +268,7 @@ export default function SettingsClient({
         note={
           sw
             ? "Eneo la kudumu kwa kila mradi ambapo AI hujenga programu: husakinisha vifurushi, huendesha majaribio na hufunga matokeo. Ni tofauti na sanduku la uchambuzi wa data, ambalo halina mtandao kwa makusudi."
-            : "A persistent per-project directory where the assistant builds software — installing packages, running tests, packaging results. Separate from the data-analysis sandbox, which stays offline by design."
+            : "A persistent per-project directory where the assistant builds software, installs packages, runs tests and packages results. Separate from the data-analysis sandbox, which stays offline by design."
         }
       >
         <div className="flex items-center justify-between gap-3 text-sm">
@@ -284,18 +285,19 @@ export default function SettingsClient({
               ? sw
                 ? "Inapatikana"
                 : "Available"
-              : sw
-                ? "Docker haipatikani"
-                : "Docker unavailable"}
+              : workspace?.runtime === "local"
+                ? sw ? "Haipatikani" : "Unavailable"
+                : sw ? "Docker haipatikani" : "Docker unavailable"}
           </span>
         </div>
         {workspace && (
           <>
-            <Info label="Image" value={workspace.image} />
-            <Info
+            <Info label={sw ? "Utekelezaji" : "Runtime"}
+              value={workspace.runtime === "local" ? (sw ? "Kompyuta hii" : "This computer") : workspace.image} />
+            {workspace.runtime === "docker" && <Info
               label={sw ? "Rasilimali" : "Resources"}
               value={`${workspace.memory_mb} MB · ${workspace.cpus} CPU`}
-            />
+            />}
             <Info
               label={sw ? "Mtandao" : "Network"}
               value={
@@ -310,7 +312,12 @@ export default function SettingsClient({
             />
           </>
         )}
-        {!workspace?.enabled && (
+        {workspace?.runtime === "local" && workspace.enabled && (
+          <p className="text-xs leading-relaxed text-fg-faint">
+            {sw ? "Amri za AI huendeshwa kwenye kompyuta hii chini ya akaunti yako." : "AI workspace commands run on this computer under your account."}
+          </p>
+        )}
+        {!workspace?.enabled && workspace?.runtime !== "local" && (
           <p className="text-xs leading-relaxed text-fg-faint">
             {sw
               ? "Jenga picha kisha washa Docker: docker build -t weave-workspace:latest ./workspace-image"

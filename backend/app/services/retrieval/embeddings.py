@@ -54,20 +54,24 @@ def _feature_hashes(text: str) -> list[tuple[int, float]]:
 # --- Ollama embedding backend (opt-in) --------------------------------------
 # Decided ONCE per process so a whole ingest+query run uses one embedding space
 # (mixing dims across chunks would silently break cosine similarity).
-_ollama_state: dict = {"resolved": False, "active": False, "client": None}
+_ollama_state: dict = {"resolved": False, "active": False, "client": None, "retry_at": 0.0}
 
 
 def _resolve_ollama_embeddings() -> bool:
-    if _ollama_state["resolved"]:
-        return _ollama_state["active"]
+    import time
+    if _ollama_state["active"]:
+        return True
+    if _ollama_state["resolved"] and time.monotonic() < _ollama_state["retry_at"]:
+        return False
     _ollama_state["resolved"] = True
     if not settings.ollama_use_embeddings:
         _ollama_state["active"] = False
         return False
     try:
         import httpx
+        from ...runtime import ollama_host
         client = httpx.Client(
-            base_url=settings.ollama_host.rstrip("/"), timeout=30.0,
+            base_url=ollama_host().rstrip("/"), timeout=30.0,
             headers={"ngrok-skip-browser-warning": "true", "User-Agent": "weave/1.0"},
         )
         # probe: embed a token and confirm we get a vector back
@@ -79,7 +83,19 @@ def _resolve_ollama_embeddings() -> bool:
     except Exception:  # noqa: BLE001 - unreachable / model not pulled
         pass
     _ollama_state["active"] = False
+    _ollama_state["retry_at"] = time.monotonic() + 30.0
     return False
+
+
+def reset_ollama_embeddings() -> None:
+    """Drop a stale client after the model host or embedding model changes."""
+    client = _ollama_state.get("client")
+    if client is not None:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _ollama_state.update(resolved=False, active=False, client=None, retry_at=0.0)
 
 
 def _ollama_embed_raw(client, text: str) -> list[float] | None:
@@ -122,7 +138,8 @@ def embed_text(text: str) -> list[float]:
                 norm = math.sqrt(sum(v * v for v in vec))
                 return [v / norm for v in vec] if norm > 0 else vec
         except Exception:  # noqa: BLE001 - fall back for this call
-            pass
+            import time
+            _ollama_state.update(active=False, resolved=True, retry_at=time.monotonic() + 30.0)
     return _deterministic_embed(text)
 
 

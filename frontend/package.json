@@ -1,15 +1,20 @@
 {
-  "name": "weave-frontend",
-  "version": "1.0.0",
+  "name": "weave",
+  "version": "1.0.2",
   "private": true,
-  "description": "Weave — bilingual study + research platform (Next.js App Router, no Vite).",
+  "description": "Local workspace for research, analysis, and knowledge management.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "desktop:prepare": "node scripts/prepare-desktop.mjs",
+    "desktop:run": "npm run build && npm run desktop:prepare && electron .",
+    "dist:win": "npm run build && npm run desktop:prepare && node scripts/package-desktop.mjs windows",
+    "dist:mac": "npm run build && npm run desktop:prepare && node scripts/package-desktop.mjs mac",
+    "dist:linux": "npm run build && npm run desktop:prepare && node scripts/package-desktop.mjs linux"
   },
   "dependencies": {
     "core-js": "^3.39.0",
@@ -28,6 +33,106 @@
     "eslint-config-next": "16.3.4",
     "postcss": "8.5.23",
     "tailwindcss": "3.4.17",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "electron": "^38.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "main": "desktop/main.cjs",
+  "build": {
+    "appId": "org.weave.platform",
+    "productName": "Weave",
+    "asar": true,
+    "beforeBuild": "scripts/desktop-before-build.cjs",
+    "extraMetadata": { "dependencies": {} },
+    "files": [
+      "desktop/main.cjs",
+      "desktop/browser-service.cjs",
+      "desktop/preload.cjs",
+      "package.json",
+      "!node_modules/**"
+    ],
+    "extraResources": [
+      {
+        "from": ".desktop-dist/app",
+        "to": "app"
+      },
+      {
+        "from": ".desktop-dist/app/node_modules",
+        "to": "app/node_modules"
+      },
+      {
+        "from": "../backend/dist/weave-backend",
+        "to": "backend"
+      },
+      {
+        "from": ".desktop-dist/render",
+        "to": "render"
+      },
+      {
+        "from": ".desktop-dist/render/node_modules",
+        "to": "render/node_modules"
+      },
+      {
+        "from": ".desktop-dist/npm",
+        "to": "npm"
+      },
+      {
+        "from": ".desktop-dist/npm/node_modules",
+        "to": "npm/node_modules"
+      },
+      {
+        "from": "desktop/assets",
+        "to": "assets"
+      }
+    ],
+    "directories": {
+      "buildResources": "desktop/assets",
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "desktop/assets/weave.ico",
+      "artifactName": "Weave-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "installerLanguages": [
+        "en-US"
+      ],
+      "include": "desktop/installer.nsh",
+      "uninstallDisplayName": "Weave"
+    },
+    "mac": {
+      "category": "public.app-category.education",
+      "target": [
+        "dmg"
+      ],
+      "icon": "desktop/assets/weave.png"
+    },
+    "dmg": {
+      "artifactName": "Weave-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "category": "Education;Science;",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "desktop/assets/weave.png",
+      "artifactName": "Weave-${version}-${arch}.${ext}"
+    }
   }
 }

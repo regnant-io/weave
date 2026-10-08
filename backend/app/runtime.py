@@ -6,9 +6,27 @@ uses the new endpoint.
 """
 from __future__ import annotations
 
-from .config import settings
+import json
+import logging
 
-_overrides: dict = {}
+from .config import DATA_DIR, settings
+
+log = logging.getLogger("weave.runtime")
+_RUNTIME_FILE = DATA_DIR / "runtime.json"
+
+
+def _read_overrides() -> dict:
+    try:
+        value = json.loads(_RUNTIME_FILE.read_text(encoding="utf-8"))
+        return {
+            key: value[key].strip()
+            for key in ("ollama_host", "ollama_model")
+            if isinstance(value, dict) and isinstance(value.get(key), str) and value[key].strip()
+        }
+    except (OSError, ValueError, TypeError):
+        return {}
+
+_overrides: dict = _read_overrides()
 
 # --- effort ("Loom") levels: unique, on-brand terminology ------------------
 # Spool  = quick/low   | Weave = balanced/mid | Tapestry = deep/high
@@ -114,6 +132,17 @@ def set_ollama(host: str | None = None, model: str | None = None) -> None:
         _overrides["ollama_model"] = model.strip()
         changed = True
     if changed:
+        try:
+            temporary = _RUNTIME_FILE.with_suffix(".tmp")
+            temporary.write_text(json.dumps(_overrides, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(_RUNTIME_FILE)
+        except OSError as exc:
+            log.warning("could not persist local model settings: %s", exc)
+        try:
+            from .services.retrieval.embeddings import reset_ollama_embeddings
+            reset_ollama_embeddings()
+        except Exception:  # noqa: BLE001 - chat configuration must remain usable
+            pass
         from .services.orchestration.llm import reset_engine
         reset_engine()
 

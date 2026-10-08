@@ -182,7 +182,12 @@ export function prepareScript(rawCode, { allowModule = true } = {}) {
  */
 export function lintHtml(html) {
   const problems = [];
-  const src = String(html || "");
+  // The libraries this service inlines itself (Babylon, Three, React Flow) are
+  // not the model's code. Babylon alone contains fetch/XMLHttpRequest and
+  // thousands of braces inside strings and regexes, so linting it reported
+  // "attempts a network request" and "4 more { than }" on every 3D scene.
+  const src = String(html || "").replace(
+    /<script\b[^>]*\bdata-weave-lib\b[^>]*>[\s\S]*?<\/script>/gi, "<script></script>");
   const add = (severity, message) => problems.push({ severity, message });
 
   if (!src.trim()) {

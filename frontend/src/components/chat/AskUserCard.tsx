@@ -98,7 +98,7 @@ export default function AskUserCard({
       setError(
         sw
           ? "Imeshindwa kutuma jibu. Huenda swali limepitwa na wakati."
-          : "Could not send your answer — the question may have expired.",
+          : "Could not send your answer. The question may have expired.",
       );
       setSending(false);
     }
@@ -119,7 +119,7 @@ export default function AskUserCard({
     return (
       <div className="animate-rise my-3 flex items-start gap-2 border-l-2 border-ok pl-3 text-[13px] text-fg-muted">
         <IcoCheck size={13} className="mt-[3px] flex-shrink-0 text-ok" />
-        <span>{sw ? "Umejibu — kazi inaendelea." : "Answered — continuing."}</span>
+        <span>{sw ? "Umejibu, kazi inaendelea." : "Answered, continuing."}</span>
       </div>
     );
   }

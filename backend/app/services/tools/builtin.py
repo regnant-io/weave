@@ -36,12 +36,15 @@ def _run_analysis(ctx: ToolContext, inp: dict) -> dict:
     svc = ctx.services["analysis"]
     run = svc.run_code(
         ctx.db, code=inp.get("code", ""), dataset=ctx.dataset,
-        heavy=bool(inp.get("heavy")),
+        heavy=bool(inp.get("heavy")) and ctx.trust == "institutional",
         user_id=ctx.project.user_id if ctx.project else None,
         message_id=ctx.message_id,
     )
     result = {"status": run.status, "stdout": run.stdout, "stderr": run.stderr,
-              "output_files": run.output_files, "execution_time_ms": run.execution_time_ms}
+              "output_files": run.output_files, "execution_time_ms": run.execution_time_ms,
+              "run_id": run.id,
+              "dataset_id": getattr(ctx.dataset, "id", None),
+              "dataset_name": getattr(ctx.dataset, "original_filename", None)}
     _emit_live(ctx, result, "run_analysis")
     return result
 
@@ -67,9 +70,17 @@ def _web_search(ctx: ToolContext, inp: dict) -> dict:
     if client is None or not client.enabled:
         return {"status": "unavailable", "message": "web search (SearXNG) not configured",
                 "results": []}
-    results = client.search(inp.get("query", ""), language=ctx.language)
+    results, outage = client.search_detailed(inp.get("query", ""), language=ctx.language)
+    if outage and not results:
+        # Not "no results". Nobody looked. Saying so stops the model from
+        # reporting that a topic has no public information.
+        return {"status": "error", "code": "search_unreachable", "retryable": True,
+                "error": outage + ". Say that web search was unavailable; do not "
+                                  "conclude that no information exists.",
+                "results": []}
     images = client.search_images(inp.get("query", ""), n=4, language=ctx.language)
-    return {"status": "ok",
+    from ..clock import today_iso
+    return {"status": "ok", "today": today_iso(),
             "results": [{"title": r.title, "url": r.url, "snippet": r.snippet,
                          "engine": r.engine} for r in results],
             "images": images}
@@ -107,6 +118,7 @@ def _fetch_url(ctx: ToolContext, inp: dict) -> dict:
         "status": "ok",
         "url": page.url,
         "title": page.title,
+        **({"published": page.published} if getattr(page, "published", "") else {}),
         "text": text[:limit],
         "truncated": len(text) > limit,
         "chars": len(text),
@@ -126,9 +138,16 @@ def _deep_research(ctx: ToolContext, inp: dict) -> dict:
         client, inp.get("query", ""), rounds=inp.get("rounds"),
         language=ctx.language, emit=ctx.emit,
     )
-    return {"status": "ok" if out["available"] else "unavailable",
-            "passages": out["passages"], "pages_read": out["pages_read"],
-            "queries": out["queries"], "images": out.get("images", [])}
+    from ..clock import today_iso
+    result = {"status": "ok" if out["available"] else "unavailable",
+              "today": today_iso(),
+              "passages": out["passages"], "pages_read": out["pages_read"],
+              "queries": out["queries"], "images": out.get("images", [])}
+    if out.get("error"):
+        result["error"] = (out["error"] + ". Say that web research was unavailable; "
+                           "do not conclude that no information exists.")
+        result["retryable"] = True
+    return result
 
 
 # --- visual / presentation generation --------------------------------------
@@ -225,6 +244,8 @@ def _query_warehouse(ctx: ToolContext, inp: dict) -> dict:
 
 
 def register_all(reg: ToolRegistry) -> None:
+    from ...config import settings
+
     reg.register(Tool(
         name="run_analysis",
         description=(
@@ -340,8 +361,10 @@ def register_all(reg: ToolRegistry) -> None:
             "  end       — closing slide\n"
             "Rules that matter: ONE idea per slide; body text under ~40 words; "
             "never paste a paragraph onto a slide; open with `title` and change "
-            "layout at least every third slide. format 'pdf' also exports a PDF "
-            "(needs Gotenberg). Works bilingually."
+            "layout at least every third slide. Works bilingually. "
+            + ("format 'pdf' also exports a PDF via the configured converter."
+               if settings.gotenberg_url else
+               "Use format 'html'; PDF export is unavailable in this distribution.")
         ),
         input_schema={"type": "object", "properties": {
             "slides": {"type": "array", "items": {"type": "object", "properties": {
@@ -361,7 +384,8 @@ def register_all(reg: ToolRegistry) -> None:
             "title": {"type": "string"},
             "subtitle": {"type": "string", "description": "Shown in the deck footer."},
             "theme": {"type": "string", "enum": ["light", "dark"]},
-            "format": {"type": "string", "enum": ["html", "pdf"]},
+            "format": {"type": "string", "enum": ["html", "pdf"]
+                       if settings.gotenberg_url else ["html"]},
         }, "required": ["slides"]},
         execute=_generate_deck, trust_required="verified", requires_services=("render",),
     ))

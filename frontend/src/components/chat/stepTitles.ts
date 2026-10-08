@@ -44,6 +44,7 @@ const VERBS: Record<string, Pair> = {
   update_visual: ["Inasasisha taswira", "Updating the visual"],
   delete_visual: ["Inafuta taswira", "Removing a visual"],
   list_visuals: ["Inaorodhesha taswira", "Listing visuals"],
+  workspace_check: ["Inakagua mradi: majaribio na ujenzi", "Running the project's tests and build"],
 };
 
 /** Title for a step that is starting, from the tool name and its arguments. */

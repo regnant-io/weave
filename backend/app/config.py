@@ -14,8 +14,8 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "var"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.getenv("WEAVE_DATA_DIR", str(BASE_DIR / "var"))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Settings(BaseSettings):
@@ -81,8 +81,23 @@ class Settings(BaseSettings):
     #   auto      -> Ollama if reachable, else Anthropic if a key is set, else offline
     #   ollama    -> force Ollama (falls back to offline if unreachable)
     #   anthropic -> force Anthropic (falls back to offline if no key/SDK)
+    #   cordon    -> Cordon (Regnant): local inference, every request audited
+    #                and every answer signed (falls back to offline)
     #   offline   -> force the deterministic offline engine
     llm_backend: str = "auto"
+
+    # Cordon (used when llm_backend = "cordon"). The client ID must be enrolled
+    # in Cordon's clients.json; outside Cordon's Light mode give the client
+    # certificate for mutual TLS. num_ctx is the runtime's context window and
+    # max_tokens Cordon's per-client output ceiling: neither is discoverable.
+    cordon_url: str = "http://127.0.0.1:8443"
+    cordon_client_id: str = "weave"
+    cordon_model: str = "default"
+    cordon_num_ctx: int = 32768
+    cordon_max_tokens: int = 4096
+    cordon_client_cert: str | None = None
+    cordon_client_key: str | None = None
+    cordon_ca_cert: str | None = None
     # Output ceiling for the Anthropic path. Deliberately generous: a truncated
     # answer mid-file is worse than a slow one, and this is a ceiling, not a target.
     llm_max_tokens: int = 16384
@@ -95,7 +110,9 @@ class Settings(BaseSettings):
     # Anthropic (Claude)
     anthropic_api_key: str | None = os.getenv("ANTHROPIC_API_KEY")
     model_tier_fast: str = "claude-haiku-4-5-20251001"
-    model_tier_frontier: str = "claude-opus-4-8"
+    # A model id the API does not recognise fails every frontier-tier turn
+    # into the offline fallback, so this must name a current model.
+    model_tier_frontier: str = "claude-opus-5-5"
 
     # Ollama (fully-local LLM). host.docker.internal is set in docker-compose so a
     # containerised backend reaches an Ollama server running on the host.

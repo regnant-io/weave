@@ -67,6 +67,8 @@ class FetchedPage:
     text: str
     ok: bool
     error: str = ""
+    #: Publication date the page declares (YYYY[-MM[-DD]]), or "".
+    published: str = ""
 
 
 def _is_safe_url(url: str) -> tuple[bool, str]:
@@ -190,13 +192,55 @@ class WebSearchClient:
 
     @property
     def enabled(self) -> bool:
-        return bool(settings.searxng_url)
+        # A desktop installation has no container runtime for SearXNG, so it
+        # searches public keyless endpoints instead (see keyless.py).
+        return bool(settings.searxng_url) or self._keyless_mode
+
+    @property
+    def _keyless_mode(self) -> bool:
+        return not settings.searxng_url and settings.environment == "desktop"
+
+    def _keyless(self):
+        if self._keyless_client is None:
+            from .keyless import KeylessSearch
+            self._keyless_client = KeylessSearch(
+                self._httpx, timeout=float(settings.websearch_fetch_timeout))
+        return self._keyless_client
+
+    _keyless_client = None
 
     def search(self, query: str, max_results: int | None = None,
                language: str = "en") -> list[SearchResult]:
-        if not settings.searxng_url:
-            return []
+        """Results, or [] on any failure. Prefer `search_detailed` in new code."""
+        results, _error = self.search_detailed(query, max_results, language)
+        return results
+
+    def search_detailed(self, query: str, max_results: int | None = None,
+                        language: str = "en") -> tuple[list[SearchResult], str]:
+        """(results, error). `error` is non-empty only when search was UNREACHABLE.
+
+        The distinction matters to the model. An empty list with no error means
+        the web has nothing on this query. An outage means nobody looked. Folding
+        the second into the first made the assistant state that a real company
+        "has no public information".
+        """
         n = max_results or settings.websearch_max_results
+
+        if self._keyless_mode:
+            from .keyless import SearchOutage
+            try:
+                hits = self._keyless().search(query, n)
+            except SearchOutage as exc:
+                return [], f"web search is unreachable right now ({exc})"
+            results = []
+            for hit in hits:
+                safe, _ = _is_safe_url(hit.url)
+                if safe:
+                    results.append(SearchResult(title=hit.title, url=hit.url,
+                                                snippet=hit.snippet, engine=hit.engine))
+            return results[:n], ""
+        if not settings.searxng_url:
+            return [], "web search is not configured"
         httpx = self._httpx
         try:
             r = httpx.get(
@@ -208,8 +252,8 @@ class WebSearchClient:
             )
             r.raise_for_status()
             data = r.json()
-        except Exception:  # noqa: BLE001 - service down -> no results (caller degrades)
-            return []
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            return [], f"the search service did not answer ({type(exc).__name__})"
         results = []
         for item in data.get("results", [])[: n]:
             results.append(SearchResult(
@@ -218,10 +262,12 @@ class WebSearchClient:
                 snippet=(item.get("content") or "")[:500],
                 engine=item.get("engine", ""),
             ))
-        return results
+        return results, ""
 
     def search_images(self, query: str, n: int = 4, language: str = "en") -> list[dict]:
-        """Top image results (SearXNG images category) for the in-chat image grid."""
+        """Top image results for the in-chat image grid."""
+        if self._keyless_mode:
+            return self._keyless().images(query, n)
         if not settings.searxng_url:
             return []
         httpx = self._httpx
@@ -271,7 +317,9 @@ class WebSearchClient:
             return FetchedPage(url=url, title="", text="", ok=False, error=str(exc)[:200])
 
         title, text = _html_to_text(html)
-        return FetchedPage(url=url, title=title, text=text, ok=True)
+        from ..clock import published_date
+        return FetchedPage(url=url, title=title, text=text, ok=True,
+                           published=published_date(html))
 
     def _fetch_via_browserless(self, url: str) -> str:
         httpx = self._httpx

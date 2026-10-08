@@ -17,5 +17,5 @@ export default defineConfig([
       "react-hooks/immutability": "off",
     },
   },
-  globalIgnores([".next/**", "next-env.d.ts"]),
+  globalIgnores([".next/**", ".desktop-dist/**", "dist/**", "dist-*/**", "desktop/assets/*.png", "desktop/assets/*.ico", "next-env.d.ts"]),
 ]);

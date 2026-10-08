@@ -11,8 +11,11 @@ runs inside the sandbox tier; the guard here is defence-in-depth.)
 from __future__ import annotations
 
 import re
+import math
+import threading
 
 from ...storage import storage
+from ..sandbox.datasets import CSV_NULL_VALUES, csv_options, read_dataset
 
 _BLOCKED = re.compile(
     r"\b(attach|copy|install|load|pragma|export|import|create|insert|update|delete|"
@@ -55,32 +58,86 @@ class WarehouseService:
             return {"status": "unavailable", "error": "duckdb is not installed"}
         if dataset is None:
             return {"status": "error", "error": "no dataset in context to query (use `data` table)"}
+        if getattr(dataset, "status", "ready") != "ready":
+            return {"status": "error", "code": "dataset_not_ready",
+                    "error": "dataset is not ready; wait for profiling or correct the parsing error"}
 
+        con = None
+        timer = None
         try:
-            import pandas as pd
             path = storage.local_path(dataset.s3_key)
             suffix = path.suffix.lower()
+            con = self._duckdb.connect(database=":memory:")
+            con.execute("SET memory_limit = '512MB'")
+            con.execute("SET threads = 2")
             if suffix in {".csv", ".tsv"}:
-                df = pd.read_csv(path, sep="\t" if suffix == ".tsv" else ",")
-            elif suffix in {".xlsx", ".xls"}:
-                df = pd.read_excel(path)
-            elif suffix == ".json":
-                df = pd.read_json(path)
+                options = csv_options(path)
+                if options["encoding"] in {"utf-8", "utf-8-sig"}:
+                    con.read_csv(str(path), delimiter=options["sep"],
+                                 sample_size=-1, strict_mode=True, header=True,
+                                 na_values=CSV_NULL_VALUES).create_view("source_data")
+                    con.execute("CREATE TABLE data AS SELECT * FROM source_data")
+                    con.execute("DROP VIEW source_data")
+                else:
+                    # DuckDB does not ship legacy encoding support by default.
+                    con.register("source_data", read_dataset(path))
+                    con.execute("CREATE TABLE data AS SELECT * FROM source_data")
+                    con.unregister("source_data")
+            elif suffix in {".xlsx", ".xls", ".json", ".parquet"}:
+                df = read_dataset(path)
+                con.register("data", df)
             else:
                 return {"status": "error", "error": f"unsupported dataset format {suffix}"}
 
-            con = self._duckdb.connect(database=":memory:")
-            con.register("data", df)
-            result = con.execute(sql).fetch_df().head(max_rows)
-            con.close()
+            # Regex checks alone miss aliases/extensions and replacement scans.
+            # Materialize the one trusted file, then disable every external scan
+            # for the untrusted query and prevent it from restoring settings.
+            con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
+            timer = threading.Timer(30, con.interrupt)
+            timer.daemon = True
+            timer.start()
+            limit = max(1, min(int(max_rows), 1000))
+            cursor = con.execute(f"SELECT * FROM ({sql.strip().rstrip(';')}) AS weave_result LIMIT ?",
+                                 [limit + 1])
+            columns = [str(item[0]) for item in cursor.description]
+            rows = cursor.fetchall()
+            truncated = len(rows) > limit
+            rows = rows[:limit]
             return {
                 "status": "ok",
-                "columns": [str(c) for c in result.columns],
-                "rows": result.astype(object).where(result.notna(), None).values.tolist(),
-                "row_count": int(len(result)),
+                "columns": columns,
+                "rows": [[_public_value(value) for value in row] for row in rows],
+                "row_count": len(rows), "truncated": truncated,
+                "dataset_id": getattr(dataset, "id", None),
+                "dataset_name": getattr(dataset, "original_filename", path.name),
             }
         except Exception as exc:  # noqa: BLE001
             return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if con is not None:
+                con.close()
+
+
+def _public_value(value):
+    from datetime import date, datetime, time
+    from decimal import Decimal
+    if isinstance(value, (date, datetime, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_public_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _public_value(item) for key, item in value.items()}
+    if isinstance(value, bytes):
+        import base64
+        return base64.b64encode(value).decode("ascii")
+    return value
 
 
 _service: WarehouseService | None = None

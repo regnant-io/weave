@@ -40,6 +40,47 @@ class RenderClient:
     def _base(self) -> str:
         return (settings.render_service_url or "").rstrip("/")
 
+    def _post(self, endpoint: str, payload: dict, timeout: float):
+        """POST to the render service. Returns (response, None) or (None, error result).
+
+        Every failure becomes a tool result the model can act on. The service
+        answers a bad spec with 400 and a precise reason ("encoding refers to
+        `Yield`, which is not in the data"); `raise_for_status()` turned that
+        into "HTTPStatusError: 400 Bad Request", which told the model nothing
+        and led to a blind rewrite of a spec that needed one word changed.
+        """
+        try:
+            r = self._httpx.post(f"{self._base()}{endpoint}", json=payload, timeout=timeout)
+        except self._httpx.TimeoutException:
+            return None, {"status": "error", "code": "render_timeout", "retryable": True,
+                          "error": "the render service took too long; simplify the spec "
+                                   "or reduce the amount of data, then try again"}
+        except self._httpx.HTTPError as exc:
+            return None, {"status": "unavailable", "code": "render_unreachable",
+                          "retryable": True,
+                          "error": f"the render service is not reachable ({type(exc).__name__})"}
+        if r.status_code < 400:
+            return r, None
+        message = ""
+        if r.headers.get("content-type", "").startswith("application/json"):
+            try:
+                body = r.json()
+                message = str(body.get("error") or body.get("note") or "")
+            except ValueError:
+                message = ""
+        if r.status_code == 413:
+            return None, {"status": "error", "code": "too_large", "retryable": True,
+                          "error": message or "the request is too large to render; "
+                                              "reduce the data or the code size"}
+        if r.status_code in {429, 503}:
+            return None, {"status": "error", "code": "render_busy", "retryable": True,
+                          "error": "the render service is busy; try the same call again"}
+        if r.status_code < 500:
+            return None, {"status": "error", "code": "invalid_spec", "retryable": True,
+                          "error": message or f"the renderer rejected the spec (HTTP {r.status_code})"}
+        return None, {"status": "error", "code": "render_failed", "retryable": True,
+                      "error": message or f"the render service failed (HTTP {r.status_code})"}
+
     def _save(self, data: bytes, name: str, mime: str) -> dict:
         key = f"render/{uuid.uuid4().hex[:8]}_{name}"
         storage.put_bytes(key, data)
@@ -69,12 +110,12 @@ class RenderClient:
     def chart(self, spec: dict, fmt: str = "svg", theme: str = "light") -> dict:
         import base64
         want_png = fmt == "png"
-        r = self._httpx.post(
-            f"{self._base()}/chart",
-            json={"spec": spec, "format": "png" if want_png else "json", "theme": theme},
+        r, error = self._post(
+            "/chart", {"spec": spec, "format": "png" if want_png else "json", "theme": theme},
             timeout=30,
         )
-        r.raise_for_status()
+        if error:
+            return error
         body = r.json()
         svg = body.get("svg", "")
         files = [self._save(svg.encode("utf-8"), "chart.svg", "image/svg+xml")]
@@ -86,16 +127,18 @@ class RenderClient:
     # -- decks ----------------------------------------------------------------
     def deck(self, slides: list[dict], title: str = "Weave deck", theme: str = "light",
              fmt: str = "html", subtitle: str = "") -> dict:
-        r = self._httpx.post(f"{self._base()}/deck",
-                             json={"slides": slides, "title": title,
-                                   "subtitle": subtitle, "theme": theme}, timeout=30)
-        r.raise_for_status()
+        if fmt == "pdf" and not self.pdf_enabled:
+            return {"status": "unavailable", "code": "pdf_export_unavailable",
+                    "retryable": False,
+                    "error": "PDF export is unavailable in this distribution. "
+                             "Use format 'html' to create the presentation."}
+        r, error = self._post("/deck", {"slides": slides, "title": title,
+                                        "subtitle": subtitle, "theme": theme}, timeout=30)
+        if error:
+            return error
         html = r.text
         files = [self._save(html.encode("utf-8"), "deck.html", "text/html")]
         if fmt == "pdf":
-            if not self.pdf_enabled:
-                return {"status": "ok", "output_files": files,
-                        "note": "PDF export needs Gotenberg (WEAVE_GOTENBERG_URL)"}
             pdf = self._html_to_pdf(html)
             files.append(self._save(pdf, "deck.pdf", "application/pdf"))
         return {"status": "ok", "output_files": files}
@@ -112,15 +155,13 @@ class RenderClient:
                 title: str, tool: str, spec: dict, source: dict | None = None) -> dict:
         from . import visuals
 
-        r = self._httpx.post(f"{self._base()}{endpoint}", json=payload, timeout=45)
         # A spec the renderer rejects (bad expression, empty node list) comes back
         # as 400 with a usable message. Surfacing it verbatim lets the model
         # correct itself on the next tool call instead of silently shipping a
         # blank artifact.
-        if r.status_code == 400:
-            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            return {"status": "error", "error": body.get("error", "invalid spec")}
-        r.raise_for_status()
+        r, error = self._post(endpoint, payload, timeout=45)
+        if error:
+            return error
         body = r.json()
         if body.get("status") != "ok" or not body.get("html"):
             return {"status": body.get("status", "error"),
@@ -139,6 +180,9 @@ class RenderClient:
                 "mime": "text/html",
                 "bytes": len(body["html"].encode("utf-8")),
             }],
+            # What the renderer adapted (e.g. a redeclared `engine`), so the
+            # model learns the contract instead of repeating the habit.
+            **({"adjusted": body["notes"]} if body.get("notes") else {}),
         }
 
     def diagram(self, spec: dict, *, project_id: str, title: str = "Diagram",

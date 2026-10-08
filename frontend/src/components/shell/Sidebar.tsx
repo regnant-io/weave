@@ -76,13 +76,14 @@ export default function Sidebar({
       <Link
         href={href}
         onClick={() => setMobileOpen(false)}
-        className={`group relative flex items-center gap-3 px-3 py-2 text-sm transition-colors duration-fast ease-soft ${
-          active ? "text-fg" : "text-fg-muted hover:text-fg"
+        aria-current={active ? "page" : undefined}
+        className={`group relative flex items-center gap-3 rounded-md px-3 py-2 text-[13px] font-medium transition-colors duration-fast ease-soft ${
+          active ? "sidebar-nav-active" : "hover:bg-white/5"
         }`}
       >
-        {/* Active state is an editorial rule, not a filled pill. */}
         <span
-          className={`absolute left-0 top-1/2 h-4 w-[2px] -translate-y-1/2 bg-accent transition-all duration-300 ease-expo ${
+          aria-hidden="true"
+          className={`sidebar-active-indicator absolute left-0 top-1/2 h-4 w-[2px] -translate-y-1/2 bg-accent transition-all duration-300 ease-expo ${
             active ? "opacity-100" : "scale-y-0 opacity-0"
           }`}
         />
@@ -111,13 +112,13 @@ export default function Sidebar({
           content column gets the entire viewport when the user wants focus.
         */
         style={{ width: collapsed ? 0 : undefined }}
-        className={`fixed inset-y-0 left-0 z-50 flex w-[268px] flex-col overflow-hidden border-r border-border bg-bg-subtle
+        className={`weave-sidebar fixed inset-y-0 left-0 z-50 flex w-[252px] flex-col overflow-hidden border-r
           transition-transform duration-panel ease-expo
           md:static md:translate-x-0 md:transition-[width] md:duration-panel md:ease-expo
-          ${collapsed ? "md:w-0 md:border-r-0" : "md:w-[268px]"}
+          ${collapsed ? "md:w-0 md:border-r-0" : "md:w-[252px]"}
           ${mobileOpen ? "translate-x-0" : "-translate-x-full"}`}
       >
-        <div className="flex h-full w-[268px] flex-col">
+        <div className="flex h-full w-[252px] flex-col">
           {/* brand */}
           <div className="flex h-16 items-center gap-2 px-4">
             <Link
@@ -129,24 +130,24 @@ export default function Sidebar({
             </Link>
             <button
               onClick={toggle}
-              className="ml-auto hidden h-8 w-8 items-center justify-center text-fg-faint transition-colors duration-fast hover:text-fg md:flex"
+              className="sidebar-toggle ml-auto hidden h-8 w-8 items-center justify-center transition-colors duration-fast md:flex"
               title={sw ? "Ficha kando" : "Hide sidebar"}
             >
               <IcoPanelClose />
             </button>
             <button
               onClick={() => setMobileOpen(false)}
-              className="ml-auto grid h-8 w-8 place-items-center text-fg-faint transition-colors duration-fast hover:text-fg md:hidden"
+              className="ml-auto grid h-8 w-8 place-items-center transition-colors duration-fast md:hidden"
               aria-label={sw ? "Funga" : "Close"}
             >
               <IcoClose />
             </button>
           </div>
 
-          <div className="mx-4 h-px bg-border" />
+          <div className="sidebar-separator mx-4 h-px border-t" />
 
           {/* nav */}
-          <nav className="flex flex-col gap-0.5 py-3 pl-1 pr-2">
+          <nav aria-label={sw ? "Urambazaji mkuu" : "Main navigation"} className="flex flex-col gap-1 px-3 py-4">
             <NavItem href="/app/projects" icon={IcoProjects} label={t("projects", language)} />
             <NavItem href="/app/library" icon={IcoLibrary} label={t("library", language)} />
             <NavItem href="/app/settings" icon={IcoSettings} label={t("settings", language)} />
@@ -154,11 +155,11 @@ export default function Sidebar({
 
           {/* current project */}
           {project && (
-            <div className="mx-4 border-t border-border pt-3">
-              <div className="eyebrow mb-1">{sw ? "Mradi" : "Project"}</div>
-              <div className="truncate text-sm font-medium">{project.title}</div>
+            <div className="sidebar-separator mx-4 border-t pt-3">
+              <div className="sidebar-label mb-1.5 font-mono text-[9px] uppercase tracking-[0.1em]">{sw ? "Mradi" : "Project"}</div>
+              <div className="truncate text-[13px] font-semibold">{project.title}</div>
               <div
-                className={`mt-0.5 text-[11px] ${
+                className={`mt-1 text-[10px] uppercase tracking-wide ${
                   project.mode === "researcher" ? "text-warn" : "text-accent"
                 }`}
               >
@@ -184,14 +185,14 @@ export default function Sidebar({
           )}
 
           {/* bottom prefs */}
-          <div className="mt-auto flex items-center gap-2 border-t border-border p-3">
+          <div className="sidebar-separator mt-auto flex items-center gap-2 border-t p-3">
             <div className="flex border border-border">
               {(["sw", "en"] as Language[]).map((l) => (
                 <button
                   key={l}
                   onClick={() => setLang(l)}
                   className={`px-2 py-1 font-mono text-[10px] uppercase tracking-widest transition-colors duration-fast ${
-                    language === l ? "bg-fg text-bg" : "text-fg-muted hover:text-fg"
+                    language === l ? "sidebar-language-active" : "hover:bg-white/5"
                   }`}
                 >
                   {l}
@@ -208,7 +209,7 @@ export default function Sidebar({
             {authed && (
               <button
                 onClick={logout}
-                className="ml-auto grid h-8 w-8 place-items-center text-fg-muted transition-colors duration-fast hover:text-danger"
+                className="sidebar-logout ml-auto grid h-8 w-8 place-items-center text-fg-muted transition-colors duration-fast hover:text-danger"
                 title={t("logout", language)}
               >
                 <IcoLogout />

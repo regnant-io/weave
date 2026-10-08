@@ -1,81 +1,100 @@
-"""Lightweight dataset profiling (architecture 3, step 1: a profiling job).
-
-Runs on upload to populate `Dataset.column_profile` so the Orchestration Service
-can hand the model a schema/profile as context without shipping the raw data.
-Degrades gracefully if pandas is unavailable on the host.
-"""
+"""Bounded profiling with explicit scope for every sampled statistic."""
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 from typing import Any
+
+from ..sandbox.datasets import csv_options, read_dataset
+
+PROFILE_ROWS = 10_000
+
+
+def _kind(pd, col) -> str:
+    if pd.api.types.is_bool_dtype(col):
+        return "categorical"
+    if pd.api.types.is_numeric_dtype(col):
+        return "numeric"
+    if pd.api.types.is_datetime64_any_dtype(col):
+        return "datetime"
+    return "categorical"
 
 
 def profile_dataset(path: Path) -> dict[str, Any]:
     try:
-        import numpy as np
         import pandas as pd
-    except ImportError:  # pragma: no cover - host without the scientific stack
-        return {"available": False, "reason": "pandas/numpy not installed on host"}
+    except ImportError:  # pragma: no cover
+        return {"available": False, "reason": "pandas not installed on host"}
 
-    suffix = path.suffix.lower()
+    path = Path(path)
     try:
-        if suffix == ".csv":
-            df = pd.read_csv(path)
-        elif suffix == ".tsv":
-            df = pd.read_csv(path, sep="\t")
-        elif suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(path)
-        elif suffix == ".json":
-            df = pd.read_json(path)
+        row_count, nulls, kinds = 0, {}, {}
+        if path.suffix.lower() in {".csv", ".tsv"}:
+            df = None
+            with pd.read_csv(path, chunksize=PROFILE_ROWS, **csv_options(path)) as reader:
+                for chunk in reader:
+                    if df is None:
+                        df = chunk
+                    row_count += len(chunk)
+                    for name in chunk.columns:
+                        nulls[name] = nulls.get(name, 0) + int(chunk[name].isna().sum())
+                        if chunk[name].notna().any():
+                            kinds.setdefault(name, set()).add(_kind(pd, chunk[name]))
+            if df is None:
+                raise ValueError("dataset contains no header")
         else:
-            return {"available": False, "reason": f"unsupported format {suffix}"}
-    except Exception as exc:  # noqa: BLE001
-        return {"available": False, "reason": f"could not parse: {exc}"}
+            full = read_dataset(path)
+            row_count = len(full)
+            nulls = {name: int(full[name].isna().sum()) for name in full.columns}
+            kinds = {name: {_kind(pd, full[name])} for name in full.columns}
+            df = full.head(PROFILE_ROWS)
 
-    columns = []
-    for name in df.columns:
-        col = df[name]
-        dtype = str(col.dtype)
-        info: dict[str, Any] = {
-            "name": str(name),
-            "dtype": dtype,
-            "non_null": int(col.notna().sum()),
-            "null": int(col.isna().sum()),
-            "unique": int(col.nunique(dropna=True)),
-        }
-        if pd.api.types.is_numeric_dtype(col):
-            desc = col.describe()
-            info["kind"] = "numeric"
-            info["stats"] = {
-                "mean": _f(desc.get("mean")),
-                "std": _f(desc.get("std")),
-                "min": _f(desc.get("min")),
-                "q25": _f(desc.get("25%")),
-                "median": _f(desc.get("50%")),
-                "q75": _f(desc.get("75%")),
-                "max": _f(desc.get("max")),
+        sampled = row_count > len(df)
+        columns = []
+        for name in df.columns:
+            col = df[name]
+            seen = kinds.get(name, set())
+            kind = "mixed" if len(seen) > 1 else _kind(pd, col)
+            values = col.dropna().map(_value)
+            info: dict[str, Any] = {
+                "name": str(name), "dtype": "mixed" if kind == "mixed" else str(col.dtype),
+                "kind": kind, "non_null": row_count - nulls[name], "null": nulls[name],
+                "unique": int(values.nunique()), "statistics_rows": len(df),
+                "statistics_scope": "first_rows" if sampled else "full_dataset",
             }
-        elif pd.api.types.is_datetime64_any_dtype(col):
-            info["kind"] = "datetime"
-        else:
-            info["kind"] = "categorical"
-            top = col.astype(str).value_counts().head(5)
-            info["top_values"] = [{"value": str(k), "count": int(v)} for k, v in top.items()]
-        columns.append(info)
+            if kind == "numeric":
+                desc = col.describe()
+                info["stats"] = {key: _f(desc.get(source)) for key, source in {
+                    "mean": "mean", "std": "std", "min": "min", "q25": "25%",
+                    "median": "50%", "q75": "75%", "max": "max",
+                }.items()}
+                info["non_finite"] = int(col.dropna().map(lambda v: not math.isfinite(float(v))).sum())
+            elif kind != "datetime":
+                top = values.value_counts().head(5)
+                info["top_values"] = [{"value": str(k)[:160], "count": int(v)} for k, v in top.items()]
+            columns.append(info)
+        warnings = []
+        if sampled:
+            warnings.append(f"Statistics, unique counts and top values describe only the first {len(df)} rows; row and null counts cover the full dataset. Execute analysis for full-data conclusions.")
+        if path.suffix.lower() in {".xls", ".xlsx"}:
+            warnings.append("Only the first worksheet is loaded.")
+        return {"available": True, "row_count": row_count, "column_count": len(df.columns),
+                "columns": columns, "sampled": sampled, "statistics_rows": len(df),
+                "statistics_scope": "first_rows" if sampled else "full_dataset",
+                "memory_bytes": int(df.memory_usage(deep=True).sum()),
+                "memory_scope": "profile_sample", "warnings": warnings}
+    except Exception as exc:  # noqa: BLE001 - parsing failure is explicit dataset state
+        return {"available": False, "reason": f"could not parse: {type(exc).__name__}: {exc}"}
 
-    return {
-        "available": True,
-        "row_count": int(len(df)),
-        "column_count": int(df.shape[1]),
-        "columns": columns,
-        "memory_bytes": int(df.memory_usage(deep=True).sum()),
-    }
+
+def _value(value) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
 
 
-def _f(v) -> float | None:
+def _f(value) -> float | None:
     try:
-        import math
-        f = float(v)
-        return None if math.isnan(f) else round(f, 6)
+        number = float(value)
+        return round(number, 6) if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None

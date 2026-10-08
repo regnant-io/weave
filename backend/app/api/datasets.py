@@ -143,7 +143,10 @@ async def upload_dataset(
     db.refresh(dataset)
 
     job_id = None
-    if settings.redis_url and not settings.celery_always_eager:
+    if (settings.redis_url and not settings.celery_always_eager) or settings.environment == "desktop":
+        # Release SQLite's read transaction before the background worker opens
+        # its own session. Large files must not keep the upload request open.
+        db.commit()
         from ..tasks import dispatch
         job_id = dispatch("weave.profile_dataset", dataset.id,
                           job_owner_id=user.id, job_project_id=project.id)
@@ -158,7 +161,8 @@ async def upload_dataset(
         record.response = {"dataset_id": dataset.id, "status": dataset.status,
                            **({"job_id": job_id} if job_id else {})}
         db.add(record)
-        db.commit()
+    db.add(dataset)
+    db.commit()
     return DatasetOut.model_validate(dataset)
 
 

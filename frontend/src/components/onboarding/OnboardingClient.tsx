@@ -100,8 +100,8 @@ export default function OnboardingClient({
       "Weave works fully in both Kiswahili and English. You can switch at any time, mid-conversation.",
     ],
     mode: [
-      "Hii inabadilisha jinsi Weave inavyojibu — si kile inachojua.",
-      "This changes how Weave answers you — not what it knows.",
+      "Hii inabadilisha jinsi Weave inavyojibu, si kile inachojua.",
+      "This changes how Weave answers you, not what it knows.",
     ],
     field: [
       "Hutumika kuchagua vyanzo na mifano inayokufaa. Si lazima.",
@@ -112,8 +112,8 @@ export default function OnboardingClient({
       "Switch on what you want used by default. Weave will still reach for the others when a question needs them.",
     ],
     project: [
-      "Kila kitu kinaishi ndani ya mradi — mazungumzo, data, dhana, na taswira.",
-      "Everything lives inside a project — conversations, datasets, hypotheses, and visuals.",
+      "Kila kitu kinaishi ndani ya mradi: mazungumzo, data, dhana, na taswira.",
+      "Everything lives inside a project: conversations, datasets, hypotheses, and visuals.",
     ],
   };
 
@@ -313,10 +313,18 @@ export default function OnboardingClient({
 
               {id === "project" && (
                 <div>
-                  <label className="eyebrow mb-2 block">
+                  <label htmlFor="onboarding-project-title" className="eyebrow mb-2 block">
                     {sw ? "Jina la mradi" : "Project name"}
                   </label>
+                  {/*
+                    A boxed field with real inner padding, like the rest of the
+                    app's inputs. The underline version had px-0, so the text
+                    sat flush against the edge and the autofocus outline was
+                    drawn tight around it. Static on purpose: focus changes the
+                    border colour and adds a soft ring, with no animation.
+                  */}
                   <input
+                    id="onboarding-project-title"
                     value={projectTitle}
                     onChange={(e) => setProjectTitle(e.target.value)}
                     onKeyDown={(e) => {
@@ -328,7 +336,7 @@ export default function OnboardingClient({
                         ? "k.m. Athari za mvua kwenye mavuno ya mahindi"
                         : "e.g. Rainfall and maize yield in Iringa"
                     }
-                    className="w-full border-b-2 border-border bg-transparent px-0 py-2.5 font-read text-lg outline-none transition-colors duration-fast placeholder:italic placeholder:text-fg-faint focus:border-accent"
+                    className="min-h-12 w-full rounded-md border border-border bg-surface px-4 py-3 font-read text-lg text-fg outline-none placeholder:italic placeholder:text-fg-faint focus:border-accent focus:shadow-[0_0_0_3px_var(--accent-soft)] focus-visible:outline-none"
                   />
                   <p className="mt-3 text-[13px] text-fg-faint">
                     {sw

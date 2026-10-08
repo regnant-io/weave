@@ -7,7 +7,6 @@ else).
 """
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -24,8 +23,11 @@ class AnalysisService:
 
     def profile(self, dataset: Dataset, db: Session) -> None:
         """Populate a dataset's profile from its stored object."""
-        local = storage.local_path(dataset.s3_key)
-        prof = profile_dataset(local)
+        try:
+            local = storage.local_path(dataset.s3_key)
+            prof = profile_dataset(local)
+        except Exception as exc:  # noqa: BLE001 - persist storage failures too
+            prof = {"available": False, "reason": f"dataset storage unavailable: {type(exc).__name__}: {exc}"}
         dataset.column_profile = prof
         dataset.row_count = prof.get("row_count")
         dataset.status = "ready" if prof.get("available") else "error"
@@ -44,10 +46,24 @@ class AnalysisService:
         """Execute code in the sandbox, persist output files to storage, record the
         AnalysisRun and a separate SandboxAudit entry (architecture 8.4 item 5)."""
         dataset_path: Path | None = None
+        problem = None
         if dataset is not None:
-            dataset_path = storage.local_path(dataset.s3_key)
+            if dataset.status != "ready":
+                problem = "Dataset is not ready for analysis: " + str((dataset.column_profile or {}).get("reason") or dataset.status)
+            else:
+                try:
+                    dataset_path = storage.local_path(dataset.s3_key)
+                    if not dataset_path.is_file():
+                        problem = "Dataset file is missing; upload the dataset again."
+                except Exception as exc:  # noqa: BLE001
+                    problem = f"Dataset storage unavailable: {type(exc).__name__}: {exc}"
 
-        result: SandboxResult = self.sandbox.run(code, dataset_path=dataset_path, heavy=heavy)
+        if problem:
+            import hashlib
+            result = SandboxResult(status="error", stderr=problem,
+                                   code_hash=hashlib.sha256(code.encode()).hexdigest())
+        else:
+            result = self.sandbox.run(code, dataset_path=dataset_path, heavy=heavy)
 
         # persist output files to object storage; store references on the run
         output_refs = []

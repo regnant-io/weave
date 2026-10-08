@@ -29,7 +29,8 @@ def _sanitize(text: str) -> str:
     return _INJECTION_RE.sub("[removed]", text or "")
 
 
-def _chunk(text: str, title: str, url: str, target_words: int = 140, max_chunks: int = 3) -> list[dict]:
+def _chunk(text: str, title: str, url: str, target_words: int = 140, max_chunks: int = 3,
+           published: str = "") -> list[dict]:
     text = _sanitize(text)
     words = text.split()
     chunks = []
@@ -42,15 +43,29 @@ def _chunk(text: str, title: str, url: str, target_words: int = 140, max_chunks:
             "url": url, "source_type": "web", "access_status": "open",
             "language": "mixed", "predatory_flag": False, "content": content,
             "score": 0.0,
+            # When the page says when it was published, so a two-year-old
+            # article is visibly two years old to the model and in citations.
+            **({"published": published} if published else {}),
         })
     return chunks
 
 
 def _refine(query: str, seen_titles: list[str], round_idx: int) -> str:
-    """Naive query refinement for later rounds: bias toward specifics/recency."""
+    """Later rounds widen the net without changing the subject.
+
+    These used to append "statistics data report" and "study evidence" to every
+    query, which dragged a question like "Thinking Machines' recent work"
+    toward statistics pages. Recency and analysis are neutral widenings that
+    surface pages the first round's ranking missed; seen URLs are skipped.
+    """
     if round_idx == 0:
         return query
-    hint = "statistics data report" if round_idx == 1 else "study evidence"
+    from ..clock import now
+    # The CURRENT year, never a remembered one: this round exists to surface
+    # what the first round's ranking buried, and recency is what it buries.
+    hint = str(now().year) if round_idx == 1 else "analysis"
+    if hint in query:
+        hint = "latest"
     return f"{query} {hint}"
 
 
@@ -84,11 +99,14 @@ def deep_research(
     # top images for the in-chat grid (emitted once by the orchestrator)
     images = client.search_images(query, n=4, language=language)
 
+    outages: list[str] = []
     for r in range(rounds):
         q = _refine(query, seen_titles, r)
         queries.append(q)
         _emit("searching", {"round": r + 1, "query": q})
-        results = client.search(q, language=language)
+        results, outage = client.search_detailed(q, language=language)
+        if outage:
+            outages.append(outage)
         _emit("search_results", {"round": r + 1, "count": len(results),
                                  "results": [{"title": x.title, "url": x.url} for x in results[:8]]})
 
@@ -104,7 +122,8 @@ def deep_research(
                 _emit("fetch_skipped", {"url": res.url, "reason": page.error or "too little text"})
                 continue
             seen_titles.append(page.title or res.title)
-            chunks = _chunk(page.text, page.title or res.title, res.url)
+            chunks = _chunk(page.text, page.title or res.title, res.url,
+                            published=getattr(page, "published", ""))
             passages.extend(chunks)
             _emit("extracted", {"url": res.url, "chunks": len(chunks),
                                 "chars": len(page.text)})
@@ -115,5 +134,9 @@ def deep_research(
 
     _emit("research", {"status": "done", "pages_read": len(seen_urls),
                        "passages": len(passages)})
+    # Every round failed to reach a search provider: that is an outage, not an
+    # absence of sources, and the caller must be able to tell the difference.
+    unreachable = len(outages) == len(queries) and not passages
     return {"passages": passages, "pages_read": len(seen_urls),
-            "queries": queries, "available": True, "images": images}
+            "queries": queries, "available": not unreachable, "images": images,
+            **({"error": outages[-1]} if unreachable else {})}

@@ -38,6 +38,43 @@ const MAX_ASSET_BYTES = 24 * 1024 * 1024;
  * so any mesh, texture or sound it needs has to travel with it. The backend
  * reads those bytes out of the project workspace and passes them here.
  */
+/**
+ * Adapt the Babylon boilerplate models write by habit to the harness contract.
+ *
+ * Every Babylon sample on the web opens with
+ *     const canvas = document.getElementById("renderCanvas");
+ *     const engine = new BABYLON.Engine(canvas, true);
+ * and ends with `const scene = createScene(); engine.runRenderLoop(...)`.
+ * Inside our `createScene(engine, canvas, ...)` body the first two are
+ * redeclarations of parameters, a SyntaxError before a single line runs, and
+ * the last never returns the scene. Each came back to the model as a repair
+ * round for code that was, by the standards it learned from, correct.
+ *
+ * The rewrites keep the model's statements and change only the binding:
+ *   * `const engine = X`  ->  `engine = engine || X`   (X is never evaluated)
+ *   * `const canvas = X`  ->  `canvas = canvas || X`
+ *   * a fallback `return` of `scene` / `createScene()` appended to the body,
+ *     unreachable when the code already returns.
+ * Runtime behaviour of well-formed scene code is unchanged.
+ */
+export function adoptHarnessContract(code) {
+  const adjustments = [];
+  let out = code.replace(
+    /(^|[;{}\n]\s*)(?:const|let|var)\s+(engine|canvas)\s*=(?!=)/g,
+    (_match, lead, name) => {
+      adjustments.push(`reused the provided \`${name}\` instead of redeclaring it`);
+      return `${lead}${name} = ${name} ||`;
+    },
+  );
+  out = out.replace(/(^|[;{}\n]\s*)(?:let|var)\s+(engine|canvas)\s*;/g, (_m, lead) => lead);
+  out +=
+    "\n;/* weave: fallback when the scene is built but not returned */\n" +
+    "return (typeof scene !== 'undefined' && scene && typeof scene.render === 'function')\n" +
+    "  ? scene\n" +
+    "  : (typeof createScene === 'function' ? createScene(engine, canvas, BABYLON, assets) : undefined);\n";
+  return { code: out, adjustments: [...new Set(adjustments)] };
+}
+
 function buildAssets(assets) {
   const out = {};
   let total = 0;
@@ -92,7 +129,10 @@ export function renderBabylon({
   // already inline, and reject the rest with a message that names the specifier.
   const prepared = prepareScript(code, { allowModule: false });
   if (!prepared.ok) return { status: "error", error: prepared.error };
-  code = prepared.code;
+  // Measured on the model's own code, before the fallback return is added.
+  const returnsSomething = /\breturn\b/.test(prepared.code);
+  const adopted = adoptHarnessContract(prepared.code);
+  code = adopted.code;
 
   /*
     COMPILE IT HERE, BEFORE IT EVER REACHES A BROWSER.
@@ -138,8 +178,6 @@ export function renderBabylon({
     returned through a helper) is rare enough that a WARNING in the page is the
     right severity rather than a rejection.
   */
-  const returnsSomething = /\breturn\b/.test(code);
-
   const built = buildAssets(assets);
   if (built.error) return { status: "error", error: built.error };
 
@@ -202,9 +240,9 @@ ${controls ? `<div id="hints">${esc(controls)}</div>` : ""}
 <div id="boot">Loading scene…</div>
 <div id="err"></div>
 
-<script>${babylonSrc}</script>
-${loadersSrc ? `<script>${loadersSrc}</script>` : ""}
-${guiSrc ? `<script>${guiSrc}</script>` : ""}
+<script data-weave-lib="babylon">${babylonSrc}</script>
+${loadersSrc ? `<script data-weave-lib="babylon-loaders">${loadersSrc}</script>` : ""}
+${guiSrc ? `<script data-weave-lib="babylon-gui">${guiSrc}</script>` : ""}
 
 <script>
 /*
@@ -276,6 +314,25 @@ ${guiSrc ? `<script>${guiSrc}</script>` : ""}
 
   ${physics ? "try { if (BABYLON.CannonJSPlugin && window.CANNON) { /* physics plugin available */ } } catch (e) {}" : ""}
 
+  /*
+    The scene's OWN render loop, when it registers one, is adopted rather than
+    doubled. Sample code ends with engine.runRenderLoop(() => scene.render()),
+    often with per-frame game logic in it; adding the harness loop on top
+    rendered every frame twice. Wrapped so a throw inside it reaches the error
+    panel instead of repeating 60 times a second.
+  */
+  var userLoops = 0;
+  var nativeLoop = engine.runRenderLoop.bind(engine);
+  engine.runRenderLoop = function (fn) {
+    userLoops += 1;
+    return nativeLoop(function () {
+      try { fn(); } catch (e) {
+        engine.stopRenderLoop();
+        fail(e && e.message ? e.message : String(e));
+      }
+    });
+  };
+
   window.__weaveBoot = function () {
     var make = window.__weaveCreateScene;
     if (typeof make !== 'function') {
@@ -333,22 +390,32 @@ ${guiSrc ? `<script>${guiSrc}</script>` : ""}
   var frames = 0;
   var booted = false;
 
-  engine.runRenderLoop(function () {
-    try {
-      scene.render();
-      if (!booted && ++frames > 2) {
-        booted = true;
-        var boot = document.getElementById('boot');
-        if (boot) boot.classList.add('gone');
-      }
-      if (fpsEl && (frames & 31) === 0) fpsEl.textContent = engine.getFps().toFixed(0) + ' fps';
-    } catch (e) {
-      // Stop the loop on the FIRST render failure. Left running it would repeat
-      // the same exception 60 times a second and lock the tab.
-      engine.stopRenderLoop();
-      fail(e && e.message ? e.message : String(e));
+  function frameDone() {
+    frames++;
+    if (!booted && frames > 2) {
+      booted = true;
+      var boot = document.getElementById('boot');
+      if (boot) boot.classList.add('gone');
     }
-  });
+    if (fpsEl && (frames & 31) === 0) fpsEl.textContent = engine.getFps().toFixed(0) + ' fps';
+  }
+
+  if (userLoops > 0) {
+    // The scene drives its own frames; only observe them.
+    scene.onAfterRenderObservable.add(frameDone);
+  } else {
+    nativeLoop(function () {
+      try {
+        scene.render();
+        frameDone();
+      } catch (e) {
+        // Stop the loop on the FIRST render failure. Left running it would
+        // repeat the same exception 60 times a second and lock the tab.
+        engine.stopRenderLoop();
+        fail(e && e.message ? e.message : String(e));
+      }
+    });
+  }
 
     window.addEventListener('resize', function () { engine.resize(); });
     // The iframe is resized by the panel, which does not always fire a window
@@ -386,5 +453,9 @@ window.__weaveBoot();
 </script>
 </body></html>`;
 
-  return { status: "ok", html };
+  return {
+    status: "ok",
+    html,
+    ...(adopted.adjustments.length ? { notes: adopted.adjustments } : {}),
+  };
 }

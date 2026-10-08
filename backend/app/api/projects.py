@@ -1,7 +1,8 @@
 """Project routes — the persistent research workspace (architecture 4.2 / 9)."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -34,10 +35,23 @@ def create_project(
 
 
 @router.get("", response_model=list[ProjectOut])
-def list_projects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    projects = db.query(Project).filter(Project.user_id == user.id).order_by(
-        Project.created_at.desc()
-    ).all()
+def list_projects(db: Session = Depends(get_db), user: User = Depends(get_current_user),
+                  limit: int = Query(default=100, ge=1, le=500),
+                  before: str | None = None):
+    query = db.query(Project).filter(Project.user_id == user.id)
+    if before:
+        cursor = db.query(Project).filter(
+            Project.id == before, Project.user_id == user.id
+        ).first()
+        if cursor is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "project cursor not found")
+        query = query.filter(or_(
+            Project.created_at < cursor.created_at,
+            and_(Project.created_at == cursor.created_at, Project.id < cursor.id),
+        ))
+    projects = query.order_by(
+        Project.created_at.desc(), Project.id.desc()
+    ).limit(limit).all()
     return [ProjectOut.model_validate(p) for p in projects]
 
 

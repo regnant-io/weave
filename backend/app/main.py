@@ -134,7 +134,7 @@ def _preflight() -> None:
     # there is more than one worker, and nothing about the running system makes
     # that visible -- the configured number stays in the settings and stops
     # being true. See ratelimit.py.
-    if not settings.redis_url:
+    if not settings.redis_url and settings.environment != "desktop":
         log.warning(
             "SECURITY: no WEAVE_REDIS_URL, so rate limits are per-process. With N "
             "uvicorn workers the effective limit is N times the configured one. "
@@ -152,7 +152,7 @@ def _preflight() -> None:
 
     # Loud, but not fatal: these are deliberate choices with real consequences
     # if the instance is reachable from the internet.
-    if settings.workspace_enabled and settings.workspace_network:
+    if settings.workspace_enabled and settings.workspace_network and settings.environment != "desktop":
         log.warning(
             "SECURITY: the developer workspace can execute code with network access. "
             "Every VERIFIED user of this instance can run commands in a container on "
@@ -179,18 +179,45 @@ def _database_preflight() -> None:
     finally:
         db.close()
 
+def _promote_desktop_accounts() -> None:
+    """One-time repair: desktop accounts registered as `anonymous` lost every
+    verified tool. See `auth.initial_trust_tier`."""
+    from .api.auth import promote_desktop_accounts
+    from .db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        promoted = promote_desktop_accounts(db)
+        if promoted:
+            log.info("promoted %d local desktop account(s) to verified trust", promoted)
+    except Exception as exc:  # noqa: BLE001 - never block boot on a repair
+        db.rollback()
+        log.warning("could not promote desktop accounts: %s", exc)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _preflight()
     init_db()
     _database_preflight()
+    if settings.environment == "desktop":
+        from .tasks import recover_desktop_jobs
+        recover_desktop_jobs()
+        _promote_desktop_accounts()
     engine = get_engine()
     _artifact_sweeper()
     log.info("Weave gateway ready [env=%s, llm=%s, sandbox=%s, workspace=%s]",
              settings.environment, getattr(engine, "name", "offline"),
              settings.sandbox_backend,
              "on" if settings.workspace_enabled else "off")
-    yield
+    try:
+        yield
+    finally:
+        from .services.workspace import service as workspace_service
+        if workspace_service._service is not None:
+            workspace_service._service.shutdown()
 
 
 app = FastAPI(
@@ -260,10 +287,13 @@ def _database_ready() -> bool:
 
 def _capability_status() -> tuple[dict[str, bool], dict[str, bool]]:
     from .services.warehouse import get_warehouse
+    from .services.websearch import get_web_search
+
+    desktop_search = settings.environment == "desktop" and get_web_search().enabled
 
     configured = {
         "analysis_execution": settings.analysis_execution_enabled,
-        "web_search": bool(settings.searxng_url),
+        "web_search": bool(settings.searxng_url) or desktop_search,
         "browserless": bool(settings.browserless_url),
         "render_service": bool(settings.render_service_url),
         "gotenberg": bool(settings.gotenberg_url),
@@ -272,7 +302,7 @@ def _capability_status() -> tuple[dict[str, bool], dict[str, bool]]:
     }
     available = {
         **configured,
-        "web_search": _endpoint_reachable(settings.searxng_url),
+        "web_search": desktop_search or _endpoint_reachable(settings.searxng_url),
         "browserless": _endpoint_reachable(settings.browserless_url),
         "render_service": _endpoint_reachable(settings.render_service_url),
         "gotenberg": _endpoint_reachable(settings.gotenberg_url),

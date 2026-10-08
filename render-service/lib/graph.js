@@ -204,7 +204,7 @@ footer{flex:0 0 auto;padding:8px 16px;border-top:1px solid var(--border);
   <div class="body"><div id="root"></div></div>
   ${caption ? `<footer>${esc(caption)}</footer>` : ""}
 </div>
-<script>${flowSrc}</script>
+<script data-weave-lib="reactflow">${flowSrc}</script>
 <script id="graph-data" type="application/json">${jsonForScript(data)}</script>
 <script>${RUNTIME}</script>
 </body></html>`;

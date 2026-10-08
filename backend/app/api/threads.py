@@ -7,7 +7,8 @@ message list.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -38,9 +39,9 @@ def _owned_thread(db: Session, project: Project, thread_id: str) -> Thread:
     return thread
 
 
-def _to_out(db: Session, t: Thread) -> ThreadOut:
-    from sqlalchemy import func
-    count = db.query(func.count(Message.id)).filter(Message.thread_id == t.id).scalar() or 0
+def _to_out(db: Session, t: Thread, count: int | None = None) -> ThreadOut:
+    if count is None:
+        count = db.query(func.count(Message.id)).filter(Message.thread_id == t.id).scalar() or 0
     return ThreadOut(
         id=t.id, project_id=t.project_id, title=t.title or "Untitled",
         summary=t.summary or "", status=t.status,
@@ -51,7 +52,9 @@ def _to_out(db: Session, t: Thread) -> ThreadOut:
 
 @router.get("/projects/{project_id}/threads", response_model=list[ThreadOut])
 def list_threads(project_id: str, db: Session = Depends(get_db),
-                 user: User = Depends(get_current_user)):
+                 user: User = Depends(get_current_user),
+                 limit: int = Query(default=100, ge=1, le=500),
+                 before: str | None = None):
     project = _owned_project(db, project_id, user)
     memory = get_memory_service()
     # Guarantee at least one thread exists so the client never has to special-case
@@ -59,11 +62,22 @@ def list_threads(project_id: str, db: Session = Depends(get_db),
     if not db.query(Thread).filter(Thread.project_id == project.id).first():
         memory.active_thread(db, project)
         db.commit()
-    rows = (
-        db.query(Thread).filter(Thread.project_id == project.id)
-        .order_by(Thread.updated_at.desc()).all()
-    )
-    return [_to_out(db, t) for t in rows]
+    query = db.query(Thread).filter(Thread.project_id == project.id)
+    if before:
+        cursor = db.query(Thread).filter(
+            Thread.id == before, Thread.project_id == project.id
+        ).first()
+        if cursor is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "chat cursor not found")
+        query = query.filter(or_(
+            Thread.updated_at < cursor.updated_at,
+            and_(Thread.updated_at == cursor.updated_at, Thread.id < cursor.id),
+        ))
+    rows = query.order_by(Thread.updated_at.desc(), Thread.id.desc()).limit(limit).all()
+    counts = dict(db.query(Message.thread_id, func.count(Message.id)).filter(
+        Message.thread_id.in_([t.id for t in rows])
+    ).group_by(Message.thread_id).all()) if rows else {}
+    return [_to_out(db, t, counts.get(t.id, 0)) for t in rows]
 
 
 @router.post("/projects/{project_id}/threads", response_model=ThreadOut, status_code=201)
@@ -79,13 +93,24 @@ def create_thread(project_id: str, body: ThreadCreate, db: Session = Depends(get
 @router.get("/projects/{project_id}/threads/{thread_id}/messages",
             response_model=list[MessageOut])
 def thread_messages(project_id: str, thread_id: str, db: Session = Depends(get_db),
-                    user: User = Depends(get_current_user)):
+                    user: User = Depends(get_current_user),
+                    limit: int = Query(default=100, ge=1, le=200),
+                    before: str | None = None):
     project = _owned_project(db, project_id, user)
     _owned_thread(db, project, thread_id)
-    rows = (
-        db.query(Message).filter(Message.thread_id == thread_id)
-        .order_by(Message.created_at).all()
-    )
+    query = db.query(Message).filter(Message.thread_id == thread_id)
+    if before:
+        cursor = db.query(Message).filter(
+            Message.id == before, Message.thread_id == thread_id
+        ).first()
+        if cursor is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "message cursor not found")
+        query = query.filter(or_(
+            Message.created_at < cursor.created_at,
+            and_(Message.created_at == cursor.created_at, Message.id < cursor.id),
+        ))
+    rows = query.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit).all()
+    rows.reverse()
     # Skip an assistant row that holds nothing at all.
     #
     # The assistant placeholder is committed at the START of a turn (so the
@@ -103,7 +128,7 @@ def _has_content(m: Message) -> bool:
         return True
     return bool(
         (m.content_en or "").strip() or (m.content_sw or "").strip()
-        or m.tool_calls or m.artifacts
+        or m.tool_calls or m.artifacts or (m.plan or {}).get("steps")
     )
 
 

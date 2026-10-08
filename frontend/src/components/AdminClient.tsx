@@ -92,7 +92,7 @@ export default function AdminClient() {
                   <td className="py-1.5 pr-3 font-mono text-xs">{j.kind.replace("weave.", "")}</td>
                   <td className={j.status === "succeeded" ? "pr-3 text-ok" : j.status === "dead_letter" || j.status === "failed" ? "pr-3 text-danger" : "pr-3 text-warn"}>{j.status}</td>
                   <td className="pr-3">{j.attempts}</td>
-                  <td className="max-w-[24rem] truncate text-xs text-fg-muted" title={j.error}>{j.error || "—"}</td>
+                  <td className="max-w-[24rem] truncate text-xs text-fg-muted" title={j.error}>{j.error || "None"}</td>
                 </tr>
               ))}
               {jobs.length === 0 && <tr><td colSpan={4} className="py-3 text-fg-faint">No background jobs yet.</td></tr>}

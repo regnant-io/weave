@@ -3,6 +3,9 @@
 import type { LucideIcon, LucideProps } from "lucide-react";
 import {
   AlertTriangle,
+  CalendarDays,
+  ClipboardCheck,
+  GraduationCap,
   ArrowDown,
   ArrowUp,
   Atom,
@@ -109,6 +112,9 @@ export const IcoAtom = mk(Atom);
 export const IcoFlask = mk(FlaskConical);
 export const IcoNetwork = mk(Network);
 export const IcoSparkles = mk(Sparkles);
+export const IcoCalendar = mk(CalendarDays);
+export const IcoClipboard = mk(ClipboardCheck);
+export const IcoGraduation = mk(GraduationCap);
 
 /* state */
 export const IcoCheck = mk(Check);

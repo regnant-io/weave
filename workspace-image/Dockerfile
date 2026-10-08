@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv \
+      python3 python-is-python3 python3-pip python3-venv \
       git curl ca-certificates unzip zip tar gzip \
       build-essential pkg-config \
       imagemagick ffmpeg \

@@ -187,17 +187,43 @@ class RetrievalService:
                 params,
             ).fetchall()
             return [(row[0], float(row[1])) for row in rows]
-        q = db.query(SourceChunk)
-        rows = q.all()
-        scored = []
-        allowed_sources = None
+
+        # SQLite does not have pgvector. Use the indexed FTS table to narrow the
+        # candidate set before computing local cosine scores. The old fallback
+        # loaded every chunk and every 384-value embedding into Python on every
+        # search, making memory and latency grow with the entire library.
+        tokens = self._expand_query_tokens(query)
+        if not tokens:
+            return []
+        match_expr = " OR ".join(f'"{t}"' for t in tokens)
+        params: dict = {"q": match_expr, "n": min(1000, max(limit * 40, 200))}
+        type_filter = ""
         if source_types:
-            allowed_sources = {
-                s.id for s in db.query(Source.id).filter(Source.source_type.in_(source_types)).all()
-            }
+            placeholders = []
+            for i, source_type in enumerate(source_types):
+                key = f"type_{i}"
+                params[key] = source_type
+                placeholders.append(f":{key}")
+            type_filter = f" AND s.source_type IN ({', '.join(placeholders)})"
+        try:
+            candidate_ids = [row[0] for row in db.execute(
+                sql_text(
+                    "SELECT c.id FROM source_chunk_fts "
+                    "JOIN source_chunks c ON c.id = source_chunk_fts.chunk_id "
+                    "JOIN sources s ON s.id = c.source_id "
+                    "WHERE source_chunk_fts MATCH :q" + type_filter + " "
+                    "ORDER BY bm25(source_chunk_fts) LIMIT :n"
+                ),
+                params,
+            ).fetchall()]
+        except Exception:  # noqa: BLE001 - FTS may be unavailable on an old database
+            return []
+        if not candidate_ids:
+            return []
+
+        rows = db.query(SourceChunk).filter(SourceChunk.id.in_(candidate_ids)).all()
+        scored = []
         for chunk in rows:
-            if allowed_sources is not None and chunk.source_id not in allowed_sources:
-                continue
             if not chunk.embedding:
                 continue
             scored.append((chunk.id, cosine(qvec, chunk.embedding)))

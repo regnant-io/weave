@@ -51,12 +51,24 @@ export default function ThreadBar({
   const sw = language === "sw";
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [visibleThreads, setVisibleThreads] = useState(threads);
+  const [hasMoreThreads, setHasMoreThreads] = useState(threads.length >= 100);
+  const [loadingThreads, setLoadingThreads] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<Thread | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  const active = threads.find((t) => t.id === activeId) ?? threads[0];
+  const active = visibleThreads.find((t) => t.id === activeId) ?? visibleThreads[0];
+
+  useEffect(() => {
+    setVisibleThreads((current) => {
+      const byId = new Map(current.map((thread) => [thread.id, thread]));
+      for (const thread of threads) byId.set(thread.id, thread);
+      return [...byId.values()].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    });
+    if (threads.length >= 100) setHasMoreThreads(true);
+  }, [threads]);
 
   useEffect(() => {
     if (!open) return;
@@ -113,10 +125,32 @@ export default function ThreadBar({
     );
     // Land somewhere real: the next chat in the list, or whatever the server
     // auto-created if this was the last one.
-    const rest = threads.filter((x) => x.id !== t.id);
+    const rest = visibleThreads.filter((x) => x.id !== t.id);
+    setVisibleThreads(rest);
     onChanged();
     if (t.id === activeId && rest[0]) onSelect(rest[0].id);
     else if (t.id === activeId) onSelect("");
+  }
+
+  async function loadEarlierThreads() {
+    const cursor = visibleThreads.at(-1)?.id;
+    if (!cursor || loadingThreads || !hasMoreThreads) return;
+    setLoadingThreads(true);
+    try {
+      const params = new URLSearchParams({ limit: "100", before: cursor });
+      const res = await fetch(`/api/projects/${projectId}/threads?${params.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error();
+      const older: Thread[] = await res.json();
+      setVisibleThreads((current) => {
+        const ids = new Set(current.map((thread) => thread.id));
+        return [...current, ...older.filter((thread) => !ids.has(thread.id))];
+      });
+      setHasMoreThreads(older.length >= 100);
+    } catch {
+      setHasMoreThreads(false);
+    } finally {
+      setLoadingThreads(false);
+    }
   }
 
   if (!threads.length) return null;
@@ -133,10 +167,10 @@ export default function ThreadBar({
            button on the left and the options button on the right. The row is
            given the rail's height and centres its contents, which lets the pill
            keep its own smaller height without drifting off that line. */
-        className="pointer-events-none absolute left-1/2 z-30 flex w-full max-w-[min(24rem,calc(100%-8rem))] -translate-x-1/2 items-center justify-center"
+        className="pointer-events-none absolute left-1/2 z-30 flex w-full max-w-[min(24rem,calc(100%-7rem))] -translate-x-1/2 items-center justify-center"
         style={{ top: "var(--float-top)", height: "var(--float-h)" }}
       >
-        <div className="pointer-events-auto relative flex max-w-full items-center gap-1">
+        <div className="pointer-events-auto flex max-w-full min-w-0 items-center gap-1">
           <button
             onClick={() => {
               const next = !open;
@@ -145,19 +179,19 @@ export default function ThreadBar({
               // Warming the few most recent chats now means the click that
               // follows renders from cache instead of behind a spinner.
               if (next && onPrefetch) {
-                threads.slice(0, 6).forEach((t) => {
+                visibleThreads.slice(0, 6).forEach((t) => {
                   if (t.id !== activeId) onPrefetch(t.id);
                 });
               }
             }}
             aria-expanded={open}
-            aria-haspopup="menu"
+            aria-haspopup="dialog"
             className="flex min-w-0 items-center gap-1.5 rounded-full border border-border bg-surface/90 px-3 py-1 text-[12.5px] text-fg-muted shadow-sm backdrop-blur transition-colors duration-fast hover:border-border-mid hover:text-fg"
           >
             <span className="min-w-0 truncate">{active?.title || (sw ? "Gumzo" : "Chat")}</span>
-            {threads.length > 1 && (
+            {visibleThreads.length > 1 && (
               <span className="flex-shrink-0 font-mono text-[10px] text-fg-faint">
-                {threads.length}
+                {visibleThreads.length}
               </span>
             )}
             <IcoChevronDown size={12} className="chev flex-shrink-0 opacity-60" data-open={open} />
@@ -175,14 +209,15 @@ export default function ThreadBar({
 
           {open && (
             <div
-              role="menu"
-              className="animate-rise absolute left-0 top-full z-50 mt-1.5 max-h-[60vh] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto rounded-sm border border-border bg-surface shadow-lg"
+              role="dialog"
+              aria-label={sw ? "Gumzo katika mradi huu" : "Chats in this project"}
+              className="animate-rise absolute -left-14 -right-14 top-full z-50 mx-auto mt-1.5 max-h-[60vh] w-[22rem] max-w-[calc(100%+7rem)] overflow-y-auto rounded-md border border-border bg-surface shadow-lg"
             >
               <div className="eyebrow border-b border-border px-3 py-2">
                 {sw ? "Gumzo katika mradi huu" : "Chats in this project"}
               </div>
 
-              {threads.map((t) => {
+              {visibleThreads.map((t) => {
                 const isActive = t.id === activeId;
                 return (
                   <div
@@ -265,6 +300,19 @@ export default function ThreadBar({
                   </div>
                 );
               })}
+
+              {hasMoreThreads && (
+                <button
+                  type="button"
+                  onClick={() => void loadEarlierThreads()}
+                  disabled={loadingThreads}
+                  className="flex w-full items-center justify-center border-t border-border px-3 py-2 text-xs font-medium text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg disabled:opacity-60"
+                >
+                  {loadingThreads
+                    ? sw ? "Inapakia…" : "Loading…"
+                    : sw ? "Pakia gumzo za zamani" : "Load earlier chats"}
+                </button>
+              )}
 
               <button
                 onClick={newChat}

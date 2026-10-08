@@ -33,30 +33,38 @@ export default function CreateProjectForm({ language, defaultMode }: { language:
     return (
       <button
         onClick={() => setOpen(true)}
-        className="rounded-full bg-accent px-4 py-2 text-sm font-medium text-accent-fg transition-opacity hover:opacity-90"
+        className="platform-control platform-control-primary inline-flex items-center gap-2"
       >
-        + {t("newProject", language)}
+        <span aria-hidden="true" className="font-mono text-base leading-none">+</span>
+        {t("newProject", language)}
       </button>
     );
   }
 
   return (
-    <form onSubmit={create} className="w-full max-w-sm border border-border bg-surface p-4 shadow-soft">
+    <form onSubmit={create} className="platform-panel w-full max-w-sm p-4 shadow-soft">
+      <label htmlFor="project-title" className="mb-1.5 block text-xs font-medium text-fg-muted">
+        {language === "sw" ? "Jina la mradi" : "Project name"}
+      </label>
       <input
+        id="project-title"
         autoFocus
-        className="mb-3 w-full border border-border bg-bg px-3 py-2 outline-none focus:border-border-strong"
+        required
+        maxLength={255}
+        className="mb-3 min-h-10 w-full rounded-md border border-border bg-bg px-3 py-2 text-sm outline-none transition-colors focus:border-accent"
         placeholder={language === "sw" ? "Jina la mradi" : "Project title"}
         value={title}
         onChange={(e) => setTitle(e.target.value)}
       />
-      <div className="mb-3 inline-flex rounded-full border border-border bg-surface-2 p-0.5">
+      <div className="mb-3 inline-flex rounded-md border border-border bg-surface-2 p-0.5">
         {(["student", "researcher"] as Mode[]).map((m) => (
           <button
             type="button"
             key={m}
             onClick={() => setMode(m)}
-            className={`rounded-full px-3 py-1.5 text-sm transition-colors ${
-              mode === m ? "bg-accent text-accent-fg" : "text-fg-muted hover:text-fg"
+            aria-pressed={mode === m}
+            className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+              mode === m ? "bg-surface text-fg shadow-sm" : "text-fg-muted hover:text-fg"
             }`}
           >
             {t(m, language)}
@@ -66,11 +74,11 @@ export default function CreateProjectForm({ language, defaultMode }: { language:
       <div className="flex gap-2">
         <button
           disabled={loading}
-          className="rounded-full bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:opacity-90 disabled:opacity-60"
+          className="platform-control platform-control-primary disabled:cursor-wait disabled:opacity-60"
         >
-          {t("newProject", language)}
+          {loading ? (language === "sw" ? "Inaunda…" : "Creating…") : t("newProject", language)}
         </button>
-        <button type="button" onClick={() => setOpen(false)} className="rounded-full px-4 py-2 text-sm text-fg-muted hover:bg-surface-hover">
+        <button type="button" onClick={() => setOpen(false)} className="platform-control">
           {language === "sw" ? "Ghairi" : "Cancel"}
         </button>
       </div>

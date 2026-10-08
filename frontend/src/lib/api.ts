@@ -115,6 +115,7 @@ export const api = {
     try {
       return await request<{
         enabled: boolean;
+        runtime: "local" | "docker";
         image: string;
         network: boolean;
         memory_mb: number;

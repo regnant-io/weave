@@ -36,14 +36,14 @@ export default function SteerBar({
 
   const quick: Array<{ label: string; text: string; kind: string }> = sw
     ? [
-        { label: "Fupisha", text: "Kuwa mfupi zaidi — nipe jibu moja kwa moja.", kind: "focus" },
+        { label: "Fupisha", text: "Kuwa mfupi zaidi, nipe jibu moja kwa moja.", kind: "focus" },
         { label: "Ruka hii", text: "Acha unachofanya sasa na uende hatua inayofuata.", kind: "skip" },
-        { label: "Niulize", text: "Usikisie — niulize unachohitaji kujua.", kind: "ask" },
+        { label: "Niulize", text: "Usikisie, niulize unachohitaji kujua.", kind: "ask" },
       ]
     : [
-        { label: "Shorter", text: "Be much shorter — just give me the answer.", kind: "focus" },
+        { label: "Shorter", text: "Be much shorter, just give me the answer.", kind: "focus" },
         { label: "Skip this", text: "Drop what you are doing and move to the next step.", kind: "skip" },
-        { label: "Ask me", text: "Stop guessing — ask me what you need to know.", kind: "ask" },
+        { label: "Ask me", text: "Stop guessing. Ask me what you need to know.", kind: "ask" },
       ];
 
   function submit() {

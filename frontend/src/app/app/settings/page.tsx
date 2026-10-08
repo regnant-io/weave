@@ -45,7 +45,7 @@ export default async function SettingsPage() {
     return (
       <PageShell>
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">{t("settings", language)}</h1>
-        {user.role === "admin" && (
+        {(user.role === "admin" || process.env.WEAVE_ENVIRONMENT === "desktop") && (
           <div className="mb-6">
             <OllamaSettings language={language} />
           </div>

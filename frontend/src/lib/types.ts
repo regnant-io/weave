@@ -64,6 +64,7 @@ export interface ToolCall {
 }
 
 export interface Artifact {
+  visual_id?: string;
   name: string;
   mime: string;
   bytes: number;
@@ -71,10 +72,9 @@ export interface Artifact {
   url: string;
   /**
    * Whether the page was opened in a real browser and rendered without errors.
-   * `false` means it was released with known defects after the repair budget ran
-   * out — the user is being shown something that does not fully work, and the UI
-   * has to say so rather than presenting it like everything else.
-   * `undefined` means it was never gated (a chart rendered server-side to SVG).
+   * `false` means inspection is incomplete or found defects.
+   * `undefined` means no browser inspection verdict is available (for example,
+   * a chart rendered server-side to SVG).
    */
   verified?: boolean;
   /** What still fails, when `verified` is false. */
@@ -105,6 +105,7 @@ export interface Plan {
   goal?: string;
   steps: PlanStep[];
   checks?: string[];
+  _task_state?: { status?: string; phase?: string; outstanding?: string[] };
 }
 
 export interface WebImage {

@@ -43,6 +43,8 @@ single question quietly becomes a hundred model calls.
 """
 from __future__ import annotations
 
+from ..clock import date_context as _date_context
+
 import logging
 
 log = logging.getLogger("weave.subagent")
@@ -171,7 +173,8 @@ def run_delegate(
 
     agent = Agent(
         engine=engine,
-        system=_SYSTEM,
+        # A delegate researches the web too, so it needs to know what "recent" means.
+        system=_SYSTEM + "\n\n" + _date_context(web=True),
         messages=[{"role": "user", "content": _brief(task, context, expect)}],
         tools=allowed,
         tool_executor=scoped_executor,

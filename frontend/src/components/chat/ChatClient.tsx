@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   memo,
   useCallback,
@@ -48,10 +49,19 @@ import { useStickToBottom } from "./useStickToBottom";
 import WeaveMark from "@/components/brand/WeaveMark";
 import {
   IcoArrowDown,
+  IcoAtom,
+  IcoCalendar,
   IcoChevronRight,
+  IcoClipboard,
+  IcoDataset,
   IcoEdit,
+  IcoGraduation,
   IcoMore,
+  IcoNetwork,
   IcoRetry,
+  IcoSparkles,
+  IcoTelescope,
+  IcoTerminal,
 } from "@/components/ui/icons";
 
 /* ------------------------------------------------------------------ history */
@@ -191,6 +201,7 @@ export default function ChatClient({
   effort: initialEffort = "weave",
   threadId,
   onThreadChange,
+  threadBar,
 }: {
   projectId: string;
   language: Language;
@@ -204,8 +215,18 @@ export default function ChatClient({
   threadId?: string;
   /** Called when the server rolls the conversation into a successor thread. */
   onThreadChange?: (id: string) => void;
+  /**
+   * The thread switcher pill. Rendered INSIDE the thread column so it centres
+   * on the conversation and follows the column when a panel opens beside it;
+   * rendered at the workspace level it centred on column + panel together and
+   * drifted over the panel.
+   */
+  threadBar?: React.ReactNode;
 }) {
   const [turns, setTurns] = useState<ChatTurn[]>(() => fromHistory(initialMessages, language));
+  const [olderAvailable, setOlderAvailable] = useState(initialMessages.length >= 100);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [oldestMessageId, setOldestMessageId] = useState(initialMessages[0]?.id ?? "");
   const [input, setInput] = useState("");
   const [datasetId, setDatasetId] = useState<string>(datasets[0]?.id ?? "");
   const [streaming, setStreaming] = useState(false);
@@ -290,6 +311,44 @@ export default function ChatClient({
   const turnDone = useRef(false);
 
   const scroller = useStickToBottom<HTMLDivElement>();
+  const historyScrollHeight = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    const previousHeight = historyScrollHeight.current;
+    const viewport = scroller.ref.current;
+    if (previousHeight !== null && viewport) {
+      viewport.scrollTop += viewport.scrollHeight - previousHeight;
+      historyScrollHeight.current = null;
+    }
+  }, [turns, scroller.ref]);
+
+  const loadOlder = useCallback(async () => {
+    if (!oldestMessageId || loadingOlder || !olderAvailable || !threadId) return;
+    setLoadingOlder(true);
+    try {
+      const params = new URLSearchParams({ limit: "100", before: oldestMessageId });
+      const res = await fetch(
+        `/api/projects/${projectId}/threads/${threadId}/messages?${params.toString()}`,
+        { cache: "no-store" },
+      );
+      if (!res.ok) throw new Error("history request failed");
+      const older: Message[] = await res.json();
+      setOlderAvailable(older.length >= 100);
+      if (older.length) {
+        setOldestMessageId(older[0].id);
+        historyScrollHeight.current = scroller.ref.current?.scrollHeight ?? null;
+        const olderTurns = fromHistory(older, language);
+        setTurns((current) => {
+          const previousIds = new Set(current.map((turn) => turn.id));
+          return [...olderTurns.filter((turn) => !previousIds.has(turn.id)), ...current];
+        });
+      }
+    } catch {
+      setOlderAvailable(false);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [language, loadingOlder, oldestMessageId, olderAvailable, projectId, scroller.ref, threadId]);
 
   /* ------------------------------------------------------------ model list */
   useEffect(() => {
@@ -471,14 +530,16 @@ export default function ChatClient({
   const addArtifact = useCallback(
     (a: Artifact) => {
       if (!a?.url) return;
-      if (seenArtifacts.current.has(a.url)) {
+      const identity = a.visual_id ? `visual:${a.visual_id}` : a.url;
+      if (seenArtifacts.current.has(identity) || seenArtifacts.current.has(a.url)) {
         // Repair edits keep the same capability URL. A later event is therefore
         // an updated verification state, not a duplicate to discard. Replacing
         // the existing block also lets InlineArtifact's memo comparison redraw
         // the badge and preview without inserting a second card.
         patchBlocks((blocks) =>
           blocks.map((block) =>
-            block.kind === "artifact" && block.artifact.url === a.url
+            block.kind === "artifact" && (block.artifact.url === a.url ||
+              Boolean(a.visual_id && block.artifact.visual_id === a.visual_id))
               ? { ...block, artifact: { ...block.artifact, ...a } }
               : block,
           ),
@@ -486,6 +547,7 @@ export default function ChatClient({
         return;
       }
       seenArtifacts.current.add(a.url);
+      seenArtifacts.current.add(identity);
       appendBlock({ kind: "artifact", id: nextId("art"), artifact: a });
     },
     [appendBlock, patchBlocks],
@@ -736,10 +798,16 @@ export default function ChatClient({
             break;
 
           /* ---- the supervised loop ---- */
+          case "task_state":
+            patchLast((m) => ({ ...m, plan: { ...(m.plan ?? { steps: [] }),
+              _task_state: { status: data.status, phase: data.phase, outstanding: data.outstanding ?? [] },
+            } }));
+            break;
           case "plan":
             patchLast((m) => ({
               ...m,
               plan: {
+                _task_state: m.plan?._task_state,
                 goal: data.goal ?? "",
                 steps: Array.isArray(data.steps) ? data.steps : [],
                 checks: Array.isArray(data.checks) ? data.checks : [],
@@ -791,8 +859,8 @@ export default function ChatClient({
               tool: "continue",
               title:
                 language === "sw"
-                  ? `Bado hakijakamilika — inaendelea (${(data.gaps ?? []).length})`
-                  : `Not finished yet — continuing (${(data.gaps ?? []).length} outstanding)`,
+                  ? `Bado hakijakamilika, inaendelea (${(data.gaps ?? []).length})`
+                  : `Not finished yet. Continuing with ${(data.gaps ?? []).length} outstanding.`,
               detail: (data.gaps ?? []).join("\n"),
               state: "done",
               substeps: [],
@@ -813,7 +881,7 @@ export default function ChatClient({
                     : `Review found ${(data.defects ?? []).length} problem(s)`
                   : language === "sw"
                     ? "Ukaguzi umepita"
-                    : "Reviewed — no problems found",
+                    : "Reviewed. No problems found.",
               detail: (data.defects ?? []).join("\n"),
               state: data.verdict === "revise" ? "error" : "done",
               substeps: [],
@@ -965,7 +1033,10 @@ export default function ChatClient({
             // panel's grouped view still lists it.
             const owner = (data as { id?: string }).id ?? activeStep.current;
             if (owner) {
-              mutateStep(owner, (s) => ({ ...s, artifacts: [...s.artifacts, a] }));
+              mutateStep(owner, (s) => ({ ...s, artifacts: s.artifacts.some((x) =>
+                x.url === a.url || Boolean(a.visual_id && x.visual_id === a.visual_id))
+                ? s.artifacts.map((x) => x.url === a.url || Boolean(a.visual_id && x.visual_id === a.visual_id)
+                  ? { ...x, ...a } : x) : [...s.artifacts, a] }));
             }
             addArtifact(a);
             break;
@@ -1033,18 +1104,14 @@ export default function ChatClient({
             // Drop the in-flight text block so what is on screen matches what
             // the model actually reasoned about.
             stream.reset();
-            patchBlocks((blocks) => {
-              const out = [...blocks];
-              while (out.length && out[out.length - 1].kind === "text") out.pop();
-              return out;
-            });
+            patchBlocks((blocks) => blocks.filter((block) => block.kind !== "text"));
             patchLast((m) => ({ ...m, text: "" }));
             break;
           case "steer_deferred":
             setSteerNote(
               language === "sw"
                 ? "Maelekezo yamehifadhiwa kwa zamu ijayo."
-                : "Noted — I'll pick that up on the next turn.",
+                : "Noted. I'll pick that up on the next turn.",
             );
             break;
 
@@ -1260,8 +1327,8 @@ export default function ChatClient({
         if (!res.ok) {
           setSteerNote(
             language === "sw"
-              ? "Umechelewa — zamu imekwisha."
-              : "Too late — that turn already finished.",
+              ? "Umechelewa, zamu imekwisha."
+              : "Too late. That turn already finished.",
           );
           return;
         }
@@ -1383,6 +1450,7 @@ export default function ChatClient({
         inside itself instead of widening the page.
       */}
       <div className="relative flex min-w-0 flex-1 flex-col lg:shrink-0 lg:basis-[380px]">
+        {threadBar}
         {/* thread menu */}
         {/* On the shared floating rail — see --float-top / --float-h. This used
             to be `top-2` with no safe-area allowance, so on a notched phone it
@@ -1431,7 +1499,7 @@ export default function ChatClient({
                         <span className="flex-1 text-fg">
                           {language === "sw" ? meta.label[0] : meta.label[1]}
                         </span>
-                        <span className="font-mono text-[11px] text-fg-faint">{n || "—"}</span>
+                        <span className="font-mono text-[11px] text-fg-faint">{n || "N/A"}</span>
                       </button>
                     );
                   })}
@@ -1464,6 +1532,38 @@ export default function ChatClient({
                 "calc(var(--composer-h, 9.5rem) + 1.75rem + var(--kb-inset))",
             }}
           >
+            {catalog?.engine === "offline" && (
+              <div className="mb-5 rounded-md border border-warn/20 bg-warn-soft px-3 py-2.5 text-xs leading-5 text-warn" role="status">
+                <div className="font-semibold">{language === "sw" ? "Modeli ya AI haitumiki" : "AI model is not active"}</div>
+                <div className="mt-0.5">
+                  {catalog.ollamaReachable
+                    ? language === "sw"
+                      ? "Seva ya Ollama inajibu, lakini Weave bado inatumia majibu ya msingi."
+                      : "Ollama responds, but Weave is still using its local fallback."
+                    : language === "sw"
+                      ? "Hakuna seva ya modeli inayopatikana. Majibu yatakuwa ya msingi hadi muunganisho urekebishwe."
+                      : "No model server is available. Replies will use the local fallback until the connection is restored."}
+                  {" "}
+                  <Link href="/app/settings" className="font-semibold underline underline-offset-2">
+                    {language === "sw" ? "Kagua mipangilio" : "Check settings"}
+                  </Link>
+                </div>
+              </div>
+            )}
+            {olderAvailable && (
+              <div className="flex justify-center py-3">
+                <button
+                  type="button"
+                  onClick={() => void loadOlder()}
+                  disabled={loadingOlder}
+                  className="inline-flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-xs font-medium text-fg-muted transition-colors hover:border-border-mid hover:text-fg disabled:opacity-60"
+                >
+                  {loadingOlder
+                    ? language === "sw" ? "Inapakia…" : "Loading history…"
+                    : language === "sw" ? "Pakia ujumbe wa zamani" : "Load earlier messages"}
+                </button>
+              </div>
+            )}
             {empty && <EmptyState language={language} mode={mode} onPick={setInput} />}
             {turns.map((turn, i) =>
               turn.role === "user" ? (
@@ -2042,8 +2142,8 @@ const OPENINGS: Record<
   ],
   researcher: [
     {
-      sw: "Nimepakia data yangu — ichunguze, kisha uniambie tatizo lililopo ndani yake.",
-      en: "I have uploaded my data — profile it, then tell me what is wrong with it.",
+      sw: "Nimepakia data yangu. Ichunguze, kisha uniambie tatizo lililopo ndani yake.",
+      en: "I have uploaded my data. Profile it, then tell me what is wrong with it.",
       hint: ["data", "analysis"],
     },
     {
@@ -2091,39 +2191,45 @@ function EmptyState({
       <p className="mt-6 max-w-sm text-center font-read text-[15px] italic leading-relaxed text-fg-muted">
         {mode === "researcher"
           ? sw
-            ? "Hali ya mtafiti — majibu ya moja kwa moja yenye rejea."
-            : "Researcher mode — direct answers, strictly cited."
+            ? "Hali ya mtafiti, majibu ya moja kwa moja yenye rejea."
+            : "Researcher mode, direct answers with citations."
           : sw
-            ? "Hali ya mwanafunzi — mwongozo hatua kwa hatua."
-            : "Student mode — guided, step by step."}
+            ? "Hali ya mwanafunzi, mwongozo hatua kwa hatua."
+            : "Student mode, guided step by step."}
       </p>
 
-      <div className="mt-9 w-full max-w-lg">
-        <div className="eyebrow mb-2.5 flex items-center gap-2">
-          <span>{sw ? "Jaribu" : "Try"}</span>
+      <div className="mt-9 w-full max-w-2xl">
+        <div className="eyebrow mb-3 flex items-center gap-2">
+          <span>{sw ? "Anza na" : "Start with"}</span>
           <span className="h-px flex-1 bg-border" />
         </div>
-        <ul className="space-y-px">
+        <ul className="grid gap-2.5 sm:grid-cols-2">
           {openings.map((o) => {
             const text = sw ? o.sw : o.en;
+            const Icon = OPENING_ICONS[o.hint[1]] ?? IcoSparkles;
             return (
-              <li key={o.en}>
+              <li key={o.en} className="min-w-0">
                 {/*
                   Fills the composer rather than sending. Every one of these has
                   a bracket in it that only the user can fill, and sending it
-                  verbatim would ask the assistant about "[topic]" — which is
+                  verbatim would ask the assistant about "[topic]", which is
                   both useless and a small lesson that the suggestions do not
-                  work.
+                  work. The first bracket is selected, so typing replaces it.
                 */}
                 <button
-                  onClick={() => onPick(text)}
-                  className="group flex w-full items-center gap-3 border-l-2 border-border py-2 pl-3 pr-2 text-left transition-all duration-fast ease-soft hover:border-accent hover:bg-surface-2/50"
+                  onClick={() => pickOpening(text, onPick)}
+                  className="group flex h-full w-full items-start gap-3 rounded-lg border border-border bg-surface p-3.5 text-left shadow-sm transition-[border-color,box-shadow,transform] duration-fast ease-soft hover:-translate-y-px hover:border-accent-line hover:shadow-md focus-visible:border-accent"
                 >
-                  <span className="min-w-0 flex-1 font-read text-[14.5px] leading-snug text-fg-muted transition-colors duration-fast group-hover:text-fg">
-                    {text}
+                  <span className="grid h-8 w-8 flex-shrink-0 place-items-center rounded-md bg-accent-soft text-accent">
+                    <Icon size={16} />
                   </span>
-                  <span className="eyebrow flex-shrink-0 opacity-0 transition-opacity duration-fast group-hover:opacity-100">
-                    {sw ? o.hint[0] : o.hint[1]}
+                  <span className="min-w-0 flex-1">
+                    <span className="eyebrow block text-fg-faint group-hover:text-accent">
+                      {sw ? o.hint[0] : o.hint[1]}
+                    </span>
+                    <span className="mt-1 block font-read text-[14px] leading-snug text-fg-muted group-hover:text-fg">
+                      {withPlaceholders(text)}
+                    </span>
                   </span>
                 </button>
               </li>
@@ -2133,6 +2239,48 @@ function EmptyState({
       </div>
     </div>
   );
+}
+
+/** Icon for each opening, keyed by its English hint. */
+const OPENING_ICONS: Record<string, typeof IcoSparkles> = {
+  teaching: IcoGraduation,
+  simulation: IcoAtom,
+  exam: IcoClipboard,
+  planning: IcoCalendar,
+  analysis: IcoDataset,
+  literature: IcoTelescope,
+  graph: IcoNetwork,
+  software: IcoTerminal,
+};
+
+/** Render `[placeholders]` as chips so it is obvious what to fill in. */
+function withPlaceholders(text: string) {
+  return text.split(/(\[[^\]]*\])/).map((part, i) =>
+    part.startsWith("[") && part.endsWith("]") ? (
+      <span
+        key={i}
+        className="mx-0.5 rounded-sm bg-accent-soft px-1 py-px font-ui text-[12.5px] not-italic text-accent"
+      >
+        {part.slice(1, -1)}
+      </span>
+    ) : (
+      <span key={i}>{part}</span>
+    ),
+  );
+}
+
+/** Put an opening in the composer and select its first placeholder. */
+function pickOpening(text: string, onPick: (text: string) => void) {
+  onPick(text);
+  requestAnimationFrame(() => {
+    const field = document.querySelector<HTMLTextAreaElement>(".composer-field textarea");
+    if (!field) return;
+    field.focus();
+    const start = text.indexOf("[");
+    const end = text.indexOf("]", start);
+    if (start >= 0 && end > start) field.setSelectionRange(start, end + 1);
+    else field.setSelectionRange(text.length, text.length);
+  });
 }
 
 /* -------------------------------------------------------------- transport */

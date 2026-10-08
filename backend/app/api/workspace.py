@@ -68,6 +68,7 @@ def workspace_status(_user: User = Depends(get_current_user)) -> dict:
     svc = get_workspace_service()
     return {
         "enabled": svc.refresh(),
+        "runtime": "local" if settings.environment == "desktop" else "docker",
         "image": settings.workspace_image,
         "network": settings.workspace_network,
         "memory_mb": settings.workspace_memory_mb,

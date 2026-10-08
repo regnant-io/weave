@@ -3,10 +3,10 @@ import { getToken } from "@/lib/session";
 
 const API_BASE = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const token = await getToken();
   if (!token) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  const res = await fetch(`${API_BASE}/api/v1/projects`, {
+  const res = await fetch(`${API_BASE}/api/v1/projects${req.nextUrl.search || ""}`, {
     headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
   });

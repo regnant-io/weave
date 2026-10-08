@@ -130,7 +130,7 @@ export default function CrawlerPanel() {
     const r = await fetch(`/api/admin/crawl/seeds/${id}/run`, { method: "POST" });
     const d = await r.json().catch(() => ({}));
     setBusy("");
-    setMsg(d.error ?? "Crawl started — this runs slowly on purpose.");
+    setMsg(d.error ?? "Crawl started. This can take some time.");
     void load();
   }
 

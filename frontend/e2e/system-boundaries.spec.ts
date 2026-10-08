@@ -175,3 +175,39 @@ test("a repaired artifact updates its verification state in place", async ({ pag
   expect(hydrationErrors).toEqual([]);
   await page.evaluate((id) => fetch(`/api/projects/${id}`, { method: "DELETE" }), project.id);
 });
+
+test("incomplete orchestration replaces provisional claims and retains one revised artifact", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "one orchestration-state journey is sufficient");
+  await registerAndOnboard(page);
+  const project = await page.evaluate(async () => {
+    const response = await fetch("/api/projects/create", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "E2E orchestration", mode: "researcher" }) });
+    return response.json();
+  });
+  await page.route(`**/api/chat/${project.id}`, async (route) => {
+    const frames = [
+      ["turn", { turn_id: "e2e-incomplete", resumable: true }],
+      ["plan", { goal: "Create and validate", steps: [{ n: 1, title: "Create", status: "done" }] }],
+      ["token", { text: "Everything is complete." }],
+      ["step_start", { id: "s1", tool: "verify_artifact" }],
+      ["artifact", { url: "/api/artifact/e2e/old.json", visual_id: "v", name: "draft.json", mime: "application/json" }],
+      ["artifact", { url: "/api/artifact/e2e/new.json", visual_id: "v", name: "revision.json", mime: "application/json" }],
+      ["step_end", { id: "s1", status: "unverified" }],
+      ["task_state", { status: "stalled", outstanding: ["Browser inspection unavailable"] }],
+      ["answer_restart", { reason: "supervised_revision" }],
+      ["token", { text: "Task incomplete: browser inspection unavailable." }],
+      ["done", { message_id: "e2e-incomplete" }],
+    ];
+    await route.fulfill({ status: 200, contentType: "text/event-stream; charset=utf-8",
+      body: frames.map(([event, data], seq) => `event: ${event}\ndata: ${JSON.stringify({ ...(data as object), seq })}\n\n`).join("") });
+  });
+  await page.goto(`/app/chat/${project.id}`);
+  await page.locator("textarea").fill("Create and validate this artifact");
+  await page.locator("textarea").press("Enter");
+  await expect(page.getByText("Task incomplete: browser inspection unavailable.")).toBeVisible();
+  await expect(page.getByText("Everything is complete.")).toHaveCount(0);
+  await expect(page.getByText(/incomplete ·|haijakamilika ·/)).toBeVisible();
+  await expect(page.locator("figure.inline-artifact")).toHaveCount(1);
+  await page.evaluate((id) => fetch(`/api/projects/${id}`, { method: "DELETE" }), project.id);
+});

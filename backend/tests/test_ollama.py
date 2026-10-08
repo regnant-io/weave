@@ -39,6 +39,29 @@ def test_ping_true_and_false():
     assert down.ping() is False
 
 
+def test_offline_engine_retries_and_recovers_when_ollama_starts(monkeypatch):
+    """An Ollama server started after Weave must replace the cached fallback."""
+    from app.services.orchestration import llm
+
+    class AvailableEngine:
+        name = "ollama"
+
+    available = AvailableEngine()
+    monkeypatch.setattr(llm.settings, "force_offline_llm", False)
+    monkeypatch.setattr(llm.settings, "llm_backend", "auto")
+    monkeypatch.setattr(llm, "_try_ollama", lambda: None)
+    monkeypatch.setattr(llm, "_try_anthropic", lambda: None)
+    llm.reset_engine()
+    try:
+        assert llm.get_engine().name == "offline"
+        monkeypatch.setattr(llm, "_try_ollama", lambda: available)
+        # Simulate the discovery interval expiring without waiting in the test.
+        monkeypatch.setattr(llm, "_engine_retry_at", 0.0)
+        assert llm.get_engine() is available
+    finally:
+        llm.reset_engine()
+
+
 def test_generate_plain_answer_no_tools():
     def handler(request):
         return httpx.Response(200, json={"message": {"role": "assistant", "content": "Habari, jibu."}})

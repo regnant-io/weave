@@ -64,7 +64,7 @@ html,body{margin:0;height:100%;overflow:hidden;background:${t.bg};color:${t.fg};
 <div class="ctrls"><button id="spin">Pause spin</button><button id="reset">Reset view</button></div>
 <div class="hint">drag to orbit · scroll to zoom</div>
 <div class="tip" id="tip"></div>
-<script>${threeSrc}</script>
+<script data-weave-lib="three">${threeSrc}</script>
 <script>
 const D = ${JSON.stringify(data)};
 const C = D.colors;

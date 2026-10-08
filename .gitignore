@@ -2,6 +2,8 @@
 backend/.venv/
 backend/.venv312/
 backend/var/
+backend/build/
+backend/dist/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -11,6 +13,11 @@ __pycache__/
 # Node / Next
 frontend/node_modules/
 frontend/.next/
+frontend/.desktop-dist/
+frontend/desktop/assets/weave.png
+frontend/desktop/assets/weave.ico
+frontend/dist/
+frontend/dist-*/
 frontend/.env.local
 npm-debug.log*
 

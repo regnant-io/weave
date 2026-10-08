@@ -1,12 +1,12 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "@/lib/session";
 
 const API_BASE = process.env.WEAVE_API_BASE || "http://127.0.0.1:8000";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const token = await getToken();
   if (!token) return NextResponse.json({ models: [] }, { status: 401 });
-  const res = await fetch(`${API_BASE}/api/v1/models`, {
+  const res = await fetch(`${API_BASE}/api/v1/models${req.nextUrl.search || ""}`, {
     headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
   });

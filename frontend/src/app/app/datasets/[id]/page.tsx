@@ -57,7 +57,7 @@ export default async function DatasetPage({ params }: { params: Promise<{ id: st
                         ? `μ=${fmt(c.stats.mean)} σ=${fmt(c.stats.std)} [${fmt(c.stats.min)}, ${fmt(c.stats.max)}]`
                         : c.top_values
                           ? c.top_values.map((v) => `${v.value}(${v.count})`).join(", ")
-                          : "—"}
+                          : "Unknown"}
                     </td>
                   </tr>
                 ))}
@@ -77,6 +77,6 @@ export default async function DatasetPage({ params }: { params: Promise<{ id: st
 }
 
 function fmt(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
+  if (n === null || n === undefined) return "Unknown";
   return Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2);
 }

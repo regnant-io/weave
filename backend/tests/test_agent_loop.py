@@ -18,7 +18,6 @@ from __future__ import annotations
 import pytest
 
 from app.services.orchestration import agent as ag
-from app.services.orchestration.verification import MAX_REPAIRS, ArtifactGate, Verdict
 
 
 # --------------------------------------------------------------------------- #
@@ -142,14 +141,33 @@ def _agent(engine, policy, **kw):
     )
 
 
-def test_open_plan_steps_bring_the_model_back():
-    """Going quiet with the plan unfinished is not 'done'."""
-    engine = _Engine([("first pass", [("workspace_write", {})]),
-                      ("second pass", [("workspace_write", {})])])
-    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=2))
-    a.plan = ag.Plan(goal="g", steps=[ag.PlanStep(1, "unfinished")])
+def test_open_plan_steps_bring_the_model_back_when_nothing_was_delivered():
+    """Going quiet with the plan unfinished AND nothing to show is not 'done'."""
+    engine = _Engine([("", [("create_simulation", {})]),
+                      ("second pass", [])])
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=2),
+               tool_executor=lambda n, a: {"status": "error", "error": "bad spec"})
+    a.plan = ag.Plan(goal="g", surface="artifact", steps=[ag.PlanStep(1, "unfinished")])
     a.run()
-    assert engine.calls >= 2, "the model was allowed to stop with an open plan step"
+    assert engine.calls >= 2, "the model was allowed to stop with nothing delivered"
+
+
+def test_open_plan_steps_are_reconciled_when_the_deliverable_exists():
+    """A verified deliverable closes the plan; it does not buy a nag pass.
+
+    This is the self-healing that ran after every build prompt: the model had
+    finished, simply had not ticked its boxes, and was sent round again.
+    """
+    engine = _Engine([("Here is the simulation.", [("create_simulation", {})])])
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=3),
+               tool_executor=lambda n, a: {"status": "ok", "verified": True,
+                                           "output_files": [{"s3_key": "k"}]})
+    a.plan = ag.Plan(goal="g", surface="artifact",
+                     steps=[ag.PlanStep(1, "build it"), ag.PlanStep(2, "check it")])
+    result = a.run()
+    assert engine.calls == 1
+    assert result.stopped_because == "finished"
+    assert all(s.status == "done" for s in a.plan.steps)
 
 
 def test_the_loop_gives_up_when_nothing_is_advancing():
@@ -167,16 +185,155 @@ def test_the_loop_gives_up_when_nothing_is_advancing():
 
 
 def test_pressing_on_open_steps_is_bounded():
-    """Press twice, then stop nagging.
+    """Repeated failed calls stop with a blocker, never a finished task."""
+    engine = _Engine([("", [("create_simulation", {})])] * 6)
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=5),
+               tool_executor=lambda n, a: {"status": "error", "error": "x"})
+    a.plan = ag.Plan(goal="g", surface="artifact", steps=[ag.PlanStep(1, "never closed")])
+    result = a.run()
+    assert result.stopped_because == "stalled"
+    assert engine.calls == 2
+    assert "incomplete" in result.text
+    assert result.task_state["outstanding"]
 
-    A model doing the work but not ticking boxes looks identical to one that
-    abandoned the task; nagging it forever burns the budget re-doing work.
-    """
-    engine = _Engine([("working", [("workspace_write", {})])] * 6)
-    a = _agent(engine, ag.LoopPolicy(plan=False, review=False, max_continuations=5))
-    a.plan = ag.Plan(goal="g", steps=[ag.PlanStep(1, "never closed")])
+
+def test_a_redirect_sent_before_work_starts_is_applied_not_dropped():
+    """A steer sent during planning used to skip the whole work phase: the turn
+    ended with no answer and the redirect was never delivered."""
+    import threading
+
+    from app.services.steering import SteerAwareCancel
+
+    stop, steer = threading.Event(), threading.Event()
+    steer.set()
+    applied = []
+
+    def on_pass_end(_result):
+        if steer.is_set():
+            steer.clear()
+            applied.append("redirect")
+            return "restart"
+        return None
+
+    engine = _Engine([("the redirected answer", [])])
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=False),
+               cancel=SteerAwareCancel(stop, steer), on_pass_end=on_pass_end)
+    result = a.run()
+    assert applied == ["redirect"]
+    assert result.text == "the redirected answer"
+    assert result.stopped_because == "finished"
+
+
+def test_a_real_stop_still_ends_the_turn():
+    import threading
+
+    from app.services.steering import SteerAwareCancel
+
+    stop = threading.Event()
+    stop.set()
+    engine = _Engine([("never", [])])
+    a = _agent(engine, ag.LoopPolicy(plan=True, review=False),
+               cancel=SteerAwareCancel(stop, threading.Event()))
+    assert a.run().stopped_because == "cancelled"
+    assert engine.calls == 0
+
+
+def _ws_agent(engine, events_by_call, policy=None):
+    """An agent on the workspace surface whose tool results are scripted."""
+    results = iter(events_by_call)
+    a = _agent(engine, policy or ag.LoopPolicy(plan=False, review=False, max_continuations=4),
+               tool_executor=lambda n, a: next(results))
+    a.tools = [{"name": "workspace_write"}, {"name": "workspace_check"}]
+    a.plan = ag.Plan(goal="g", surface="workspace", steps=[ag.PlanStep(1, "build")])
+    return a
+
+
+def test_source_changed_since_the_last_passing_check_is_a_gap():
+    engine = _Engine([
+        ("wrote it", [("workspace_write", {"path": "src/app.ts"})]),
+        ("checked", [("workspace_check", {})]),
+    ])
+    a = _ws_agent(engine, [
+        {"status": "ok", "path": "src/app.ts"},
+        {"status": "ok", "passed": True, "summary": "all checks passed: test"},
+    ])
+    result = a.run()
+    assert engine.calls == 2, "the model was not sent back to verify its code"
+    assert result.stopped_because == "finished"
+    assert a.plan.steps[0].status == "done", "a verified build closes the plan"
+
+
+def test_a_failing_check_holds_the_turn_open_but_only_twice():
+    engine = _Engine([("done!", [("workspace_check", {})])] * 8)
+    failing = {"status": "error", "passed": False, "summary": "test failed (exit 1)"}
+    a = _ws_agent(engine, [failing] * 8,
+                  ag.LoopPolicy(plan=False, review=False, max_continuations=6))
+    result = a.run()
+    assert engine.calls == 2
+    assert result.stopped_because == "stalled"
+    assert "checks are failing" in result.text
+
+
+def test_a_verify_command_run_by_hand_counts_as_a_check():
+    engine = _Engine([("ok", [("workspace_write", {"path": "a.py"}),
+                              ("workspace_exec", {"command": "python -m pytest -q"})])])
+    a = _ws_agent(engine, [{"status": "ok", "path": "a.py"},
+                           {"status": "ok", "exit_code": 0}])
+    a.tools.append({"name": "workspace_exec"})
     a.run()
-    assert a._plan_nags == 2
+    assert engine.calls == 1
+
+
+def test_editing_a_readme_does_not_demand_a_test_run():
+    engine = _Engine([("updated the docs", [("workspace_write", {"path": "README.md"})])])
+    a = _ws_agent(engine, [{"status": "ok", "path": "README.md"}])
+    a.plan = ag.Plan()
+    a.run()
+    assert engine.calls == 1
+
+
+def test_placeholders_in_written_code_are_a_gap_until_replaced():
+    engine = _Engine([
+        ("wrote it", [("workspace_write", {"path": "a.js"})]),
+        ("filled in", [("workspace_write", {"path": "a.js"}), ("workspace_check", {})]),
+    ])
+    a = _ws_agent(engine, [
+        {"status": "ok", "path": "a.js", "placeholders": ["line 3: // ... rest"]},
+        {"status": "ok", "path": "a.js"},
+        {"status": "ok", "passed": True},
+    ])
+    a.run()
+    assert engine.calls == 2
+    assert a._evidence().placeholders == {}
+
+
+def test_a_clean_turn_is_not_reviewed():
+    """No reason in the log, no critic call."""
+    engine = _ReviewEngine("revise", ["invented problem"])
+    a = _agent(engine, ag.LoopPolicy(plan=False, review=True, max_continuations=1),
+               tool_executor=lambda n, a: {"status": "ok", "output_files": [{"s3_key": "k"}]})
+    a.tool_events = [{"name": "create_diagram", "input": {},
+                      "result": {"status": "ok", "verified": True,
+                                 "output_files": [{"s3_key": "k"}]}}]
+    a._texts = ["Here is the diagram."]
+    assert a._review_triggers() == []
+
+
+def test_an_unsupported_success_claim_is_reviewed():
+    a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=True))
+    a.tool_events = [{"name": "run_analysis", "input": {},
+                      "result": {"status": "error", "error": "KeyError: 'yield'"}}]
+    a._texts = ["The analysis works and all results are verified."]
+    reasons = a._review_triggers()
+    assert any("never recovered" in r for r in reasons)
+    assert any("claims success" in r for r in reasons)
+
+
+def test_deep_effort_reviews_any_turn_that_did_work():
+    p = ag.LoopPolicy.for_effort("tapestry", complex_request=True)
+    a = _agent(_Engine([("", [])]), p)
+    a.tool_events = [{"name": "web_search", "input": {}, "result": {"status": "ok"}}]
+    assert a._review_triggers()
 
 
 def test_an_unrepaired_artifact_is_a_gap():
@@ -271,91 +428,12 @@ def test_the_surface_directive_reaches_the_model():
 def test_plan_updates_move_the_ledger():
     a = _agent(_Engine([("", [])]), ag.LoopPolicy(plan=False, review=False))
     a.plan = ag.Plan(goal="g", steps=[ag.PlanStep(1, "one"), ag.PlanStep(2, "two")])
-    assert a._apply_plan_update({"step": 1, "status": "done"})["remaining_steps"] == 1
+    assert a._apply_plan_update({"step": 1, "status": "done"})["status"] == "error"
+    a.tool_events = [{"name": "workspace_read", "input": {}, "result": {"status": "ok"}}]
+    assert a._apply_plan_update({"step": 1, "status": "done", "evidence": [1]})["remaining_steps"] == 1
     assert a.plan.get(1).status == "done"
     # A step number that does not exist is reported, not silently ignored.
     assert a._apply_plan_update({"step": 9, "status": "done"})["status"] == "error"
-
-
-# --------------------------------------------------------------------------- #
-#  The artifact gate                                                           #
-# --------------------------------------------------------------------------- #
-def test_a_broken_artifact_comes_back_as_a_failed_tool_call():
-    """The load-bearing behaviour of the whole gate.
-
-    A model handed `{"status": "ok"}` has been told the work is finished, and no
-    amount of system-prompt exhortation reliably overrides a tool result.
-    """
-    verdict = Verdict(checked=True, ok=False, attempt=1,
-                      errors=["Scene error: createScene did not return a BABYLON.Scene"])
-    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
-                             verdict, "create_3d_experience")
-    assert out["status"] == "needs_repair"
-    assert out["verified"] is False
-    # Nothing was released, so the result must not imply otherwise.
-    assert "output_files" not in out
-    assert "createScene did not return" in out["error"]
-    assert "call `create_3d_experience` again" in out["error"]
-    # The specific hint for this failure mode.
-    assert "return scene;" in out["error"]
-
-
-def test_a_verified_artifact_passes_through():
-    verdict = Verdict(checked=True, runtime_checked=True, ok=True, attempt=1)
-    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
-                             verdict, "create_simulation")
-    assert out["status"] == "ok"
-    assert out["verified"] is True
-    assert out["output_files"]
-
-
-def test_static_only_artifact_is_released_without_a_verified_claim():
-    verdict = Verdict(checked=True, runtime_checked=False, ok=True, attempt=1)
-    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
-                             verdict, "create_simulation")
-    assert out["status"] == "ok"
-    assert out["verified"] is False
-    assert out["verification"]["ran"] is False
-    assert "browser execution was unavailable" in out["note"]
-
-
-def test_after_the_budget_it_ships_with_the_defects_on_record():
-    """Released, but the model is told not to call it working."""
-    verdict = Verdict(checked=True, ok=False, attempt=MAX_REPAIRS, exhausted=True,
-                      errors=["the page rendered nothing at all"])
-    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
-                             verdict, "create_html_page")
-    assert out["status"] == "ok"
-    assert out["verified"] is False
-    assert out["output_files"], "an exhausted artifact is still shown to the user"
-    assert "KNOWN DEFECTS" in out["note"]
-    assert "Do NOT describe it as finished" in out["note"]
-
-
-def test_the_repair_budget_is_per_artifact_not_per_turn():
-    gate = ArtifactGate("proj")
-    a = {"visual_id": "v1"}
-    b = {"visual_id": "v2"}
-    assert gate._identity("create_diagram", a, {}) != gate._identity("create_diagram", b, {})
-    # The same visual retried counts against one budget.
-    assert (gate._identity("create_diagram", a, {})
-            == gate._identity("create_diagram", {}, {"visual_id": "v1"}))
-
-
-def test_only_page_producing_tools_are_gated():
-    gate = ArtifactGate("proj")
-    assert gate.gates("create_3d_experience")
-    assert gate.gates("create_html_page")
-    # A Vega chart is rendered to SVG server-side: there is no page and no
-    # script, so a browser can tell us nothing the renderer did not.
-    assert not gate.gates("generate_visual")
-    assert not gate.gates("run_analysis")
-
-
-def test_a_tool_that_failed_before_rendering_is_not_probed():
-    gate = ArtifactGate("proj")
-    verdict = gate.check("create_diagram", {}, {"status": "error", "error": "bad spec"})
-    assert verdict.checked is False
 
 
 # --------------------------------------------------------------------------- #
@@ -493,7 +571,7 @@ def test_pass_really_does_pass():
 def test_a_verdict_with_no_defects_does_not_trigger_a_repair_round():
     """'revise' with nothing to act on would loop for no reason."""
     a = _agent(_ReviewEngine("revise", []), ag.LoopPolicy(plan=False, review=True))
-    assert a._review() == []
+    assert a._review(), "a review without an explicit pass cannot silently approve the result"
 
 
 def test_the_work_log_states_verification_unmissably():
@@ -576,36 +654,6 @@ def test_needs_work_with_nothing_actionable_is_treated_as_good():
 
     engine = _VisionEngine("needs_work", ["", "  ", "short"])
     assert for_turn(engine, "tapestry")("IMG", "t", "create_diagram") == []
-
-
-def test_a_polish_note_withholds_the_artifact_and_asks_for_better():
-    """It works, so the language is improvement — but it is still not shown yet.
-
-    Releasing it and asking for a better one afterwards puts two versions in
-    the transcript and leaves the reader to work out which is current.
-    """
-    verdict = Verdict(checked=True, runtime_checked=True, ok=True, attempt=1,
-                      polish_notes=["the trajectory is clipped at the top of the chart"])
-    assert verdict.needs_polish and not verdict.released
-    out = ArtifactGate.apply({"status": "ok", "output_files": [{"s3_key": "k"}]},
-                             verdict, "create_simulation")
-    assert out["status"] == "needs_polish"
-    assert out["verified"] is True, "nothing is broken; it renders"
-    assert "output_files" not in out
-    assert "clipped at the top" in out["error"]
-    assert "Change the SPEC" in out["error"]
-
-
-def test_polish_is_skipped_on_the_final_attempt():
-    """Sending the model back to improve something it can no longer resubmit
-    is a round trip for nothing."""
-    calls = []
-    gate = ArtifactGate("proj", polish=lambda *a: calls.append(a) or ["something"])
-    gate._attempts["proj:create_diagram:t"] = MAX_REPAIRS - 1
-    # No html in the result, so check() returns before probing — enough to show
-    # the budget arithmetic without needing a browser.
-    gate.check("create_diagram", {"title": "t"}, {"status": "ok"})
-    assert calls == []
 
 
 # --------------------------------------------------------------------------- #

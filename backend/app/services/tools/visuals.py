@@ -135,10 +135,8 @@ def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
         "createScene did not return a BABYLON.Scene", which is a perfectly
         well-formed document that renders a black rectangle.
 
-    Artifacts produced by the tools are gated automatically (see
-    services/orchestration/verification.py), so this tool is for pages the model
-    has written but not yet submitted — checking a draft, or a page it read out
-    of the workspace.
+    The task supervisor invokes this inspection after execution and after edits.
+    It can also inspect a draft or a page read out of the workspace.
     """
     client = _render(ctx)
     if not client:
@@ -169,7 +167,14 @@ def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
             return {"status": "error",
                     "error": "supply `html`, a `visual_id`, or a `workspace_path` that exists"}
 
-    static = client.verify_html(html)
+    try:
+        static = client.verify_html(html)
+    except Exception as exc:
+        return {"status": "unavailable", "ok": False, "executed": False,
+                "error": f"artifact inspection unavailable: {exc}"}
+    if static.get("status") not in {None, "ok", "success"}:
+        return {"status": "unavailable", "ok": False, "executed": False,
+                "error": static.get("error") or "static inspection unavailable"}
     errors = [str(e) for e in (static.get("errors") or [])]
     warnings = [str(w) for w in (static.get("warnings") or [])]
 
@@ -181,15 +186,18 @@ def _verify_artifact(ctx: ToolContext, inp: dict) -> dict:
 
     ok = not errors
     return {
-        "status": "ok",
+        "status": "ok" if ok and run.available else ("error" if errors else "unverified"),
         "tool": "verify_artifact",
         "checked": source,
         "executed": run.available,
         "ok": ok,
         "errors": errors[:12],
         "warnings": warnings[:8],
+        "_screenshot_b64": run.screenshot_b64 if run.available else "",
         "note": (
             "The page opens and renders without errors."
+            if ok and run.available else
+            "Static checks passed; browser execution was unavailable. Runtime validation is incomplete."
             if ok else
             "This page is BROKEN. Fix the errors listed and check it again before "
             "showing it to the user."

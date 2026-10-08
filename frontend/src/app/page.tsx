@@ -16,6 +16,9 @@ export default async function LandingPage() {
           W
         </div>
         <h1 className="text-3xl font-semibold tracking-tight xs:text-4xl">Weave</h1>
+        <p className="mt-1 text-[10px] uppercase tracking-widest text-fg-faint" title="Weave is built by Regnant · regnant.io">
+          by Regnant
+        </p>
         <p className="mx-auto mt-3 max-w-md text-base text-fg-muted xs:text-lg">{t("appTagline", language)}</p>
       </section>
 

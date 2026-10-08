@@ -99,6 +99,29 @@ cp .env.local.example .env.local     # points at http://127.0.0.1:8000
 npm run dev
 ```
 
+### Desktop packages
+
+Install the backend requirements and PyInstaller in a Python 3.12 environment,
+then install the frontend dependencies. Build on the target operating system:
+
+```bash
+cd frontend
+npm install
+npm run dist:win     # Windows NSIS installer
+npm run dist:mac     # macOS DMG
+npm run dist:linux   # Linux AppImage and deb
+```
+
+Installers are written to `frontend/dist`. The installed app starts the API, web
+app, render service, and an isolated Chromium verification worker on loopback.
+It includes local web search through a public RSS endpoint, DuckDB for large
+dataset queries, and a per-project developer workspace with bundled Node, npm,
+and Python command shims on Windows. Docker is not needed for the desktop app.
+Ollama is detected at `http://127.0.0.1:11434` when installed separately.
+The desktop database and files live in the user's Weave data directory. Closing
+the window hides it in the system tray. Exit Weave from the tray to stop the
+local services. Uninstalling keeps user data.
+
 ---
 
 ## What actually works, end to end
@@ -122,6 +145,11 @@ npm run dev
 4. **Bilingual chat** — SSE-streamed, student (Socratic) vs researcher (direct)
    modes, model-tiering router, layered system prompt. Both `content_sw` and
    `content_en` are stored per message (bilingual at the data layer).
+   Substantial work uses persistent plans with dependencies, cited tool evidence
+   and acceptance checks. The supervisor executes, inspects, validates and
+   rechecks revisions; unfinished work stays visible when a resource boundary or
+   failed validation stops a run. `continue` in the same chat restores its saved
+   work and dataset context. Simple questions and small actions stay lightweight.
 5. **Retrieval** — hybrid vector + BM25 search with reciprocal-rank fusion over a
    seeded Tanzanian source library, language-aware query expansion, and
    access-status / predatory-journal flags enforced at the data layer.
@@ -130,13 +158,11 @@ npm run dev
      copy of the user's dataset. No network, import allowlist, no `open()`,
      workspace destroyed after each run. Those limits are the product.
    * *Developer workspace* (`services/workspace`): a persistent per-project
-     directory in a Docker container **with network**, where the assistant
-     builds real software — installs npm/pip packages, downloads assets, edits
-     existing files in place, runs the tests it writes, verifies a file actually
-     parses, and packages the result as a `.tar.gz`. Requires Docker; build the
-     image once with `docker compose --profile build-images build workspace-image`.
-     This capability is enabled only by the local Compose override. The base
-     deployment keeps it disabled and does not mount the Docker socket.
+     directory where the assistant edits files, runs commands, checks previews,
+     and packages results. The desktop app runs these commands locally under the
+     signed-in operating-system account. Compose uses a restricted Docker
+     container; build its image with
+     `docker compose --profile build-images build workspace-image`.
 7. **Asking you back** — `ask_user` blocks the turn on a real question with
    selectable options when a fork would change the work, instead of guessing or
    abandoning the run.
@@ -156,25 +182,25 @@ service; adding a capability = adding one `Tool`.
 | `run_analysis` | Sandbox Manager (Python) | working |
 | `search_library` | Retrieval (hybrid RAG) | working |
 | `check_citation` | Predatory-journal check | working |
-| `web_search` | **SearXNG** metasearch | wired; needs `deep` profile |
-| `deep_research` | SearXNG + **Browserless** + extraction, iterative loop, SSRF-guarded, streamed | wired; needs `deep` profile |
-| `generate_visual` | **Render service** (Vega-Lite → SVG, house style applied server-side) | wired; needs `deep` profile |
-| `generate_deck` | Render service (slides → designed HTML deck, 8 layouts, print-to-PDF) | wired; needs `deep` profile |
-| `create_3d_experience` | Render service (**Babylon.js**) — games, 3D building, physics, walkthroughs | wired; needs `deep` profile |
-| `generate_3d` / `create_diagram` / `create_simulation` / `create_animation` | Render service (spec-driven) | wired; needs `deep` profile |
+| `web_search` | SearXNG in Compose; public RSS search on desktop | included on desktop |
+| `deep_research` | Search, page extraction, and browser checks | included on desktop |
+| `generate_visual` | Render service (Vega-Lite → SVG) | included on desktop |
+| `generate_deck` | Render service (slides → HTML) | included on desktop |
+| `create_3d_experience` | Render service (Babylon.js) | included on desktop |
+| `generate_3d` / `create_diagram` / `create_simulation` / `create_animation` | Render service | included on desktop |
 | `query_warehouse` | **DuckDB** (embedded) / ClickHouse | working (DuckDB), read-only SQL guard |
 | `delegate` | Scoped read-only worker; several run at once, and its sources never enter your context | working |
 | `update_visual` | In-place edit of any generated visual, against its stored source | working |
 | `ask_user` | Interaction broker (blocks the turn on a real question) | working |
 | `remember` / `recall` / `forget` | Project memory, shared across chats | working |
 | `workspace_write/read/edit/list/move/delete` | Developer workspace (host FS, traversal-guarded) | working |
-| `workspace_exec` | Developer workspace container (network, npm/pip, tests) | needs Docker |
+| `workspace_exec` | Desktop local runtime or Compose container | included on desktop |
 | `workspace_verify` | Parse check — Python AST, JSON, `node --check`, structural | working |
 | `workspace_package` | `.tar.gz` of the built project | working |
 
 `GET /health` reports the resolved engine, embedding backend, the registered
 tools, and which capabilities are currently enabled. `GET /api/v1/workspace/status`
-re-probes Docker, so starting it does not need a backend restart.
+reports the active workspace runtime and re-probes Docker in Compose deployments.
 
 **Charts and decks are styled by the service, not by the prompt.** Vega's
 defaults are overridden with the Weave design tokens before every render
